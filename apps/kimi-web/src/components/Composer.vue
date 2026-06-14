@@ -1939,13 +1939,27 @@ function selectModel(modelId: string): void {
        and acts as a flex row; the textarea itself becomes the pill input. ---- */
 @media (max-width: 640px) {
   .composer {
-    padding: 9px 12px max(24px, env(safe-area-inset-bottom));
+    padding: 9px max(12px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
   }
   .composer-card {
     border-radius: 14px;
+    max-width: 100%;
   }
   .input-row {
     gap: 6px;
+    min-width: 0;
+  }
+  .queue-strip {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 2px;
+  }
+  .queue-label {
+    flex: none;
+  }
+  .queue-item {
+    max-width: min(72vw, 320px);
   }
 
   /* Send → 36px round (hide the SVG arrow, show only the ::after glyph) */
@@ -1988,6 +2002,7 @@ function selectModel(modelId: string): void {
     right: 10px;
     left: auto;
     min-width: 180px;
+    max-width: calc(100vw - 24px);
   }
 
   /* Bump mobile font sizes +2px and pin input at 16px to prevent iOS zoom.
@@ -2000,8 +2015,19 @@ function selectModel(modelId: string): void {
   .attach-btn {
     font-size: 14px;
   }
+  .toolbar {
+    gap: 6px;
+    min-width: 0;
+  }
+  .toolbar-left,
+  .toolbar-right {
+    min-width: 0;
+  }
+  .model-pill {
+    max-width: min(52vw, 220px);
+  }
   .model-pill b {
-    max-width: 240px;
+    max-width: min(40vw, 170px);
   }
   .md-row {
     font-size: 14px;

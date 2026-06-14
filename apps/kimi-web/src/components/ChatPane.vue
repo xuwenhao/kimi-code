@@ -1162,9 +1162,52 @@ function renderBlockKey(block: AssistantRenderBlock, index: number): string {
 
 /* Mobile font bump (+2px) */
 @media (max-width: 640px) {
+  .chat {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 14px max(12px, env(safe-area-inset-right)) 18px max(12px, env(safe-area-inset-left));
+  }
+  .u-bub {
+    max-width: min(88%, calc(100vw - 52px));
+  }
+  .a-msg {
+    width: 100%;
+    max-width: 100%;
+  }
   .u-bub .u-text,
   .a-msg .msg {
     font-size: 16px;
+  }
+  .a-msg :deep(.md),
+  .a-msg :deep(.markdown-renderer),
+  .a-msg :deep(.code-block-container),
+  .a-msg :deep(.diff-wrap),
+  .a-msg :deep(pre) {
+    max-width: 100%;
+  }
+  .a-msg :deep(.code-block-container pre),
+  .a-msg :deep(.diff-pre) {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .a-msg :deep(.media-tool.mob) {
+    width: min(44vw, 160px);
+  }
+  .cd-label {
+    min-width: 0;
+    max-width: calc(100% - 48px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .a-cpbtn-text,
+  .cpbtn-text {
+    opacity: 1;
+    max-width: 120px;
+  }
+  .u-edit-confirm {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: calc(100vw - 28px);
   }
   .userline .pr,
   .ai .pr,

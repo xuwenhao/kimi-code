@@ -1387,6 +1387,20 @@ onUnmounted(() => {
 .content-wrap.align-left { margin-left: 0; margin-right: auto; }
 /* Mobile: bubbles span the full pane width; no reading-column constraint. */
 .content-wrap.align-mobile { max-width: none; }
+@media (max-width: 640px) {
+  .con.mobile {
+    min-width: 0;
+    overflow: hidden;
+  }
+  .con.mobile .panes {
+    scrollbar-gutter: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .content-wrap.align-mobile {
+    width: 100%;
+    min-width: 0;
+  }
+}
 .conversation-toc {
   position: absolute;
   top: 58px;
@@ -1610,6 +1624,13 @@ onUnmounted(() => {
 .dock.align-center { margin-left: auto; margin-right: auto; }
 .dock.align-left { margin-left: 0; margin-right: auto; }
 .dock.align-mobile { max-width: none; }
+@media (max-width: 640px) {
+  .dock.align-mobile {
+    box-sizing: border-box;
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+}
 
 /* A docked approval can carry a tall diff/file preview; cap it so it never
    pushes the rest of the dock off-screen, scrolling internally instead. Match
@@ -1618,6 +1639,12 @@ onUnmounted(() => {
   margin: 8px 0;
   max-height: 50vh;
   overflow-y: auto;
+}
+@media (max-width: 640px) {
+  .dock-approval {
+    max-height: 45dvh;
+    margin: 8px 10px;
+  }
 }
 
 /* Capped desktop dock (center/left): the fused composer card is the visual
@@ -1773,6 +1800,20 @@ onUnmounted(() => {
    Back row. v-show hides the inactive half. No side-by-side split.
    --------------------------------------------------------------------------- */
 @media (max-width: 640px) {
+  .nav-seg {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+  .seg-btn {
+    min-width: 0;
+    padding: 6px 6px;
+    font-size: 12px;
+  }
+  .seg-n {
+    flex: none;
+    padding: 0 4px;
+  }
+
   .panes.files-layout {
     flex-direction: column;
   }
@@ -1833,6 +1874,14 @@ onUnmounted(() => {
 }
 .newmsg-pill:hover {
   background: var(--blue2);
+}
+@media (max-width: 640px) {
+  .newmsg-pill {
+    bottom: max(98px, calc(env(safe-area-inset-bottom) + 88px));
+    max-width: calc(100vw - 28px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 .pill-chevron {
   width: 14px;

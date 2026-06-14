@@ -432,4 +432,44 @@ function onLogout(): void {
   height: 100%;
   background: var(--blue);
 }
+
+@media (max-width: 640px) {
+  .srow {
+    align-items: flex-start;
+    gap: 10px;
+    min-width: 0;
+    padding: 14px max(14px, env(safe-area-inset-right)) 14px max(14px, env(safe-area-inset-left));
+  }
+  .srow-main {
+    flex: 1 1 auto;
+  }
+  .srow-sub {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .srow.pref {
+    flex-wrap: wrap;
+  }
+  .srow.pref .srow-main {
+    flex: 1 0 100%;
+  }
+  .seg {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .seg-opt {
+    flex: 0 0 auto;
+    padding: 7px 10px;
+  }
+  .num-field {
+    margin-left: auto;
+  }
+  .srow-val,
+  .chev,
+  .toggle,
+  .ctx-meter {
+    margin-top: 2px;
+  }
+}
 </style>
