@@ -8,6 +8,7 @@ export default {
   account: '账户',
   uiFontSize: '字体大小',
   advanced: '高级',
+  build: '构建',
   exportLog: '故障排查日志',
   logHint: '加 ?debug=1 开启采集',
   exportLogBtn: '导出日志',

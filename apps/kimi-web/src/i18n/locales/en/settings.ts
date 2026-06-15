@@ -8,6 +8,7 @@ export default {
   account: 'Account',
   uiFontSize: 'Font size',
   advanced: 'Advanced',
+  build: 'Build',
   exportLog: 'Troubleshooting log',
   logHint: 'Enable with ?debug=1 to capture',
   exportLogBtn: 'Export log',

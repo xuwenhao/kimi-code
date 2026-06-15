@@ -39,6 +39,7 @@ const emit = defineEmits<{
 }>();
 
 const daemonEndpoint = serverEndpointLabel();
+const buildInfo = [__KIMI_WEB_VERSION__, __KIMI_WEB_COMMIT__].filter(Boolean).join(' · ');
 
 function handleKeydown(e: KeyboardEvent): void {
   if (e.key === 'Escape') emit('close');
@@ -146,6 +147,10 @@ function exportLog(): void {
           <div class="row">
             <span class="rlabel">{{ t('sidebar.daemon') }}</span>
             <span class="rvalue mono">{{ daemonEndpoint }}</span>
+          </div>
+          <div class="row">
+            <span class="rlabel">{{ t('settings.build') }}</span>
+            <span class="rvalue mono">{{ buildInfo }}</span>
           </div>
           <div class="row">
             <span class="rlabel">
