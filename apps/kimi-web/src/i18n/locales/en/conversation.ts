@@ -18,4 +18,5 @@ export default {
   undoConfirm: 'Undo last message?',
   confirm: 'Confirm',
   cancel: 'Cancel',
+  yesterday: 'Yesterday',
 } as const;

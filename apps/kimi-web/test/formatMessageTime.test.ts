@@ -32,6 +32,12 @@ describe('formatMessageTime', () => {
     expect(formatMessageTime(iso)).toBe('2025-12-31 09:00');
   });
 
+  it('uses custom yesterday label', () => {
+    vi.setSystemTime(new Date(2026, 5, 15, 14, 32));
+    const iso = localIso(2026, 6, 14, 9, 0);
+    expect(formatMessageTime(iso, 'Yesterday')).toBe('Yesterday 09:00');
+  });
+
   it('falls back to raw string on invalid date', () => {
     expect(formatMessageTime('not-a-date')).toBe('not-a-date');
   });

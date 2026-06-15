@@ -18,4 +18,5 @@ export default {
   undoConfirm: '确定撤销？',
   confirm: '确定',
   cancel: '取消',
+  yesterday: '昨天',
 } as const;
