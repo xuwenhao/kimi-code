@@ -34,6 +34,7 @@ import type { SessionUrlMode } from '../lib/sessionRoute';
 import { toAppEvent } from '../api/daemon/mappers';
 import { parseDiff } from '../lib/parseDiff';
 import { coerceThinkingForModel } from '../lib/modelThinking';
+import { keepLiveSubagents } from '../lib/taskMerge';
 import { messagesToTurns } from './messagesToTurns';
 import { latestTodos } from './latestTodos';
 import { buildSwarmGroups, countSwarmMembers } from './swarmGroups';
@@ -1116,7 +1117,8 @@ async function loadTasksForSession(sessionId: string): Promise<void> {
     const taskList = await api.listTasks(sessionId);
     rawState.tasksBySession = {
       ...rawState.tasksBySession,
-      [sessionId]: taskList,
+      // Keep WS-delivered swarm subagents that REST /tasks omits (see keepLiveSubagents).
+      [sessionId]: keepLiveSubagents(taskList, rawState.tasksBySession[sessionId] ?? []),
     };
     // Completed tasks may have real terminal output that never streamed over
     // WS. Fetch it once now so the rows are expandable when the session opens.
@@ -1236,7 +1238,7 @@ async function pollTaskOutputForSession(sessionId: string): Promise<void> {
   const existing = rawState.tasksBySession[sessionId] ?? [];
   const existingById = new Map(existing.map((t) => [t.id, t] as const));
 
-  const merged: AppTask[] = taskList.map((fresh) => {
+  const refreshed: AppTask[] = taskList.map((fresh) => {
     const old = existingById.get(fresh.id);
     const polled = outputByTaskId.get(fresh.id);
     return {
@@ -1250,7 +1252,8 @@ async function pollTaskOutputForSession(sessionId: string): Promise<void> {
 
   rawState.tasksBySession = {
     ...rawState.tasksBySession,
-    [sessionId]: merged,
+    // Keep WS-delivered swarm subagents that REST /tasks omits (see keepLiveSubagents).
+    [sessionId]: keepLiveSubagents(refreshed, existing),
   };
 }
 
