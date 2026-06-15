@@ -12,6 +12,8 @@ export default defineConfig({
   format: ['esm'],
   outDir: 'dist',
   clean: true,
+  dts: false,
+  hash: false,
   banner: {
     js: [
       '#!/usr/bin/env node',
@@ -37,5 +39,9 @@ export default defineConfig({
     // prebuilt binary. Bundling it leaves the binary unresolvable → the terminal
     // PTY fails with "Failed to load native module: pty.node".
     neverBundle: ['node-pty'],
+  },
+  outputOptions: {
+    codeSplitting: false,
+    entryFileNames: 'main.mjs',
   },
 });
