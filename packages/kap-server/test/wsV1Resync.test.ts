@@ -70,19 +70,36 @@ function openConn(url: string, token: string): Promise<Conn> {
               res(frames.splice(idx, 1)[0]!);
               return;
             }
-            const t = setTimeout(() => {
-              const i = waiters.indexOf(waiter);
-              if (i >= 0) waiters.splice(i, 1);
-              rej(new Error('timeout waiting for frame'));
-            }, timeoutMs);
+            // Absolute deadline so non-matching frames (e.g. global
+            // `event.session.status_changed` that bypass an agent_filter)
+            // don't clear the timeout and strand the waiter forever: each
+            // non-match re-arms against the time remaining to the deadline.
+            const deadline = Date.now() + timeoutMs;
+            let t: ReturnType<typeof setTimeout>;
             const waiter = (f: Frame): void => {
               clearTimeout(t);
               if (pred(f)) res(f);
               else {
                 frames.push(f);
                 waiters.push(waiter);
+                arm();
               }
             };
+            const arm = (): void => {
+              const left = deadline - Date.now();
+              if (left <= 0) {
+                const i = waiters.indexOf(waiter);
+                if (i >= 0) waiters.splice(i, 1);
+                rej(new Error('timeout waiting for frame'));
+                return;
+              }
+              t = setTimeout(() => {
+                const i = waiters.indexOf(waiter);
+                if (i >= 0) waiters.splice(i, 1);
+                rej(new Error('timeout waiting for frame'));
+              }, left);
+            };
+            arm();
             waiters.push(waiter);
           }),
       }),

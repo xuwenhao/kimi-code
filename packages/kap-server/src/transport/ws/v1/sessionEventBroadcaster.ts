@@ -527,9 +527,11 @@ export class SessionEventBroadcaster {
       // `session.status === 'running'`) never renders. Emitted before
       // `turn.started` so the web projector's `turn.started` synthesis (which
       // binds the real prompt_id) applies after and keeps `currentPromptId`
-      // intact; idle/aborted are left to the projector's `turn.ended`
-      // synthesis, awaiting states to the client-side approval/question lists.
-      // Mirrors v1's sessionService status_changed emission.
+      // intact. The matching idle/aborted transition is emitted on `turn.ended`
+      // below — kimi-web treats `event.session.status_changed` as the single
+      // source of status transitions and does NOT synthesize idle from
+      // `turn.ended`. Awaiting states stay in the client-side approval/question
+      // lists. Mirrors v1's sessionService status_changed emission.
       this.enqueueDurable(state, {
         type: 'event.session.status_changed',
         status: 'running',
@@ -542,6 +544,31 @@ export class SessionEventBroadcaster {
     state.queue = state.queue
       .then(() => this.dispatch(state, wireEvent, volatile))
       .catch(() => {});
+    if (event.type === 'turn.ended') {
+      // Symmetric to the `running` emission on `turn.started` above: v2 derives
+      // session status via `ISessionActivity` (a pure pull) and publishes
+      // nothing, and kimi-web's `turn.ended` projector deliberately does NOT
+      // synthesize a status flip — the daemon's `event.session.status_changed`
+      // is its only turn-end signal (it drives `onSessionIdle` queue flush and
+      // clears the Stop/loading state). Without this the session stays
+      // `running` forever once the turn ends; most visibly for background tasks
+      // (`task.started`), where `ISessionActivity` keeps reporting non-idle
+      // while the detached task lives, so even a REST pull never corrects it.
+      // Mirrors v1's `_handleBusEvent('turn.ended')` → `_computeStatus`
+      // (`cancelled`/`failed`/`blocked` ⇒ `aborted`, else `idle`). Emitted after
+      // `turn.ended` (same queue) so the web finishes the assistant message
+      // before flipping status and running turn-end cleanup.
+      const reason = (event as { reason?: unknown }).reason;
+      const status =
+        reason === 'cancelled' || reason === 'failed' || reason === 'blocked' ? 'aborted' : 'idle';
+      this.enqueueDurable(state, {
+        type: 'event.session.status_changed',
+        status,
+        previous_status: 'running',
+        agentId: 'main',
+        sessionId,
+      } as unknown as Event);
+    }
     // v1 wire compat: fan the legacy `background.task.*` spelling out next to
     // the native `task.*` event (see `legacyTaskEvent`) so unchanged v1 clients
     // keep working while v2-shaped clients ignore the alias. Same volatility as
