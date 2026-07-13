@@ -27,6 +27,7 @@ function createProvider(
     stream: boolean;
     reasoningKey: string;
     model: string;
+    supportEfforts: readonly string[];
   }>,
 ): OpenAILegacyChatProvider {
   return new OpenAILegacyChatProvider({
@@ -34,6 +35,7 @@ function createProvider(
     apiKey: 'test-key',
     stream: options?.stream ?? false,
     reasoningKey: options?.reasoningKey,
+    supportEfforts: options?.supportEfforts,
   });
 }
 
@@ -923,7 +925,7 @@ describe('OpenAILegacyChatProvider', () => {
       },
     );
 
-    it('.withThinking("max") maps to xhigh without model-specific clamping', async () => {
+    it('.withThinking("max") passes max through verbatim', async () => {
       const history: Message[] = [
         { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
       ];
@@ -947,9 +949,51 @@ describe('OpenAILegacyChatProvider', () => {
         history,
       );
 
-      expect(openAIChatModel['reasoning_effort']).toBe('xhigh');
-      expect(openAIProModel['reasoning_effort']).toBe('xhigh');
-      expect(deepSeekModel['reasoning_effort']).toBe('xhigh');
+      expect(openAIChatModel['reasoning_effort']).toBe('max');
+      expect(openAIProModel['reasoning_effort']).toBe('max');
+      expect(deepSeekModel['reasoning_effort']).toBe('max');
+    });
+
+    it('passes max through verbatim', async () => {
+      const provider = createProvider({ model: 'kimi-for-coding' }).withThinking('max');
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
+      ];
+      const body = await captureRequestBody(provider, '', [], history);
+
+      expect(body['reasoning_effort']).toBe('max');
+      expect(provider.thinkingEffort).toBe('max');
+    });
+
+    it('passes concrete effort strings through verbatim', async () => {
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
+      ];
+      for (const requested of ['xhigh', 'medium', 'extreme'] as const) {
+        const body = await captureRequestBody(
+          createProvider({ model: 'kimi-for-coding' }).withThinking(requested),
+          '',
+          [],
+          history,
+        );
+        expect(body['reasoning_effort']).toBe(requested);
+      }
+    });
+
+    it('omits undeclared efforts for Kimi-style supportEfforts', async () => {
+      const history: Message[] = [
+        { role: 'user', content: [{ type: 'text', text: 'Think' }], toolCalls: [] },
+      ];
+      const provider = createProvider({
+        model: 'kimi-for-coding',
+        supportEfforts: ['low', 'high', 'max'],
+      });
+
+      const maxBody = await captureRequestBody(provider.withThinking('max'), '', [], history);
+      const xhighBody = await captureRequestBody(provider.withThinking('xhigh'), '', [], history);
+
+      expect(maxBody['reasoning_effort']).toBe('max');
+      expect(xhighBody['reasoning_effort']).toBeUndefined();
     });
   });
 

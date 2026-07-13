@@ -805,7 +805,8 @@ describe('KimiChatProvider', () => {
 
     it('effort-capable model omits effort for efforts not declared in support_efforts', async () => {
       // 'xhigh' / 'on' / 'foo' are not in ['low', 'high', 'max'], so the
-      // provider normalizes them to "enabled, no effort" instead of rejecting.
+      // provider sends enabled thinking without an effort and lets Kimi use
+      // the model default.
       for (const effort of ['xhigh', 'on', 'foo']) {
         const provider = createProvider(false, ['low', 'high', 'max']).withThinking(effort);
         const history: Message[] = [

@@ -47,6 +47,9 @@ export interface KimiOptions {
   stream?: boolean | undefined;
   defaultHeaders?: Record<string, string> | undefined;
   generationKwargs?: GenerationKwargs | undefined;
+  /** Efforts the model advertises (e.g. ["low", "high", "max"]). When
+   * present and non-empty, withThinking sends the chosen effort only when it
+   * is in this set; otherwise only thinking.type is sent. */
   supportEfforts?: readonly string[];
   clientFactory?: (auth: ProviderRequestAuth) => OpenAI;
 }
@@ -532,6 +535,9 @@ export class KimiChatProvider implements ChatProvider {
   }
 
   withThinking(effort: ThinkingEffort): KimiChatProvider {
+    // Only efforts the endpoint declares via `support_efforts` go on the wire.
+    // When the request is not declared, omit effort and let Kimi apply the
+    // model's default effort.
     let thinking: ThinkingConfig;
     if (effort === 'off') {
       thinking = { type: 'disabled' };

@@ -376,7 +376,6 @@ function buildProtocolProviderOptions(
       break;
     }
     case 'kimi':
-      if (model.supportEfforts !== undefined) options.supportEfforts = model.supportEfforts;
       break;
     case 'vertexai': {
       const project = vertexAIProject(provider);
@@ -393,6 +392,10 @@ function buildProtocolProviderOptions(
       const exhaustive: never = protocol;
       void exhaustive;
     }
+  }
+
+  if (provider?.type === 'kimi' && model.supportEfforts !== undefined) {
+    options.supportEfforts = model.supportEfforts;
   }
 
   return Object.values(options).some((value) => value !== undefined)

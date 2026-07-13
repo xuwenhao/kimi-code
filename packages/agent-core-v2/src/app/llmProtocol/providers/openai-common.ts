@@ -7,7 +7,7 @@ import {
 } from '../errors';
 import { extractText } from '../message';
 import type { ContentPart, Message } from '../message';
-import type { FinishReason, ThinkingEffort } from '../provider';
+import type { FinishReason } from '../provider';
 import type { Tool } from '../tool';
 import type { TokenUsage } from '../usage';
 import {
@@ -144,53 +144,6 @@ export function isFunctionToolCall<T extends { type: string }>(
   tc: T,
 ): tc is T & FunctionToolCallShape {
   return tc.type === 'function';
-}
-/**
- * Map kosong `ThinkingEffort` to OpenAI `reasoning_effort` string.
- */
-export function thinkingEffortToReasoningEffort(effort: ThinkingEffort): string | undefined {
-  switch (effort) {
-    case 'off':
-      return undefined;
-    case 'low':
-      return 'low';
-    case 'medium':
-      return 'medium';
-    case 'high':
-      return 'high';
-    case 'xhigh':
-    case 'max':
-      return 'xhigh';
-    default:
-      return undefined;
-  }
-}
-
-/**
- * Map OpenAI `reasoning_effort` string back to kosong `ThinkingEffort`.
- */
-export function reasoningEffortToThinkingEffort(
-  reasoning: string | undefined,
-): ThinkingEffort | null {
-  if (reasoning === undefined || reasoning === null) {
-    return null;
-  }
-  switch (reasoning) {
-    case 'low':
-    case 'minimal':
-      return 'low';
-    case 'medium':
-      return 'medium';
-    case 'high':
-      return 'high';
-    case 'xhigh':
-    case 'max':
-      return 'xhigh';
-    case 'none':
-      return 'off';
-    default:
-      return 'off';
-  }
 }
 /**
  * Extract `TokenUsage` from an OpenAI-compatible usage object.

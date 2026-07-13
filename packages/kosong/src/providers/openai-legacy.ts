@@ -25,8 +25,6 @@ import {
   TOOL_RESULT_MEDIA_PLACEHOLDER,
   TOOL_RESULT_MEDIA_PROMPT,
   type ToolMessageConversion,
-  reasoningEffortToThinkingEffort,
-  thinkingEffortToReasoningEffort,
   toolToOpenAI,
 } from './openai-common';
 import {
@@ -100,6 +98,8 @@ export interface OpenAILegacyOptions {
   httpClient?: unknown;
   defaultHeaders?: Record<string, string>;
   toolMessageConversion?: ToolMessageConversion | undefined;
+  /** Kimi-managed endpoint effort set. When present, only declared values send. */
+  supportEfforts?: readonly string[] | undefined;
   clientFactory?: (auth: ProviderRequestAuth) => OpenAI;
 }
 
@@ -483,6 +483,7 @@ export class OpenAILegacyChatProvider implements ChatProvider {
   private _defaultHeaders: Record<string, string> | undefined;
   private _reasoningKey: string | undefined;
   private _reasoningEffort: string | undefined;
+  private readonly _supportEfforts: readonly string[];
   private _generationKwargs: OpenAILegacyGenerationKwargs;
   private _toolMessageConversion: ToolMessageConversion;
   private _client: OpenAI | undefined;
@@ -506,6 +507,7 @@ export class OpenAILegacyChatProvider implements ChatProvider {
         ? normalizedReasoningKey
         : undefined;
     this._reasoningEffort = undefined;
+    this._supportEfforts = options.supportEfforts ?? [];
     this._generationKwargs =
       options.maxTokens !== undefined ? completionTokenKwargs(this._model, options.maxTokens) : {};
     this._toolMessageConversion = options.toolMessageConversion ?? null;
@@ -520,7 +522,8 @@ export class OpenAILegacyChatProvider implements ChatProvider {
   }
 
   get thinkingEffort(): ThinkingEffort | null {
-    return reasoningEffortToThinkingEffort(this._reasoningEffort);
+    if (this._reasoningEffort === undefined) return null;
+    return this._reasoningEffort === 'none' ? 'off' : this._reasoningEffort;
   }
 
   get modelParameters(): Record<string, unknown> {
@@ -617,7 +620,12 @@ export class OpenAILegacyChatProvider implements ChatProvider {
   }
 
   withThinking(effort: ThinkingEffort): OpenAILegacyChatProvider {
-    const reasoningEffort = thinkingEffortToReasoningEffort(effort);
+    const reasoningEffort =
+      effort === 'off' ||
+      effort === 'on' ||
+      (this._supportEfforts.length > 0 && !this._supportEfforts.includes(effort))
+        ? undefined
+        : effort;
     const clone = this._clone();
     clone._reasoningEffort = reasoningEffort;
     return clone;

@@ -629,6 +629,44 @@ describe('ModelResolverService', () => {
       });
     });
 
+    it('does not pass supportEfforts through for non-Kimi providers', async () => {
+      providers['p'] = { type: 'anthropic', baseUrl: 'https://example.test', apiKey: 'sk' };
+      models['m'] = {
+        provider: 'p',
+        model: 'kimi-for-coding',
+        maxContextSize: 1000,
+        supportEfforts: ['low', 'high', 'max'],
+      };
+
+      const config = await resolveAndCreateProvider();
+
+      expect(config).toMatchObject({
+        protocol: 'anthropic',
+      });
+      const providerOptions = config?.['providerOptions'] as
+        | { readonly supportEfforts?: readonly string[] }
+        | undefined;
+      expect(providerOptions?.supportEfforts).toBeUndefined();
+    });
+
+    it('passes Kimi supportEfforts through when Kimi uses the Anthropic protocol', async () => {
+      providers['p'] = { type: 'kimi', baseUrl: 'https://example.test', apiKey: 'sk' };
+      models['m'] = {
+        provider: 'p',
+        protocol: 'anthropic',
+        model: 'kimi-for-coding',
+        maxContextSize: 1000,
+        supportEfforts: ['low', 'high', 'max'],
+      };
+
+      const config = await resolveAndCreateProvider();
+
+      expect(config).toMatchObject({
+        protocol: 'anthropic',
+        providerOptions: { supportEfforts: ['low', 'high', 'max'] },
+      });
+    });
+
     it('passes Vertex service-account options and derives location from the baseUrl', async () => {
       providers['p'] = {
         type: 'vertexai',

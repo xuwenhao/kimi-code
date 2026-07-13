@@ -271,6 +271,7 @@ function toKosongProviderConfig(
         ...(maxOutputSize !== undefined ? { defaultMaxTokens: maxOutputSize } : {}),
         ...(adaptiveThinking !== undefined ? { adaptiveThinking } : {}),
         ...(betaApi !== undefined ? { betaApi } : {}),
+        ...(provider.type === 'kimi' && supportEfforts !== undefined ? { supportEfforts } : {}),
         // Session affinity: Anthropic's analog of OpenAI `prompt_cache_key` is
         // `metadata.user_id` on the Messages API (cache-affinity / end-user id).
         ...(promptCacheKey !== undefined ? { metadata: { user_id: promptCacheKey } } : {}),
@@ -295,6 +296,7 @@ function toKosongProviderConfig(
         baseUrl: providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
         apiKey: providerApiKey(provider),
         reasoningKey,
+        ...(provider.type === 'kimi' && supportEfforts !== undefined ? { supportEfforts } : {}),
         ...defaultHeadersField({
           ...envCustomHeaders,
           ...kimiUserAgentHeader(kimiRequestHeaders),
@@ -333,6 +335,7 @@ function toKosongProviderConfig(
         model,
         baseUrl: providerValue(provider.baseUrl, provider.env, 'OPENAI_BASE_URL'),
         apiKey: providerApiKey(provider),
+        ...(provider.type === 'kimi' && supportEfforts !== undefined ? { supportEfforts } : {}),
         ...defaultHeadersField({
           ...envCustomHeaders,
           ...kimiUserAgentHeader(kimiRequestHeaders),

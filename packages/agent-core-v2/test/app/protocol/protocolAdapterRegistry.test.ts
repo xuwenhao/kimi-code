@@ -70,12 +70,31 @@ describe('ProtocolAdapterRegistry', () => {
       extra_body: { thinking: { type: 'enabled' } },
     });
     expect(provider.withThinking('medium').thinkingEffort).toBe('on');
+    expect(Reflect.get(provider.withThinking('xhigh'), '_generationKwargs')).toEqual({
+      extra_body: { thinking: { type: 'enabled' } },
+    });
+    expect(provider.withThinking('xhigh').thinkingEffort).toBe('on');
     expect(
       Reflect.get(provider.withThinking('high').withThinking('off'), '_generationKwargs'),
     ).toEqual({
       extra_body: { thinking: { type: 'disabled' } },
     });
     expect(provider.withThinking('high').withThinking('off').thinkingEffort).toBe('off');
+  });
+
+  it('maps supportEfforts into OpenAI provider config', () => {
+    const provider = new ProtocolAdapterRegistry().createChatProvider({
+      protocol: 'openai',
+      baseUrl: 'https://example.test/v1',
+      modelName: 'kimi-for-coding',
+      apiKey: 'sk',
+      providerOptions: { supportEfforts: ['low', 'high', 'max'] },
+    });
+
+    expect(Reflect.get(provider.withThinking('max'), '_reasoningEffort')).toBe('max');
+    expect(provider.withThinking('max').thinkingEffort).toBe('max');
+    expect(Reflect.get(provider.withThinking('medium'), '_reasoningEffort')).toBeUndefined();
+    expect(provider.withThinking('medium').thinkingEffort).toBeNull();
   });
 
   it('maps providerOptions into Vertex provider config', () => {
