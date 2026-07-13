@@ -978,7 +978,7 @@ describe('SessionSwarmService metadata compatibility', () => {
   let agents: Record<string, AgentMeta>;
   let handles: Map<string, IAgentScopeHandle>;
   let lifecycle: IAgentLifecycleService;
-  let createAgent: ReturnType<typeof vi.fn>;
+  let createAgent: ReturnType<typeof vi.fn<IAgentLifecycleService['create']>>;
   let runAgent: ReturnType<typeof vi.fn>;
   let eventBus: IEventBus;
 
@@ -989,7 +989,7 @@ describe('SessionSwarmService metadata compatibility', () => {
     handles = new Map();
     eventBus = eventBusStub();
     lifecycle = lifecycleStub(handles, eventBus);
-    createAgent = lifecycle.create as ReturnType<typeof vi.fn>;
+    createAgent = lifecycle.create as ReturnType<typeof vi.fn<IAgentLifecycleService['create']>>;
     runAgent = lifecycle.run as ReturnType<typeof vi.fn>;
     handles.set('main', agentHandle('main', lifecycle, eventBus));
 
@@ -1190,7 +1190,7 @@ describe('SessionSwarmService metadata compatibility', () => {
         [IAgentUserToolService, parentUserTools],
       ])),
     );
-    createAgent.mockImplementationOnce((opts: CreateAgentOptions = {}) => {
+    createAgent.mockImplementationOnce(async (opts: CreateAgentOptions = {}) => {
       const id = opts.agentId ?? 'agent-new';
       const handle = agentHandle(
         id,
