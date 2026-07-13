@@ -8,6 +8,7 @@ export interface IAgentContextProjectorService {
 
   project(messages: readonly ContextMessage[]): readonly Message[];
   projectStrict(messages: readonly ContextMessage[]): readonly Message[];
+  projectMediaStripped(messages: readonly ContextMessage[]): readonly Message[];
 }
 
 export const IAgentContextProjectorService = createDecorator<IAgentContextProjectorService>(

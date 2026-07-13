@@ -631,6 +631,51 @@ describe('FullCompaction', () => {
     await ctx.expectResumeMatches();
   });
 
+  it('recovers from an image-format rejection with a media-stripped resend', async () => {
+    // A poisoned image in the history makes the provider reject every request
+    // with a deterministic image-format 400 — the summarizer request included.
+    // The compaction must not fail: the requester resends once with every
+    // media part replaced by a text marker (read-side only — the stored
+    // history keeps its media), the only projection guaranteed to carry no
+    // poison.
+    let attempts = 0;
+    let sawMedia = false;
+    let sawStrippedResend = false;
+    const generate: GenerateFn = async (_provider, _system, _tools, history) => {
+      attempts += 1;
+      const hasMedia = history.some((message) =>
+        message.content.some((part) => part.type === 'image_url' || part.type === 'video_url'),
+      );
+      if (hasMedia) {
+        sawMedia = true;
+        throw new APIStatusError(400, 'unsupported image format: image/avif');
+      }
+      sawStrippedResend = true;
+      return textResult('Recovered compacted summary.');
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    // Seeds an image_url and a video_url part — the poison the provider
+    // rejects on every request until the media-stripped resend.
+    ctx.appendRichToolExchange();
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const compacted = ctx.once('full_compaction.complete');
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await compacted;
+    await completed;
+
+    expect(attempts).toBe(2);
+    expect(sawMedia).toBe(true);
+    expect(sawStrippedResend).toBe(true);
+    await ctx.expectResumeMatches();
+  });
+
   it('retries compaction responses with empty summaries before applying context', async () => {
     vi.useFakeTimers();
     const firstEmptySummary = deferred<void>();

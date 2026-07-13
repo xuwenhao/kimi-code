@@ -35,6 +35,7 @@ import {
   APIStatusError,
   APITimeoutError,
   isContextOverflowStatusError,
+  isImageFormatError,
   isRecoverableRequestStructureError,
   isRetryableGenerateError,
 } from '#/app/llmProtocol/errors';
@@ -93,6 +94,15 @@ interface ResolvedLLMRequest {
   readonly logFields: LLMRequestLogFields;
 }
 
+/**
+ * Which projection a request attempt is built from: the normal wire
+ * projection, or one of the two one-shot recovery rebuilds — `strict`
+ * (guaranteed wire-compliant) after a structural rejection, `media-stripped`
+ * (every media part replaced by a text marker) after an image-format
+ * rejection.
+ */
+type RequestProjection = 'normal' | 'strict' | 'media-stripped';
+
 interface LLMRequestLogInput {
   readonly protocol: Protocol;
   readonly modelName: string;
@@ -121,6 +131,14 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
 
   private lastConfigLogSignature: string | undefined;
   private readonly turnConfigs = new Map<number, TurnRequestConfig>();
+  /**
+   * Turns whose steps must build from the media-stripped projection: once a
+   * step only succeeded via the image-format resend, the poison is still in
+   * the full history, so later steps of the same turn stay stripped (v1
+   * parity: run-turn's `mediaStrippedActive`). Turn ids are monotonic per
+   * agent, so a newer turn evicts every older entry.
+   */
+  private readonly mediaStrippedTurns = new Set<number>();
 
   constructor(
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
@@ -207,19 +225,26 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     onPart: LLMRequestPartHandler,
     signal: AbortSignal | undefined,
   ): Promise<LLMRequestFinish> {
-    const requestInput = (strict: boolean) => ({
-      systemPrompt: request.systemPrompt,
-      tools: request.tools,
-      messages: strict
-        ? this.projector.projectStrict(this.toolSelect.shapeHistory(request.messages))
-        : this.projector.project(this.toolSelect.shapeHistory(request.messages)),
-    });
+    const requestInput = (projection: RequestProjection) => {
+      const shaped = this.toolSelect.shapeHistory(request.messages);
+      return {
+        systemPrompt: request.systemPrompt,
+        tools: request.tools,
+        messages:
+          projection === 'strict'
+            ? this.projector.projectStrict(shaped)
+            : projection === 'media-stripped'
+              ? this.projector.projectMediaStripped(shaped)
+              : this.projector.project(shaped),
+      };
+    };
 
-    const run = async (strict: boolean): Promise<LLMRequestFinish> => {
-      const input = requestInput(strict);
-      const fields = strict
-        ? { ...request.logFields, projection: 'strict' }
-        : request.logFields;
+    const run = async (projection: RequestProjection): Promise<LLMRequestFinish> => {
+      const input = requestInput(projection);
+      const fields =
+        projection === 'normal'
+          ? request.logFields
+          : { ...request.logFields, projection };
       const logInput: LLMRequestLogInput = {
         protocol: request.model.protocol,
         modelName: request.model.name,
@@ -278,17 +303,62 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
       };
     };
 
+    // Once a step of this turn only succeeded via the media-stripped resend,
+    // later steps build from the stripped projection directly: the poison is
+    // still in the full history, so rebuilding it would pay a fresh rejection
+    // on every step (v1 parity: run-turn's mediaStrippedActive).
+    const initialProjection: RequestProjection = this.isMediaStrippedTurn(request.source)
+      ? 'media-stripped'
+      : 'normal';
     try {
-      return await run(false);
+      return await run(initialProjection);
     } catch (error) {
-      if (signal?.aborted === true || !isRecoverableRequestStructureError(unwrapErrorCause(error))) throw error;
-      signal?.throwIfAborted();
-      this.log.warn('provider rejected request structure; resending with strict projection', {
-        model: request.model.name,
-        ...request.logFields,
-      });
-      return run(true);
+      if (signal?.aborted === true) throw error;
+      const raw = unwrapErrorCause(error);
+      if (initialProjection !== 'media-stripped' && isImageFormatError(raw)) {
+        // The provider rejected an IMAGE in the request (unsupported format
+        // or undecodable data). Unlike a size rejection — too MUCH media —
+        // the error never says WHICH image is poison, and the same history
+        // is re-sent every request, so the session would stay stuck. Resend
+        // ONCE with every media part replaced by a text marker: the only
+        // projection guaranteed to carry no poison. Read-side only — the
+        // history keeps its media, and the `<image path="...">` wrappers
+        // survive so the model can re-read files (getting conversion
+        // guidance for refused formats). A rejection of that rebuild
+        // propagates unchanged.
+        signal?.throwIfAborted();
+        this.log.warn(
+          'provider rejected an image in the request; resending with all media stripped',
+          {
+            model: request.model.name,
+            ...request.logFields,
+          },
+        );
+        this.markMediaStrippedTurn(request.source);
+        return run('media-stripped');
+      }
+      if (initialProjection === 'normal' && isRecoverableRequestStructureError(raw)) {
+        signal?.throwIfAborted();
+        this.log.warn('provider rejected request structure; resending with strict projection', {
+          model: request.model.name,
+          ...request.logFields,
+        });
+        return run('strict');
+      }
+      throw error;
     }
+  }
+
+  private isMediaStrippedTurn(source: LLMRequestSource | undefined): boolean {
+    if (source?.type !== 'turn') return false;
+    for (const id of this.mediaStrippedTurns) {
+      if (id < source.turnId) this.mediaStrippedTurns.delete(id);
+    }
+    return this.mediaStrippedTurns.has(source.turnId);
+  }
+
+  private markMediaStrippedTurn(source: LLMRequestSource | undefined): void {
+    if (source?.type === 'turn') this.mediaStrippedTurns.add(source.turnId);
   }
 
   private resolveRequest(overrides: LLMRequestOverrides): ResolvedLLMRequest {
@@ -504,8 +574,9 @@ function numberField(fields: LLMRequestLogFields, key: string): number | undefin
   return typeof value === 'number' ? value : undefined;
 }
 
-function projectionField(fields: LLMRequestLogFields): 'strict' | undefined {
-  return fields['projection'] === 'strict' ? 'strict' : undefined;
+function projectionField(fields: LLMRequestLogFields): 'strict' | 'media-stripped' | undefined {
+  const value = fields['projection'];
+  return value === 'strict' || value === 'media-stripped' ? value : undefined;
 }
 
 function fingerprint(content: string): string {

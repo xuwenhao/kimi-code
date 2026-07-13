@@ -10,6 +10,11 @@
  * dropped) are reported through an optional sink and surfaced once here as a
  * single deduped warning plus a `context_projection_repaired` telemetry event,
  * so a silently-mangled history always leaves a trace.
+ *
+ * `projectMediaStripped` is the fallback projection for the resend after the
+ * provider rejected an image's format: every media part is replaced by a text
+ * marker (read-side only — the history keeps its media), since the error never
+ * says WHICH image is poison and only a full strip guarantees a clean request.
  */
 
 import { InstantiationType } from '#/_base/di/extensions';
@@ -42,6 +47,10 @@ export class AgentContextProjectorService implements IAgentContextProjectorServi
 
   projectStrict(messages: readonly ContextMessage[]): readonly Message[] {
     return this.projectWithTrace(messages, projectStrict);
+  }
+
+  projectMediaStripped(messages: readonly ContextMessage[]): readonly Message[] {
+    return stripAllMediaParts(this.projectWithTrace(messages, project));
   }
 
   private projectWithTrace(
@@ -148,6 +157,55 @@ type ProjectionAnomaly =
   | { readonly kind: 'whitespace_text_dropped'; readonly role: string };
 
 type OnAnomaly = (anomaly: ProjectionAnomaly) => void;
+
+/**
+ * Markers for the media-stripped resend after the provider rejected an
+ * image's FORMAT (not its size): the image marker points the model at
+ * re-reading the file, whose refusal carries per-OS conversion instructions;
+ * audio/video are collateral of the full strip and say so.
+ */
+export const MEDIA_STRIPPED_PLACEHOLDERS = {
+  image_url:
+    '[image omitted: the provider rejected this image; re-read the file for conversion instructions]',
+  audio_url:
+    '[audio omitted: dropped along with a rejected image; re-read the file to hear it]',
+  video_url:
+    '[video omitted: dropped along with a rejected image; re-read the file to view it]',
+} as const;
+
+function isStrippableMediaPart(
+  part: ContentPart,
+): part is ContentPart & { type: keyof typeof MEDIA_STRIPPED_PLACEHOLDERS } {
+  return part.type in MEDIA_STRIPPED_PLACEHOLDERS;
+}
+
+/**
+ * Replace EVERY media part with a deterministic text marker — the projection
+ * for the resend after an image-format rejection, where the poisoned image
+ * could be anywhere in the history and only a full strip guarantees a clean
+ * request. A purely read-side transform — the underlying history is left
+ * untouched — that trades pixels for deliverability while the surrounding
+ * text (including ReadMediaFile's `<image path="...">` wrapper) survives, so
+ * the model can re-read any file it still needs. Untouched messages are
+ * returned by reference, and when nothing needs stripping the input array
+ * itself is returned.
+ */
+export function stripAllMediaParts(messages: readonly Message[]): readonly Message[] {
+  if (!messages.some((message) => message.content.some(isStrippableMediaPart))) {
+    return messages;
+  }
+  return messages.map((message) => {
+    if (!message.content.some(isStrippableMediaPart)) return message;
+    return {
+      ...message,
+      content: message.content.map((part): ContentPart =>
+        isStrippableMediaPart(part)
+          ? { type: 'text', text: MEDIA_STRIPPED_PLACEHOLDERS[part.type] }
+          : part,
+      ),
+    };
+  });
+}
 
 function projectStrict(history: readonly ContextMessage[], onAnomaly?: OnAnomaly): Message[] {
   const projected = project(history, onAnomaly);

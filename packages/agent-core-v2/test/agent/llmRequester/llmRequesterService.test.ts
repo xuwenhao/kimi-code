@@ -1,9 +1,11 @@
 /**
- * Scenario: LLM requester retries once with strict projection after provider
- * tool-use adjacency rejection.
+ * Scenario: LLM requester retries once with a recovery projection after a
+ * deterministic provider rejection — strict projection for tool-use
+ * adjacency / structural rejections, media-stripped projection for
+ * image-format rejections (with per-turn stickiness).
  *
- * Responsibilities: assert retry eligibility, strict-history rebuilding,
- * request recording, and usage accounting. Wiring: real
+ * Responsibilities: assert retry eligibility, strict/stripped-history
+ * rebuilding, request recording, and usage accounting. Wiring: real
  * AgentLLMRequesterService with stubbed context memory, projector, context
  * sizing, profile, model, telemetry, and wire/log services. Run:
  * ../../node_modules/.bin/vitest run test/llmRequester/strict-resend.test.ts
@@ -47,7 +49,7 @@ const history: Message[] = [
   { role: 'user', content: [{ type: 'text', text: 'hello' }], toolCalls: [] },
 ];
 
-function createModel(calls: { value: number }): Model {
+function createModel(calls: { value: number }, firstCallError?: Error): Model {
   const build = (): Model => ({
     id: 'm',
     name: 'wire-model',
@@ -69,7 +71,7 @@ function createModel(calls: { value: number }): Model {
     request: async function* () {
       calls.value += 1;
       if (calls.value === 1) {
-        throw new APIStatusError(400, 'messages: `tool_use` ids must be unique');
+        throw firstCallError ?? new APIStatusError(400, 'messages: `tool_use` ids must be unique');
       }
       yield {
         type: 'finish',
@@ -93,7 +95,8 @@ afterEach(() => disposables.dispose());
 
 function createService(
   model: Model,
-  projector: Pick<IAgentContextProjectorService, 'project' | 'projectStrict'>,
+  projector: Pick<IAgentContextProjectorService, 'project' | 'projectStrict'> &
+    Partial<Pick<IAgentContextProjectorService, 'projectMediaStripped'>>,
 ) {
   const ix = disposables.add(new TestInstantiationService());
   const profile: Partial<IAgentProfileService> = {
@@ -204,5 +207,92 @@ describe('AgentLLMRequesterService strict resend', () => {
       statusCode: 401,
     });
     expect(strictCalls).toBe(0);
+  });
+});
+
+describe('AgentLLMRequesterService media-stripped resend', () => {
+  const IMAGE_FORMAT_400 = new APIStatusError(
+    400,
+    'unsupported image format: image/avif is not supported',
+  );
+
+  it('resends once with the media-stripped projection after an image-format 400', async () => {
+    const calls = { value: 0 };
+    let projectCalls = 0;
+    let strictCalls = 0;
+    let strippedCalls = 0;
+    const service = createService(createModel(calls, IMAGE_FORMAT_400), {
+      project: (messages: readonly ContextMessage[]) => {
+        projectCalls += 1;
+        return messages;
+      },
+      projectStrict: (messages: readonly ContextMessage[]) => {
+        strictCalls += 1;
+        return messages;
+      },
+      projectMediaStripped: (messages: readonly ContextMessage[]) => {
+        strippedCalls += 1;
+        return messages;
+      },
+    });
+
+    const result = await service.request();
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'ok' }]);
+    expect(calls.value).toBe(2);
+    expect(projectCalls).toBe(1);
+    expect(strictCalls).toBe(0);
+    expect(strippedCalls).toBe(1);
+  });
+
+  it('keeps later steps of the same turn on the stripped projection', async () => {
+    const calls = { value: 0 };
+    let projectCalls = 0;
+    let strippedCalls = 0;
+    const service = createService(createModel(calls, IMAGE_FORMAT_400), {
+      project: (messages: readonly ContextMessage[]) => {
+        projectCalls += 1;
+        return messages;
+      },
+      projectStrict: (messages: readonly ContextMessage[]) => messages,
+      projectMediaStripped: (messages: readonly ContextMessage[]) => {
+        strippedCalls += 1;
+        return messages;
+      },
+    });
+
+    // Step 1: normal projection rejected, media-stripped resend recovers.
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    expect(calls.value).toBe(2);
+    expect(projectCalls).toBe(1);
+    expect(strippedCalls).toBe(1);
+
+    // Step 2 of the same turn: the poison is still in the full history, so
+    // the request builds from the stripped projection directly — no fresh
+    // rejection, no normal projection.
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+    expect(calls.value).toBe(3);
+    expect(projectCalls).toBe(1);
+    expect(strippedCalls).toBe(2);
+  });
+
+  it('does not resend for an unrelated 400', async () => {
+    const calls = { value: 0 };
+    let strippedCalls = 0;
+    const service = createService(
+      createModel(calls, new APIStatusError(400, 'some other validation problem')),
+      {
+        project: (messages: readonly ContextMessage[]) => messages,
+        projectStrict: (messages: readonly ContextMessage[]) => messages,
+        projectMediaStripped: (messages: readonly ContextMessage[]) => {
+          strippedCalls += 1;
+          return messages;
+        },
+      },
+    );
+
+    await expect(service.request()).rejects.toMatchObject({ statusCode: 400 });
+    expect(calls.value).toBe(1);
+    expect(strippedCalls).toBe(0);
   });
 });

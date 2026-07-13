@@ -70,7 +70,10 @@ export const llmRequest = LlmRequestTraceModel.defineOp('llm.request', {
     messageCount: z.number(),
     turnStep: z.string().optional(),
     attempt: z.string().optional(),
-    projection: z.literal('strict').optional(),
+    /** Set when this request is a recovery resend (strict rebuild after a
+     * structural rejection, media-stripped rebuild after an image-format
+     * rejection). */
+    projection: z.enum(['strict', 'media-stripped']).optional(),
     droppedCount: z.number().optional(),
   }),
   apply: (s) => s,

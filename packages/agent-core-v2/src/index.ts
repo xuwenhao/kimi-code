@@ -308,6 +308,7 @@ export {
   buildImageCompressionCaption,
   compressBase64ForModel,
   compressImageForModel,
+  gateImageFormatParts,
   IMAGE_BYTE_BUDGET,
   MAX_IMAGE_EDGE_PX,
   READ_IMAGE_BYTE_BUDGET,
@@ -315,6 +316,17 @@ export {
   resolveReadImageByteBudget,
   type ImageCompressionTelemetry,
 } from '#/agent/media/image-compress';
+export {
+  MODEL_ACCEPTED_IMAGE_MIMES,
+  buildImageConversionGuidance,
+  buildUnsupportedImageNotice,
+  decodeBase64Prefix,
+  isModelAcceptedImageMime,
+  normalizeImageMime,
+  parseImageDataUrl,
+  resolveEffectiveImageMime,
+  unsupportedImageMimeFromUrl,
+} from '#/agent/media/image-format-policy';
 export {
   persistOriginalImage,
   sessionMediaOriginalsDir,
