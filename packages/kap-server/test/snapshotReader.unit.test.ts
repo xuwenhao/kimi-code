@@ -50,7 +50,7 @@ interface Fixture {
   sessionDir: (sid: string) => string;
   index: Map<string, SessionSummary>;
   reader: SnapshotReader;
-  broadcaster: { seq: number; epoch: string; inFlightTurn: unknown };
+  broadcaster: { seq: number; epoch: string; inFlightTurn: unknown; subagents: unknown[] };
 }
 
 const tmpDirs: string[] = [];
@@ -70,7 +70,7 @@ async function makeFixtureAsync(opts?: { cacheLimit?: number }): Promise<Fixture
       [ISessionLifecycleService, { get: () => undefined }],
     ]),
   };
-  const broadcaster = { seq: 0, epoch: 'ep_unit', inFlightTurn: null };
+  const broadcaster = { seq: 0, epoch: 'ep_unit', inFlightTurn: null, subagents: [] as unknown[] };
   const deps: SnapshotReaderDeps = {
     homeDir,
     core: core as never,
@@ -79,6 +79,7 @@ async function makeFixtureAsync(opts?: { cacheLimit?: number }): Promise<Fixture
         seq: broadcaster.seq,
         epoch: broadcaster.epoch,
         inFlightTurn: broadcaster.inFlightTurn as never,
+        subagents: broadcaster.subagents as never,
       }),
     } as never,
     logger: noopLogger,
@@ -431,6 +432,29 @@ describe('SnapshotReader.read', () => {
     const snap = await f.reader.read('sess_shrink');
     expect(snap.messages.items).toHaveLength(1);
     expect((snap.messages.items[0]!.content[0] as { text: string }).text).toBe('only-one');
+  });
+
+  it('passes the broadcast subagent roster through to the response', async () => {
+    const f = await makeFixtureAsync();
+    const sid = 'sess_roster';
+    await seedSession(f, sid);
+    f.broadcaster.subagents = [
+      {
+        id: 'agent_1',
+        session_id: sid,
+        kind: 'subagent',
+        description: 'explore the auth flow',
+        status: 'running',
+        created_at: new Date().toISOString(),
+        subagent_phase: 'working',
+        swarm_index: 0,
+        run_in_background: false,
+      },
+    ];
+    const snap = await f.reader.read(sid);
+    expect(snap.subagents).toMatchObject([
+      { id: 'agent_1', subagent_phase: 'working', swarm_index: 0, run_in_background: false },
+    ]);
   });
 });
 
