@@ -571,7 +571,7 @@ registerScopedService(
   LifecycleScope.App,
   ISessionLifecycleService,
   SessionLifecycleService,
-  InstantiationType.Delayed,
+  InstantiationType.Eager,
   'sessionLifecycle',
 );
 

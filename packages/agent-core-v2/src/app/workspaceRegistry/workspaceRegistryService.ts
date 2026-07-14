@@ -450,6 +450,6 @@ registerScopedService(
   LifecycleScope.App,
   IWorkspaceRegistry,
   WorkspaceRegistryService,
-  InstantiationType.Delayed,
+  InstantiationType.Eager,
   'workspaceRegistry',
 );

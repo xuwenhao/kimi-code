@@ -157,6 +157,6 @@ registerScopedService(
   LifecycleScope.App,
   IWorkspacePersistence,
   FileWorkspacePersistence,
-  InstantiationType.Delayed,
+  InstantiationType.Eager,
   'workspaceRegistry',
 );
