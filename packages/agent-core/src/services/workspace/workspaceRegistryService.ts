@@ -103,7 +103,11 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
       const canonicalId = encodeWorkDirKey(root);
       const canonical = id === canonicalId;
       if (existing === undefined) {
-        byRoot.set(root, { id: canonicalId, entry: { ...entry, root }, canonical });
+        // Keep the persisted id when this is the only entry for the root. A
+        // legacy alias can also be the physical session bucket name; inventing
+        // the canonical id here would make the reported count point at an
+        // empty bucket.
+        byRoot.set(root, { id, entry: { ...entry, root }, canonical });
         continue;
       }
       if (!existing.canonical && canonical) {
@@ -120,7 +124,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
     // session index and never persisted, so the registry cannot drift from the
     // session store.
     for (const [root, workspace] of indexed) {
-      const id = encodeWorkDirKey(root);
+      const id = representativeIndexedWorkspaceId(workspace);
       const sessionCount = activeCountForBucket(workspace, id);
       if (
         sessionCount === 0 ||
@@ -151,41 +155,51 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
   }
 
   async get(workspaceId: string): Promise<Workspace> {
-    const { entry, deleted } = await this.runExclusive(async () => {
+    const { match, deleted } = await this.runExclusive(async () => {
       const file = await this.readRegistry();
-      const entry =
-        file.workspaces[workspaceId] ??
-        Object.values(file.workspaces).find(
-          (candidate) => encodeWorkDirKey(normalizeWorkDir(candidate.root)) === workspaceId,
-        ) ??
-        null;
+      const exact = file.workspaces[workspaceId];
+      const fallback =
+        exact === undefined
+          ? Object.entries(file.workspaces).find(
+              ([, candidate]) =>
+                encodeWorkDirKey(normalizeWorkDir(candidate.root)) === workspaceId,
+            )
+          : undefined;
+      const match =
+        exact === undefined
+          ? fallback === undefined
+            ? null
+            : { id: fallback[0], entry: fallback[1] }
+          : { id: workspaceId, entry: exact };
       return {
-        entry,
+        match,
         deleted:
           file.deleted_workspace_ids.includes(workspaceId) ||
-          (entry !== null && normalizedDeletedRoots(file).has(normalizeWorkDir(entry.root))),
+          (match !== null &&
+            normalizedDeletedRoots(file).has(normalizeWorkDir(match.entry.root))),
       };
     });
     if (deleted) throw new WorkspaceNotFoundError(workspaceId);
-    if (entry !== null) {
-      const root = normalizeWorkDir(entry.root);
+    if (match !== null) {
+      const root = normalizeWorkDir(match.entry.root);
       return this.hydrate(
-        workspaceId,
-        { ...entry, root },
-        activeCountForBucket((await this.readIndexedWorkspaces()).get(root), workspaceId),
+        match.id,
+        { ...match.entry, root },
+        activeCountForBucket((await this.readIndexedWorkspaces()).get(root), match.id),
       );
     }
     const derived = await this.findDerivedWorkspace(workspaceId);
     if (derived === undefined) throw new WorkspaceNotFoundError(workspaceId);
+    const representativeId = representativeIndexedWorkspaceId(derived, workspaceId);
     return this.hydrate(
-      workspaceId,
+      representativeId,
       {
         root: derived.root,
         name: posixBasename(derived.root),
         created_at: new Date(derived.createdAt).toISOString(),
         last_opened_at: new Date(derived.lastOpenedAt).toISOString(),
       },
-      activeCountForBucket(derived, workspaceId),
+      activeCountForBucket(derived, representativeId),
     );
   }
 
@@ -209,33 +223,40 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
     // diverged from the session store on Windows and orphaned legacy sessions.
     const normalizedRoot = normalizeWorkDir(root);
     const workspaceId = encodeWorkDirKey(normalizedRoot);
-    await fsp.mkdir(join(this.sessionsDir, workspaceId), { recursive: true, mode: 0o700 });
 
     const now = new Date().toISOString();
-    const { entry, created } = await this.mutateRegistry(async (file) => {
+    const { id: representativeId, entry, created } = await this.mutateRegistry(async (file) => {
       const aliases = Object.entries(file.workspaces).filter(
         ([, candidate]) => normalizeWorkDir(candidate.root) === normalizedRoot,
       );
-      const existing = file.workspaces[workspaceId] ?? aliases[0]?.[1];
+      const existing =
+        file.workspaces[workspaceId] !== undefined
+          ? ([workspaceId, file.workspaces[workspaceId]] as const)
+          : aliases[0];
+      const representativeId = existing?.[0] ?? workspaceId;
+      const existingEntry = existing?.[1];
       const next: WorkspaceRegistryEntry =
-        existing !== undefined
-          ? { ...existing, root: normalizedRoot, last_opened_at: now }
+        existingEntry !== undefined
+          ? { ...existingEntry, root: normalizedRoot, last_opened_at: now }
           : {
               root: normalizedRoot,
               name: name ?? posixBasename(normalizedRoot),
               created_at: now,
               last_opened_at: now,
             };
-      for (const [aliasId] of aliases) delete file.workspaces[aliasId];
-      file.workspaces[workspaceId] = next;
-      clearWorkspaceTombstones(file, workspaceId, normalizedRoot);
-      return { entry: next, created: existing === undefined };
+      for (const [aliasId] of aliases) {
+        if (aliasId !== representativeId) delete file.workspaces[aliasId];
+      }
+      file.workspaces[representativeId] = next;
+      clearWorkspaceTombstones(file, representativeId, normalizedRoot);
+      return { id: representativeId, entry: next, created: existingEntry === undefined };
     });
+    await fsp.mkdir(join(this.sessionsDir, representativeId), { recursive: true, mode: 0o700 });
     const sessionCount = activeCountForBucket(
       (await this.readIndexedWorkspaces()).get(normalizedRoot),
-      workspaceId,
+      representativeId,
     );
-    const workspace = await this.hydrate(workspaceId, entry, sessionCount);
+    const workspace = await this.hydrate(representativeId, entry, sessionCount);
     if (created) {
       this.publishWorkspace({ type: 'event.workspace.created', workspace });
     }
@@ -243,34 +264,49 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
   }
 
   async update(workspaceId: string, patch: WorkspacePatch): Promise<Workspace> {
-    const entry = await this.mutateRegistry(async (file) => {
+    const { id: representativeId, entry } = await this.mutateRegistry(async (file) => {
+      const exact = file.workspaces[workspaceId];
+      const fallback =
+        exact === undefined
+          ? Object.entries(file.workspaces).find(
+              ([, candidate]) =>
+                encodeWorkDirKey(normalizeWorkDir(candidate.root)) === workspaceId,
+            )
+          : undefined;
       const existing =
-        file.workspaces[workspaceId] ??
-        Object.values(file.workspaces).find(
-          (candidate) => encodeWorkDirKey(normalizeWorkDir(candidate.root)) === workspaceId,
-        );
+        exact === undefined
+          ? fallback === undefined
+            ? undefined
+            : { id: fallback[0], entry: fallback[1] }
+          : { id: workspaceId, entry: exact };
       if (existing === undefined) {
         throw new WorkspaceNotFoundError(workspaceId);
       }
-      const root = normalizeWorkDir(existing.root);
+      const root = normalizeWorkDir(existing.entry.root);
       const canonicalId = encodeWorkDirKey(root);
+      const canonicalEntry = file.workspaces[canonicalId];
+      const representative =
+        canonicalEntry === undefined
+          ? existing
+          : { id: canonicalId, entry: canonicalEntry };
       const next: WorkspaceRegistryEntry = {
-        ...existing,
+        ...representative.entry,
         root,
         ...(patch.name !== undefined ? { name: patch.name } : {}),
       };
       for (const [aliasId, candidate] of Object.entries(file.workspaces)) {
-        if (normalizeWorkDir(candidate.root) === root) delete file.workspaces[aliasId];
+        if (normalizeWorkDir(candidate.root) === root && aliasId !== representative.id) {
+          delete file.workspaces[aliasId];
+        }
       }
-      file.workspaces[canonicalId] = next;
-      return next;
+      file.workspaces[representative.id] = next;
+      return { id: representative.id, entry: next };
     });
     const root = normalizeWorkDir(entry.root);
-    const canonicalId = encodeWorkDirKey(root);
     const workspace = await this.hydrate(
-      canonicalId,
+      representativeId,
       entry,
-      activeCountForBucket((await this.readIndexedWorkspaces()).get(root), canonicalId),
+      activeCountForBucket((await this.readIndexedWorkspaces()).get(root), representativeId),
     );
     this.publishWorkspace({ type: 'event.workspace.updated', workspace });
     return workspace;
@@ -670,6 +706,21 @@ function activeCountForBucket(
   workspaceId: string,
 ): number {
   return indexed?.activeCountByWorkspaceId.get(workspaceId) ?? 0;
+}
+
+function representativeIndexedWorkspaceId(
+  indexed: IndexedWorkspace,
+  preferredId?: string,
+): string {
+  if (preferredId !== undefined && indexed.workspaceIds.has(preferredId)) {
+    return preferredId;
+  }
+  const canonicalId = encodeWorkDirKey(indexed.root);
+  if (indexed.workspaceIds.has(canonicalId)) return canonicalId;
+  // A legacy index can contain only alias bucket names. Keep one of those
+  // actual names instead of returning a canonical id with no matching bucket.
+  for (const id of indexed.workspaceIds) return id;
+  return canonicalId;
 }
 
 export function userHomeDir(): string {

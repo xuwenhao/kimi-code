@@ -261,6 +261,61 @@ describe('WorkspaceRegistryService', () => {
     expect(listed.find((entry) => entry.id === workspace.id)?.session_count).toBe(0);
   });
 
+  it('preserves an alias-only workspace id and its session bucket', async () => {
+    const root = await makeProjectRoot('alias-only');
+    const canonicalId = encodeWorkDirKey(root);
+    const legacyId = 'wd_aliaslegacy_deadbeef0000';
+    const registryPath = join(ctx.homeDir, 'workspaces.json');
+    const entry = {
+      root,
+      name: 'alias-only',
+      created_at: '2026-01-01T00:00:00.000Z',
+      last_opened_at: '2026-01-01T00:00:00.000Z',
+    };
+    await writeFile(
+      registryPath,
+      JSON.stringify(
+        {
+          version: 1,
+          workspaces: { [legacyId]: entry },
+          deleted_workspace_ids: [],
+        },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+
+    const sessionDir = join(ctx.homeDir, 'sessions', legacyId, 'sess-alias-only');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, 'state.json'), JSON.stringify({ archived: false }), 'utf-8');
+    await appendSessionIndexEntry(ctx.homeDir, {
+      sessionId: 'sess-alias-only',
+      sessionDir,
+      workDir: root,
+    });
+
+    const listed = await ctx.registry.list();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ id: legacyId, session_count: 1 });
+
+    // A canonical lookup may fall back to the root, but must return the real
+    // representative id so subsequent session queries use the populated alias
+    // bucket rather than an empty canonical bucket.
+    await expect(ctx.registry.get(canonicalId)).resolves.toMatchObject({
+      id: legacyId,
+      session_count: 1,
+    });
+    await expect(ctx.registry.createOrTouch(root)).resolves.toMatchObject({
+      id: legacyId,
+      session_count: 1,
+    });
+    await expect(ctx.registry.update(legacyId, { name: 'renamed' })).resolves.toMatchObject({
+      id: legacyId,
+      session_count: 1,
+    });
+  });
+
   it('tombstones a derived workspace on delete so it stays removed', async () => {
     const root = await makeProjectRoot('derived-del');
     // Derived (cwd-only, never registered) workspace with an active session.
