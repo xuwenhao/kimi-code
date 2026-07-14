@@ -1,3 +1,9 @@
+/**
+ * Scenario: OpenAI-compatible Chat Completions request and response handling.
+ * Responsibilities: wire conversion, reasoning fallback, streaming, and provider options.
+ * Wiring: real provider behavior with the remote OpenAI client as the only stubbed boundary.
+ * Run: pnpm test packages/kosong/test/openai-legacy.test.ts
+ */
 import { generate } from '#/generate';
 import type { ContentPart, Message, StreamedMessagePart, ToolCall } from '#/message';
 import { OpenAILegacyChatProvider } from '#/providers/openai-legacy';
@@ -63,6 +69,37 @@ async function captureRequestBody(
     throw new Error('Expected provider.generate() to call chat.completions.create');
   }
   return capturedBody;
+}
+
+async function collectProviderParts(options: {
+  response: unknown;
+  stream: boolean;
+  reasoningKey?: string;
+}): Promise<StreamedMessagePart[]> {
+  const provider = new OpenAILegacyChatProvider({
+    model: 'example-reasoner',
+    stream: options.stream,
+    reasoningKey: options.reasoningKey,
+    clientFactory: () =>
+      ({
+        chat: {
+          completions: {
+            create: vi.fn().mockResolvedValue(options.response),
+          },
+        },
+      }) as never,
+  });
+
+  const response = await provider.generate(
+    '',
+    [],
+    [{ role: 'user', content: [{ type: 'text', text: 'question' }], toolCalls: [] }],
+  );
+  const parts: StreamedMessagePart[] = [];
+  for await (const part of response) {
+    parts.push(part);
+  }
+  return parts;
 }
 
 const ADD_TOOL: Tool = {
@@ -1215,6 +1252,27 @@ describe('OpenAILegacyChatProvider', () => {
       expect(parts).toEqual([{ type: 'think', think: '' }]);
     });
 
+    it('uses a later non-empty reasoning fallback when a streaming delta starts with an empty field', async () => {
+      async function* response(): AsyncIterable<Record<string, unknown>> {
+        yield {
+          id: 'c1',
+          choices: [
+            {
+              index: 0,
+              delta: {
+                reasoning_content: '',
+                reasoning_details: 'actual reasoning',
+              },
+            },
+          ],
+        };
+      }
+
+      const parts = await collectProviderParts({ stream: true, response: response() });
+
+      expect(parts).toEqual([{ type: 'think', think: 'actual reasoning' }]);
+    });
+
     it('treats blank reasoning_key as unset so defaults still apply', async () => {
       // ModelAliasSchema accepts `reasoning_key = ""` (z.string().optional()).
       // A blank value must not route reads/writes through an empty property
@@ -1578,6 +1636,21 @@ describe('OpenAILegacyChatProvider — non-stream response parsing', () => {
         reasoning_content: '',
       }),
     );
+
+    expect(parts).toEqual([{ type: 'think', think: '' }]);
+  });
+
+  it('preserves an empty reasoning value when an explicit key selects it', async () => {
+    const parts = await collectProviderParts({
+      stream: false,
+      reasoningKey: 'reasoning_content',
+      response: makeNonStreamResponse({
+        role: 'assistant',
+        content: null,
+        reasoning_content: '',
+        reasoning_details: 'fallback must not override the configured field',
+      }),
+    });
 
     expect(parts).toEqual([{ type: 'think', think: '' }]);
   });

@@ -57,12 +57,20 @@ function extractReasoningContent(
 ): string | undefined {
   if (typeof source !== 'object' || source === null) return undefined;
   const record = source as Record<string, unknown>;
-  const keys: readonly string[] = explicitKey !== undefined ? [explicitKey] : KNOWN_REASONING_KEYS;
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === 'string') return value;
+
+  if (explicitKey !== undefined) {
+    const value = record[explicitKey];
+    return typeof value === 'string' ? value : undefined;
   }
-  return undefined;
+
+  let hasEmptyString = false;
+  for (const key of KNOWN_REASONING_KEYS) {
+    const value = record[key];
+    if (typeof value !== 'string') continue;
+    if (value.length > 0) return value;
+    hasEmptyString = true;
+  }
+  return hasEmptyString ? '' : undefined;
 }
 
 export interface OpenAILegacyOptions {

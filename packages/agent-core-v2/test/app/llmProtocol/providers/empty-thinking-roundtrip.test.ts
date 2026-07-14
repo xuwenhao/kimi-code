@@ -1,6 +1,7 @@
 /**
  * Scenario: providers receive or replay empty thinking, including Kimi histories missing the field.
- * Responsibilities: preserve explicit field/block presence and satisfy Kimi preserved-thinking wire requirements.
+ * Responsibilities: preserve explicit field/block presence, resolve fallback reasoning fields,
+ * and satisfy Kimi preserved-thinking wire requirements.
  * Wiring: real provider codecs with only their remote SDK clients replaced through clientFactory.
  * Run: pnpm exec vitest run packages/agent-core-v2/test/app/llmProtocol/providers/empty-thinking-roundtrip.test.ts
  */
@@ -73,6 +74,44 @@ async function captureKimiMessages(
     throw new Error('Expected Kimi provider to send a request.');
   }
   return captured['messages'] as Array<Record<string, unknown>>;
+}
+
+async function collectOpenAILegacyResponseParts(
+  message: Record<string, unknown>,
+  reasoningKey?: string,
+): Promise<StreamedMessagePart[]> {
+  const create = vi.fn().mockResolvedValue(chatCompletionResponse(message));
+  const provider = new OpenAILegacyChatProvider({
+    model: 'compatible-reasoner',
+    apiKey: '',
+    stream: false,
+    reasoningKey,
+    clientFactory: () => ({ chat: { completions: { create } } }) as never,
+  });
+
+  const response = await provider.generate('', [], []);
+  return collectParts(response);
+}
+
+async function collectOpenAILegacyStreamingResponseParts(
+  delta: Record<string, unknown>,
+): Promise<StreamedMessagePart[]> {
+  async function* responseStream() {
+    yield {
+      id: 'chatcmpl-test',
+      choices: [{ index: 0, delta, finish_reason: null }],
+    };
+  }
+  const create = vi.fn().mockResolvedValue(responseStream());
+  const provider = new OpenAILegacyChatProvider({
+    model: 'compatible-reasoner',
+    apiKey: '',
+    stream: true,
+    clientFactory: () => ({ chat: { completions: { create } } }) as never,
+  });
+
+  const response = await provider.generate('', [], []);
+  return collectParts(response);
 }
 
 describe('empty thinking round-trip', () => {
@@ -243,25 +282,73 @@ describe('empty thinking round-trip', () => {
     expect(messages[0]).toHaveProperty('reasoning_details', '');
   });
 
-  it('OpenAI Chat Completions keeps an explicitly empty response reasoning field', async () => {
-    const create = vi.fn().mockResolvedValue(
-      chatCompletionResponse({
+  it('OpenAI Chat Completions uses the first non-empty fallback reasoning field verbatim when a higher-priority field is empty', async () => {
+    const parts = await collectOpenAILegacyResponseParts({
+      role: 'assistant',
+      content: null,
+      reasoning_content: '',
+      reasoning_details: '  actual reasoning  ',
+      reasoning: 'later reasoning',
+    });
+
+    expect(parts).toEqual([{ type: 'think', think: '  actual reasoning  ' }]);
+  });
+
+  it('OpenAI Chat Completions uses a non-empty fallback reasoning field when the same streaming delta has an empty higher-priority field', async () => {
+    const parts = await collectOpenAILegacyStreamingResponseParts({
+      reasoning_content: '',
+      reasoning_details: 'actual reasoning',
+    });
+
+    expect(parts).toEqual([{ type: 'think', think: 'actual reasoning' }]);
+  });
+
+  it('OpenAI Chat Completions preserves an empty configured reasoning field when another fallback field is non-empty', async () => {
+    const parts = await collectOpenAILegacyResponseParts(
+      {
         role: 'assistant',
         content: null,
         reasoning_content: '',
-      }),
+        reasoning_details: 'actual reasoning',
+      },
+      'reasoning_content',
     );
-    const provider = new OpenAILegacyChatProvider({
-      model: 'compatible-reasoner',
-      apiKey: '',
-      stream: false,
-      clientFactory: () => ({ chat: { completions: { create } } }) as never,
+
+    expect(parts).toEqual([{ type: 'think', think: '' }]);
+  });
+
+  it('OpenAI Chat Completions keeps an empty ThinkPart when every fallback reasoning field is empty', async () => {
+    const parts = await collectOpenAILegacyResponseParts({
+      role: 'assistant',
+      content: null,
+      reasoning_content: '',
+      reasoning_details: '',
+      reasoning: '',
     });
 
-    const response = await provider.generate('', [], []);
-
-    expect(await collectParts(response)).toEqual([{ type: 'think', think: '' }]);
+    expect(parts).toEqual([{ type: 'think', think: '' }]);
   });
+
+  it.each([
+    ['missing', { role: 'assistant', content: null }],
+    [
+      'non-string',
+      {
+        role: 'assistant',
+        content: null,
+        reasoning_content: null,
+        reasoning_details: 0,
+        reasoning: {},
+      },
+    ],
+  ])(
+    'OpenAI Chat Completions does not create a ThinkPart when fallback reasoning fields are %s',
+    async (_kind, message) => {
+      const parts = await collectOpenAILegacyResponseParts(message);
+
+      expect(parts).toEqual([]);
+    },
+  );
 
   it('Google GenAI sends an explicitly empty ThinkPart back as a thought part', async () => {
     let captured: Record<string, unknown> | undefined;
