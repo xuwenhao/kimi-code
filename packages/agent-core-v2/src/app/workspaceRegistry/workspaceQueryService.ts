@@ -151,7 +151,12 @@ function resolveRegisteredWorkspace(
   const workspace = findRepresentativeWorkspace(snapshot.workspaces, workspaceId);
   if (workspace === undefined) return undefined;
   const root = normalizeWorkDir(workspace.root);
-  if (normalizedDeletedRoots(snapshot).has(root)) return undefined;
+  if (
+    normalizedDeletedRoots(snapshot).has(root) ||
+    snapshot.deletedWorkspaceIds.has(encodeWorkDirKey(root))
+  ) {
+    return undefined;
+  }
   return { ...workspace, root };
 }
 
@@ -289,7 +294,11 @@ function isDeleted(
   root: string,
   deletedRoots: ReadonlySet<string>,
 ): boolean {
-  return snapshot.deletedWorkspaceIds.has(workspaceId) || deletedRoots.has(root);
+  return (
+    snapshot.deletedWorkspaceIds.has(workspaceId) ||
+    snapshot.deletedWorkspaceIds.has(encodeWorkDirKey(root)) ||
+    deletedRoots.has(root)
+  );
 }
 
 function finiteTimestamp(value: number): number {

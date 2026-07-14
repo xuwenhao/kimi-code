@@ -257,6 +257,32 @@ describe('WorkspaceRegistryService (file-backed)', () => {
     ]);
   });
 
+  it('hides a legacy alias when its canonical id is tombstoned and restores it on re-add', async () => {
+    const root = join(homeDir, 'canonical-tombstone');
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_canonical_tombstone_alias_deadbeef0000';
+    await fsp.mkdir(root, { recursive: true });
+    await seedSessionIndex([
+      {
+        sessionId: 'canonical-tombstone-session',
+        sessionDir: join(homeDir, 'sessions', alias, 'canonical-tombstone-session'),
+        workDir: root,
+      },
+    ]);
+    await fsp.writeFile(
+      join(homeDir, 'workspaces.json'),
+      JSON.stringify({ version: 1, workspaces: {}, deleted_workspace_ids: [canonicalId] }),
+      'utf8',
+    );
+
+    const registry = build();
+    await expect(registry.list()).resolves.toEqual([]);
+    await expect(registry.get(alias)).resolves.toBeUndefined();
+
+    await expect(registry.createOrTouch(root)).resolves.toMatchObject({ id: alias, root });
+    await expect(registry.get(canonicalId)).resolves.toMatchObject({ id: alias, root });
+  });
+
   it('prefers an existing workspaces.json over the session index', async () => {
     const work = join(homeDir, 'existing');
     await writeWorkspacesJson({

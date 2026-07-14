@@ -434,6 +434,64 @@ describe('WorkspaceRegistryService', () => {
     );
   });
 
+  it('hides a legacy alias when its canonical id is tombstoned', async () => {
+    const root = await makeProjectRoot('list-canonical-tombstone');
+    const alias = 'wd_list_alias_canonical_tombstone_deadbeef0000';
+    const sessionDir = join(ctx.homeDir, 'sessions', alias, 'sess-list-canonical-tombstone');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, 'state.json'), JSON.stringify({ archived: false }), 'utf8');
+    await appendSessionIndexEntry(ctx.homeDir, {
+      sessionId: 'sess-list-canonical-tombstone',
+      sessionDir,
+      workDir: root,
+    });
+    await writeFile(
+      join(ctx.homeDir, 'workspaces.json'),
+      JSON.stringify({
+        version: 1,
+        workspaces: {},
+        deleted_workspace_ids: [encodeWorkDirKey(root)],
+      }),
+      'utf8',
+    );
+
+    await expect(ctx.registry.list()).resolves.toEqual([]);
+    await expect(ctx.registry.get(alias)).rejects.toThrow('workspace not found');
+  });
+
+  it('clears a canonical tombstone when re-adding a legacy alias root', async () => {
+    const root = await makeProjectRoot('readd-canonical-tombstone');
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_readd_alias_canonical_tombstone_deadbeef0000';
+    const sessionDir = join(ctx.homeDir, 'sessions', alias, 'sess-readd-canonical-tombstone');
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, 'state.json'), JSON.stringify({ archived: false }), 'utf8');
+    await appendSessionIndexEntry(ctx.homeDir, {
+      sessionId: 'sess-readd-canonical-tombstone',
+      sessionDir,
+      workDir: root,
+    });
+    await writeFile(
+      join(ctx.homeDir, 'workspaces.json'),
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          [alias]: {
+            root,
+            name: 'legacy alias',
+            created_at: '2026-01-01T00:00:00.000Z',
+            last_opened_at: '2026-01-01T00:00:00.000Z',
+          },
+        },
+        deleted_workspace_ids: [canonicalId],
+      }),
+      'utf8',
+    );
+
+    await expect(ctx.registry.createOrTouch(root)).resolves.toMatchObject({ id: alias, root });
+    await expect(ctx.registry.get(canonicalId)).resolves.toMatchObject({ id: alias, root });
+  });
+
   it('does not recover a derived workspace with a root tombstone during update', async () => {
     const root = await makeProjectRoot('update-root-tombstone');
     await seedSessionBucket(root, 'sess-update-root-tombstone');

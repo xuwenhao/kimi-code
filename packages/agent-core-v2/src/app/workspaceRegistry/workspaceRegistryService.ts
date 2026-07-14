@@ -99,7 +99,12 @@ export class WorkspaceRegistryService implements IWorkspaceRegistry {
       const derived = (await this.rebuildFromSessionIndex()).workspaces.get(id);
       if (derived === undefined) return undefined;
       const root = normalizeWorkDir(derived.root);
-      if (normalizedDeletedRoots(snapshot).has(root)) return undefined;
+      if (
+        normalizedDeletedRoots(snapshot).has(root) ||
+        snapshot.deletedWorkspaceIds.has(encodeWorkDirKey(root))
+      ) {
+        return undefined;
+      }
       const registered = findRepresentativeWorkspace(
         snapshot.workspaces,
         encodeWorkDirKey(root),
@@ -107,7 +112,12 @@ export class WorkspaceRegistryService implements IWorkspaceRegistry {
       return { ...(registered ?? derived), id, root };
     }
     const root = normalizeWorkDir(workspace.root);
-    if (normalizedDeletedRoots(snapshot).has(root)) return undefined;
+    if (
+      normalizedDeletedRoots(snapshot).has(root) ||
+      snapshot.deletedWorkspaceIds.has(encodeWorkDirKey(root))
+    ) {
+      return undefined;
+    }
     return { ...workspace, root };
   }
 
@@ -430,11 +440,13 @@ function normalizedDeletedRoots(
 }
 
 function clearTombstones(catalog: WorkspaceCatalogState, id: string, root: string): void {
+  const canonicalId = encodeWorkDirKey(root);
   const cleared: string[] = [];
   for (const deletedId of catalog.deletedWorkspaceIds) {
     const deletedRoot = catalog.deletedWorkspaceRoots.get(deletedId);
     if (
       deletedId === id ||
+      deletedId === canonicalId ||
       (deletedRoot !== undefined && normalizeWorkDir(deletedRoot) === root)
     ) {
       cleared.push(deletedId);

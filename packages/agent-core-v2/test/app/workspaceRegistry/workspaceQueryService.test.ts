@@ -306,4 +306,20 @@ describe('WorkspaceQueryService', () => {
     await expect(query.list()).resolves.toEqual([]);
     await expect(query.get('wd_unknown')).resolves.toBeUndefined();
   });
+
+  it('hides a legacy alias when its canonical workspace id is tombstoned', async () => {
+    const { query, index, registry } = build();
+    const root = '/work/canonical-tombstone';
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_legacy_canonical_tombstone_deadbeef0000';
+    registry.workspaces = [
+      { id: alias, root, name: 'Legacy', createdAt: 1, lastOpenedAt: 2 },
+    ];
+    registry.deletedIds.add(canonicalId);
+    index.items = [summary('legacy-session', alias, 100, root)];
+
+    await expect(query.list()).resolves.toEqual([]);
+    await expect(query.listSessions(alias)).resolves.toEqual([]);
+    await expect(query.get(alias)).resolves.toBeUndefined();
+  });
 });
