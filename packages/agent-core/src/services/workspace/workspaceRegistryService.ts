@@ -44,7 +44,6 @@ interface IndexedWorkspace {
   readonly root: string;
   readonly workspaceIds: Set<string>;
   readonly activeCountByWorkspaceId: Map<string, number>;
-  activeCount: number;
   createdAt: number;
   lastOpenedAt: number;
 }
@@ -113,9 +112,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
     }
     for (const [root, { id, entry }] of byRoot) {
       const bucket = indexed.get(root);
-      result.push(
-        await this.hydrate(id, entry, bucket?.activeCountByWorkspaceId.get(id) ?? 0),
-      );
+      result.push(await this.hydrate(id, entry, activeCountForBucket(bucket, id)));
     }
 
     // Derived workspaces: cwds that own sessions but were never registered
@@ -124,8 +121,9 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
     // session store.
     for (const [root, workspace] of indexed) {
       const id = encodeWorkDirKey(root);
+      const sessionCount = activeCountForBucket(workspace, id);
       if (
-        workspace.activeCount === 0 ||
+        sessionCount === 0 ||
         byRoot.has(root) ||
         deleted.has(id) ||
         deletedRoots.has(root)
@@ -141,7 +139,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
             created_at: new Date(workspace.createdAt).toISOString(),
             last_opened_at: new Date(workspace.lastOpenedAt).toISOString(),
           },
-          workspace.activeCount,
+          sessionCount,
         ),
       );
     }
@@ -174,7 +172,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
       return this.hydrate(
         workspaceId,
         { ...entry, root },
-        (await this.readIndexedWorkspaces()).get(root)?.activeCount ?? 0,
+        activeCountForBucket((await this.readIndexedWorkspaces()).get(root), workspaceId),
       );
     }
     const derived = await this.findDerivedWorkspace(workspaceId);
@@ -187,7 +185,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
         created_at: new Date(derived.createdAt).toISOString(),
         last_opened_at: new Date(derived.lastOpenedAt).toISOString(),
       },
-      derived.activeCount,
+      activeCountForBucket(derived, workspaceId),
     );
   }
 
@@ -233,7 +231,10 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
       clearWorkspaceTombstones(file, workspaceId, normalizedRoot);
       return { entry: next, created: existing === undefined };
     });
-    const sessionCount = (await this.readIndexedWorkspaces()).get(normalizedRoot)?.activeCount ?? 0;
+    const sessionCount = activeCountForBucket(
+      (await this.readIndexedWorkspaces()).get(normalizedRoot),
+      workspaceId,
+    );
     const workspace = await this.hydrate(workspaceId, entry, sessionCount);
     if (created) {
       this.publishWorkspace({ type: 'event.workspace.created', workspace });
@@ -269,7 +270,7 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
     const workspace = await this.hydrate(
       canonicalId,
       entry,
-      (await this.readIndexedWorkspaces()).get(root)?.activeCount ?? 0,
+      activeCountForBucket((await this.readIndexedWorkspaces()).get(root), canonicalId),
     );
     this.publishWorkspace({ type: 'event.workspace.updated', workspace });
     return workspace;
@@ -355,13 +356,11 @@ export class WorkspaceRegistryService extends Disposable implements IWorkspaceRe
           root,
           workspaceIds: new Set<string>(),
           activeCountByWorkspaceId: new Map<string, number>(),
-          activeCount: 0,
           createdAt: finiteTimestamp(summary.createdAt),
           lastOpenedAt: finiteTimestamp(summary.updatedAt),
         };
       workspace.workspaceIds.add(bucketId);
       if (summary.archived !== true) {
-        workspace.activeCount++;
         workspace.activeCountByWorkspaceId.set(
           bucketId,
           (workspace.activeCountByWorkspaceId.get(bucketId) ?? 0) + 1,
@@ -664,6 +663,13 @@ function clearWorkspaceTombstones(
 
 function finiteTimestamp(value: number): number {
   return Number.isFinite(value) ? value : 0;
+}
+
+function activeCountForBucket(
+  indexed: IndexedWorkspace | undefined,
+  workspaceId: string,
+): number {
+  return indexed?.activeCountByWorkspaceId.get(workspaceId) ?? 0;
 }
 
 export function userHomeDir(): string {

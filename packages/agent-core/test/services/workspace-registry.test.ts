@@ -274,7 +274,7 @@ describe('WorkspaceRegistryService', () => {
     expect((await ctx.registry.list()).map((w) => w.id)).not.toContain(derivedId);
   });
 
-  it('collapses duplicate registered entries for the same root, preferring the canonical id', async () => {
+  it('uses the canonical bucket count across duplicate-root registry responses', async () => {
     const root = await makeProjectRoot('dup');
     const canonicalId = encodeWorkDirKey(root);
     // Simulate a registry that also holds a legacy id for the same folder (e.g.
@@ -320,5 +320,9 @@ describe('WorkspaceRegistryService', () => {
     expect(matches[0]?.id).toBe(canonicalId);
     // Count is scoped to the representative's (canonical) bucket only.
     expect(matches[0]?.session_count).toBe(1);
+
+    expect((await ctx.registry.get(canonicalId)).session_count).toBe(1);
+    expect((await ctx.registry.createOrTouch(root)).session_count).toBe(1);
+    expect((await ctx.registry.update(canonicalId, { name: 'renamed' })).session_count).toBe(1);
   });
 });
