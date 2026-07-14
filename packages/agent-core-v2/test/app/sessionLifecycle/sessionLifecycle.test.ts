@@ -20,6 +20,7 @@ import { Disposable } from '#/_base/di/lifecycle';
 import { ILogService } from '#/_base/log/log';
 import {
   type IAgentScopeHandle,
+  type ISessionScopeHandle,
   LifecycleScope,
   type ScopeSeed,
   _clearScopedRegistryForTests,
@@ -76,15 +77,8 @@ import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/st
 import { stubFlag } from '../flag/stubs';
 import { stubQueryStore } from '../../persistence/interface/stubs';
 
-function bootstrapStub(): IBootstrapService {
-  return {
-    sessionsDir: '/tmp/sessions',
-    homeDir: '/tmp',
-    sessionScope: (workspaceId: string, sessionId: string) =>
-      `sessions/${workspaceId}/${sessionId}`,
-    sessionDir: (workspaceId: string, sessionId: string) =>
-      `/tmp/sessions/${workspaceId}/${sessionId}`,
-  } as IBootstrapService;
+function bootstrapStub(root: string): IBootstrapService {
+  return tmpBootstrapStub(root);
 }
 
 function tmpBootstrapStub(root: string): IBootstrapService {
@@ -126,6 +120,7 @@ function metadataStub(): ISessionMetadata {
     _serviceBrand: undefined,
     ready: Promise.resolve(),
     onDidChangeMetadata: () => ({ dispose: () => {} }),
+    whenIdle: () => Promise.resolve(),
     read: () => Promise.resolve({} as never),
     update: () => Promise.resolve(),
     setTitle: () => Promise.resolve(),
@@ -282,6 +277,25 @@ function appendLogStoreStub(): IAppendLogStore {
   };
 }
 
+function statefulQueryStore(): IQueryStore {
+  const base = stubQueryStore();
+  const values = new Map<string, unknown>();
+  const entryKey = (collection: string, key: string): string => `${collection}\u0000${key}`;
+  return {
+    ...base,
+    put: (collection, key, value) => {
+      values.set(entryKey(collection, key), value);
+      return Promise.resolve();
+    },
+    delete: (collection, key) => {
+      values.delete(entryKey(collection, key));
+      return Promise.resolve();
+    },
+    get: <T>(collection: string, key: string) =>
+      Promise.resolve(values.get(entryKey(collection, key)) as T | undefined),
+  };
+}
+
 function atomicDocumentStoreStub(): IAtomicDocumentStore {
   return {
     _serviceBrand: undefined,
@@ -429,11 +443,14 @@ describe('SessionLifecycleService', () => {
   let host: ScopedTestHost | undefined;
   let telemetryRecords: TelemetryRecord[];
   let tmpRoots: string[];
+  let defaultRoot: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     recordedSessionHookEvents = [];
     telemetryRecords = [];
     tmpRoots = [];
+    defaultRoot = await mkdtemp(join(tmpdir(), 'kimi-session-lifecycle-test-'));
+    tmpRoots.push(defaultRoot);
     _clearScopedRegistryForTests();
     registerScopedService(
       LifecycleScope.App,
@@ -476,7 +493,7 @@ describe('SessionLifecycleService', () => {
 
   function build(extra: ScopeSeed = []): ISessionLifecycleService {
     host = createScopedTestHost([
-      stubPair(IBootstrapService, bootstrapStub()),
+      stubPair(IBootstrapService, bootstrapStub(defaultRoot)),
       stubPair(ISessionMetadata, metadataStub()),
       stubPair(IHostEnvironment, hostEnvironmentStub()),
       stubPair(ISessionSkillCatalog, skillCatalogStub()),
@@ -484,9 +501,11 @@ describe('SessionLifecycleService', () => {
       stubPair(ISessionIndex, sessionIndexStub()),
       stubPair(IAppendLogStore, appendLogStoreStub()),
       stubPair(IAtomicDocumentStore, atomicDocumentStoreStub()),
+      stubPair(IQueryStore, stubQueryStore()),
       stubPair(IEventService, eventStub()),
       stubPair(IAgentLifecycleService, agentLifecycleStub()),
       stubPair(IConfigService, configStub()),
+      stubPair(IFlagService, stubFlag(false)),
       stubPair(ISessionCronService, { _serviceBrand: undefined } as unknown as ISessionCronService),
       stubPair(ISessionActivityKernel, stubSessionActivityKernel()),
       stubPair(IWorkspaceLocalConfigService, workspaceLocalConfigStub()),
@@ -542,7 +561,7 @@ describe('SessionLifecycleService', () => {
         key: 'session_index.jsonl',
         record: {
           sessionId: 's1',
-          sessionDir: `/tmp/sessions/${workspaceId}/s1`,
+          sessionDir: join(defaultRoot, 'sessions', workspaceId, 's1'),
           workDir: '/tmp/proj',
         },
       },
@@ -631,7 +650,7 @@ describe('SessionLifecycleService', () => {
 
     expect(ctx?.cwd).toBe(workDir);
     expect(ctx?.workspaceId).toBe(indexedWorkspaceId);
-    expect(ctx?.sessionDir).toBe(`/tmp/sessions/${indexedWorkspaceId}/s1`);
+    expect(ctx?.sessionDir).toBe(join(defaultRoot, 'sessions', indexedWorkspaceId, 's1'));
   });
 
   it('archive flags metadata, removes agents, publishes the event, and disposes the session', async () => {
@@ -1035,6 +1054,327 @@ describe('SessionLifecycleService', () => {
     expect(svc.get('s1')).toBeUndefined();
   });
 
+  it('removes fresh persisted state when create initialization fails', async () => {
+    const root = await makeTmpRoot();
+    const storage = new FileStorageService(root);
+    const mcpStarted = deferred();
+    const mcpReady = deferred();
+    const failure = new Error('MCP initialization failed');
+    let mcpAttempts = 0;
+    const queryStore = statefulQueryStore();
+    registerScopedService(
+      LifecycleScope.Session,
+      ISessionMetadata,
+      SessionMetadata,
+      InstantiationType.Delayed,
+      'sessionMetadata',
+    );
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IFileSystemStorageService, storage),
+      [IAtomicDocumentStore, new SyncDescriptor(JsonAtomicDocumentStore)],
+      stubPair(IQueryStore, queryStore),
+      stubPair(IFlagService, stubFlag(false)),
+      stubPair(ILogService, stubLog()),
+      [ISessionIndex, new SyncDescriptor(FileSessionIndex)],
+      stubPair(IAgentLifecycleService, {
+        ...agentLifecycleWithMainStub(),
+        ensureMcpReady: () => {
+          mcpAttempts += 1;
+          if (mcpAttempts === 1) {
+            mcpStarted.resolve();
+            return mcpReady.promise;
+          }
+          return Promise.resolve();
+        },
+      }),
+    ]);
+    const index = host!.app.accessor.get(ISessionIndex);
+    const sessionDir = join(root, 'sessions', 'wd_stub', 's1');
+
+    const creating = svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+    await mcpStarted.promise;
+    await expect(index.get('s1')).resolves.toMatchObject({ id: 's1' });
+    const rejected = expect(creating).rejects.toBe(failure);
+    mcpReady.reject(failure);
+    await rejected;
+
+    await expect(stat(sessionDir)).rejects.toThrow();
+    await expect(index.get('s1')).resolves.toBeUndefined();
+    await expect(index.list({ includeArchived: true })).resolves.toMatchObject({ items: [] });
+    await expect(svc.resume('s1')).resolves.toBeUndefined();
+
+    const retried = await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+    expect(retried.id).toBe('s1');
+  });
+
+  it('waits for queued metadata mirroring before removing its owned directory', async () => {
+    const root = await makeTmpRoot();
+    const storage = new FileStorageService(root);
+    const queryStore = statefulQueryStore();
+    const putStarted = deferred();
+    const releasePut = deferred();
+    const idleStarted = deferred();
+    const mcpStarted = deferred();
+    const mcpReady = deferred();
+    const failure = new Error('MCP initialization failed');
+    const pendingMirror = (async () => {
+      putStarted.resolve();
+      await releasePut.promise;
+      await queryStore.put('session', 's1', {
+        id: 's1',
+        workspaceId: 'wd_stub',
+        createdAt: 1,
+        updatedAt: 1,
+        archived: false,
+      });
+    })();
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IFileSystemStorageService, storage),
+      stubPair(IQueryStore, queryStore),
+      stubPair(IFlagService, stubFlag(true)),
+      stubPair(ILogService, stubLog()),
+      [ISessionIndex, new SyncDescriptor(FileSessionIndex)],
+      stubPair(ISessionMetadata, {
+        ...metadataStub(),
+        whenIdle: async () => {
+          idleStarted.resolve();
+          await pendingMirror;
+        },
+      }),
+      stubPair(IAgentLifecycleService, {
+        ...agentLifecycleWithMainStub(),
+        ensureMcpReady: () => {
+          mcpStarted.resolve();
+          return mcpReady.promise;
+        },
+      }),
+    ]);
+    const index = host!.app.accessor.get(ISessionIndex);
+    const sessionDir = join(root, 'sessions', 'wd_stub', 's1');
+
+    let settled = false;
+    const creating = svc.create({ sessionId: 's1', workDir: '/tmp/proj' }).finally(() => {
+      settled = true;
+    });
+    await putStarted.promise;
+    await mcpStarted.promise;
+    mcpReady.reject(failure);
+    await idleStarted.promise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await expect(stat(sessionDir)).resolves.toBeDefined();
+
+    releasePut.resolve();
+    await expect(creating).rejects.toBe(failure);
+    await expect(stat(sessionDir)).rejects.toThrow();
+    await expect(queryStore.get('session', 's1')).resolves.toMatchObject({ id: 's1' });
+    await expect(index.get('s1')).resolves.toBeUndefined();
+  });
+
+  it('waits for append-log writes before removing its owned directory', async () => {
+    const root = await makeTmpRoot();
+    const flushStarted = deferred();
+    const releaseFlush = deferred();
+    const failure = new Error('MCP initialization failed');
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IAppendLogStore, {
+        ...appendLogStoreStub(),
+        flush: () => {
+          flushStarted.resolve();
+          return releaseFlush.promise;
+        },
+      }),
+      stubPair(IAgentLifecycleService, {
+        ...agentLifecycleWithMainStub(),
+        ensureMcpReady: () => Promise.reject(failure),
+      }),
+    ]);
+    const sessionDir = join(root, 'sessions', 'wd_stub', 's1');
+
+    let settled = false;
+    const creating = svc.create({ sessionId: 's1', workDir: '/tmp/proj' }).finally(() => {
+      settled = true;
+    });
+    await flushStarted.promise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await expect(stat(sessionDir)).resolves.toBeDefined();
+
+    releaseFlush.resolve();
+    await expect(creating).rejects.toBe(failure);
+    await expect(stat(sessionDir)).rejects.toThrow();
+  });
+
+  it('reports cleanup failure without releasing an unremoved owned directory', async () => {
+    const root = await makeTmpRoot();
+    const sessionDir = join(root, 'sessions', 'wd_stub', 's1');
+    const realHostFs = new HostFileSystem();
+    const cleanupFailure = new Error('session directory cleanup failed');
+    const failingHostFs = new Proxy(realHostFs, {
+      get(target, property, receiver) {
+        if (property === 'remove') {
+          return (path: string): Promise<void> =>
+            path === sessionDir ? Promise.reject(cleanupFailure) : target.remove(path);
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as IHostFileSystem;
+    const initializationFailure = new Error('MCP initialization failed');
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IHostFileSystem, failingHostFs),
+      stubPair(IAgentLifecycleService, {
+        ...agentLifecycleWithMainStub(),
+        ensureMcpReady: () => Promise.reject(initializationFailure),
+      }),
+    ]);
+
+    const failure = await svc
+      .create({ sessionId: 's1', workDir: '/tmp/proj' })
+      .then(() => undefined, (error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      initializationFailure,
+      cleanupFailure,
+    ]);
+    await expect(stat(sessionDir)).resolves.toBeDefined();
+    await expect(
+      svc.create({ sessionId: 's1', workDir: '/tmp/proj' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.SESSION_ALREADY_EXISTS });
+  });
+
+  it('does not delete a session directory that wins the exclusive create race', async () => {
+    const root = await makeTmpRoot();
+    const realHostFs = new HostFileSystem();
+    const sessionDir = join(root, 'sessions', 'wd_stub', 's1');
+    const sessionParent = join(root, 'sessions', 'wd_stub');
+    const statePath = join(sessionDir, 'state.json');
+    const externalState = JSON.stringify({ owner: 'external' });
+    const queryStore = statefulQueryStore();
+    const externalSummary = { id: 's1', workspaceId: 'wd_stub', cwd: '/tmp/proj' };
+    await queryStore.put('session', 's1', externalSummary);
+    let injected = false;
+    const racingHostFs = new Proxy(realHostFs, {
+      get(target, property, receiver) {
+        if (property !== 'mkdir') return Reflect.get(target, property, receiver);
+        return async (path: string, options?: { readonly recursive?: boolean }): Promise<void> => {
+          await target.mkdir(path, options);
+          if (!injected && path === sessionParent && options?.recursive === true) {
+            injected = true;
+            await target.mkdir(sessionDir);
+            await target.writeText(statePath, externalState);
+          }
+        };
+      },
+    });
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IHostFileSystem, racingHostFs),
+      stubPair(IQueryStore, queryStore),
+    ]);
+
+    await expect(
+      svc.create({ sessionId: 's1', workDir: '/tmp/proj' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.SESSION_ALREADY_EXISTS });
+
+    await expect(readFile(statePath, 'utf8')).resolves.toBe(externalState);
+    await expect(queryStore.get('session', 's1')).resolves.toEqual(externalSummary);
+  });
+
+  it('rejects create without deleting an existing persisted session', async () => {
+    const root = await makeTmpRoot();
+    const storage = new FileStorageService(root);
+    const queryStore = statefulQueryStore();
+    registerScopedService(
+      LifecycleScope.Session,
+      ISessionMetadata,
+      SessionMetadata,
+      InstantiationType.Delayed,
+      'sessionMetadata',
+    );
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IFileSystemStorageService, storage),
+      [IAtomicDocumentStore, new SyncDescriptor(JsonAtomicDocumentStore)],
+      stubPair(IQueryStore, queryStore),
+      stubPair(IFlagService, stubFlag(true)),
+      stubPair(ILogService, stubLog()),
+      [ISessionIndex, new SyncDescriptor(FileSessionIndex)],
+      stubPair(IAgentLifecycleService, agentLifecycleWithMainStub()),
+    ]);
+    const index = host!.app.accessor.get(ISessionIndex);
+    const statePath = join(root, 'sessions', 'wd_stub', 's1', 'state.json');
+    await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+    await svc.close('s1');
+    const stateBefore = await readFile(statePath, 'utf8');
+    await expect(index.get('s1')).resolves.toMatchObject({ id: 's1' });
+
+    await expect(
+      svc.create({ sessionId: 's1', workDir: '/tmp/proj' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.SESSION_ALREADY_EXISTS });
+
+    await expect(readFile(statePath, 'utf8')).resolves.toBe(stateBefore);
+    await expect(queryStore.get('session', 's1')).resolves.toMatchObject({ id: 's1' });
+    await expect(index.get('s1')).resolves.toMatchObject({ id: 's1' });
+  });
+
+  it('preserves an existing persisted session when resume initialization fails', async () => {
+    const root = await makeTmpRoot();
+    const storage = new FileStorageService(root);
+    const mcpStarted = deferred();
+    const mcpReady = deferred();
+    const failure = new Error('resume MCP initialization failed');
+    let mcpAttempts = 0;
+    registerScopedService(
+      LifecycleScope.Session,
+      ISessionMetadata,
+      SessionMetadata,
+      InstantiationType.Delayed,
+      'sessionMetadata',
+    );
+    const svc = build([
+      stubPair(IBootstrapService, tmpBootstrapStub(root)),
+      stubPair(IFileSystemStorageService, storage),
+      [IAtomicDocumentStore, new SyncDescriptor(JsonAtomicDocumentStore)],
+      stubPair(IQueryStore, statefulQueryStore()),
+      stubPair(IFlagService, stubFlag(false)),
+      stubPair(ILogService, stubLog()),
+      [ISessionIndex, new SyncDescriptor(FileSessionIndex)],
+      stubPair(IAgentLifecycleService, {
+        ...agentLifecycleWithMainStub(),
+        ensureMcpReady: () => {
+          mcpAttempts += 1;
+          if (mcpAttempts === 2) {
+            mcpStarted.resolve();
+            return mcpReady.promise;
+          }
+          return Promise.resolve();
+        },
+      }),
+    ]);
+    const index = host!.app.accessor.get(ISessionIndex);
+    const statePath = join(root, 'sessions', 'wd_stub', 's1', 'state.json');
+    await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+    await svc.close('s1');
+    const stateBefore = await readFile(statePath, 'utf8');
+
+    const resuming = svc.resume('s1');
+    await mcpStarted.promise;
+    const rejected = expect(resuming).rejects.toBe(failure);
+    mcpReady.reject(failure);
+    await rejected;
+
+    await expect(readFile(statePath, 'utf8')).resolves.toBe(stateBefore);
+    await expect(index.get('s1')).resolves.toMatchObject({ id: 's1' });
+    const retried = await svc.resume('s1');
+    expect(retried?.id).toBe('s1');
+  });
+
   it('honors close after an in-flight session reaches publication', async () => {
     const firstMcpStarted = deferred();
     const firstMcp = deferred();
@@ -1065,8 +1405,9 @@ describe('SessionLifecycleService', () => {
     await rejected;
     await close;
     expect(closed).toEqual(['s1']);
-    const retried = await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
-    expect(svc.get('s1')).toBe(retried);
+    await expect(
+      svc.create({ sessionId: 's1', workDir: '/tmp/proj' }),
+    ).rejects.toMatchObject({ code: ErrorCodes.SESSION_ALREADY_EXISTS });
   });
 
   it('honors close requested while workspace registration blocks handle creation', async () => {

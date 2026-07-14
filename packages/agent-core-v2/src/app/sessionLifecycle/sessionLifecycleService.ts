@@ -13,8 +13,10 @@
  * roots are remembered through `workspaceRegistry`. On create / fork the
  * session is also appended to the shared `session_index.jsonl` so v1 clients
  * (TUI, export) can discover sessions created by the v2 engine.
- * Failed materialization, creation, resume, and fork attempts release only the
- * Session handle they created. Per-session initialization claims keep writers
+ * Failed attempts release only the Session handle they created. A failed fresh
+ * create also removes the session directory it exclusively claimed before
+ * materialization after queued metadata writes settle; resume failures preserve
+ * existing persisted state. Per-session initialization claims keep writers
  * exclusive while publishing only core-ready handles and preserving explicit
  * close/archive requests made before a handle exists. The same claim keeps an
  * initializing handle private while explicit teardown is in progress.
@@ -22,7 +24,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { join } from 'pathe';
+import { dirname, join } from 'pathe';
 import { ulid } from 'ulid';
 
 import { InstantiationType } from '#/_base/di/extensions';
@@ -96,7 +98,13 @@ type MaterializeSessionOptions = Omit<CreateSessionOptions, 'sessionId'> & {
   readonly workspaceId?: string;
   readonly claim: SessionInitializationClaim;
   readonly forkDestination?: boolean;
+  readonly directoryOwnership?: SessionDirectoryOwnership;
 };
+
+interface SessionDirectoryOwnership {
+  sessionDir?: string;
+  owned: boolean;
+}
 
 interface SessionInitializationClaim {
   readonly published: boolean;
@@ -154,9 +162,15 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
   async create(opts: CreateSessionOptions): Promise<ISessionScopeHandle> {
     const sessionId = opts.sessionId ?? createSessionId();
     const claim = this.claimInitialization(sessionId);
+    const directoryOwnership: SessionDirectoryOwnership = { owned: false };
     let handle: ISessionScopeHandle | undefined;
     try {
-      handle = await this.materializeSession({ ...opts, sessionId, claim });
+      handle = await this.materializeSession({
+        ...opts,
+        sessionId,
+        claim,
+        directoryOwnership,
+      });
       await this.appendSessionIndexEntry(sessionId, opts.workDir);
       if (this.config.get<boolean>(DEFAULT_PLAN_MODE_SECTION) === true) {
         const main = await ensureMainAgent(handle);
@@ -167,8 +181,18 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       this.assertSessionHandleOwned(sessionId, handle, claim);
       return handle;
     } catch (error) {
-      if (handle !== undefined && !claim.closing) {
-        await this.disposeFailedSession(sessionId, handle);
+      const failedHandle = handle;
+      if (failedHandle !== undefined && !claim.closing) {
+        await throwAfterCleanup(error, () =>
+          directoryOwnership.owned
+            ? this.rollbackOwnedSessionDirectory(
+                sessionId,
+                failedHandle,
+                directoryOwnership.sessionDir,
+                claim,
+              )
+            : this.disposeFailedSession(sessionId, failedHandle),
+        );
       }
       throw error;
     } finally {
@@ -211,15 +235,25 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     // synchronously in their constructors, so the probe must have landed by
     // the time the first Session-scoped service is resolved.
     await this.hostEnv.ready;
-    const handle = createScopedChildHandle(
-      this.instantiation,
-      LifecycleScope.Session,
-      opts.sessionId,
-      {
-        extra: [...sessionContextSeed(ctx)],
-      },
-    ) as ISessionScopeHandle;
+    let handle: ISessionScopeHandle | undefined;
+    let directoryOwned = false;
     try {
+      if (opts.directoryOwnership !== undefined || opts.forkDestination === true) {
+        await this.claimSessionDirectory(opts.sessionId, ctx.sessionDir);
+        directoryOwned = true;
+        if (opts.directoryOwnership !== undefined) {
+          opts.directoryOwnership.sessionDir = ctx.sessionDir;
+          opts.directoryOwnership.owned = true;
+        }
+      }
+      handle = createScopedChildHandle(
+        this.instantiation,
+        LifecycleScope.Session,
+        opts.sessionId,
+        {
+          extra: [...sessionContextSeed(ctx)],
+        },
+      ) as ISessionScopeHandle;
       handle.accessor.get(ISessionActivityKernel);
       if (additionalDirs.length > 0) {
         handle.accessor.get(ISessionWorkspaceContext).setAdditionalDirs(additionalDirs);
@@ -231,11 +265,25 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       handle.accessor.get(ISessionExternalHooksService);
       return handle;
     } catch (error) {
+      const failedHandle = handle;
       if (!opts.claim.closing) {
-        if (opts.forkDestination === true) {
-          await this.rollbackFailedFork(opts.sessionId, handle, ctx.sessionDir, opts.claim);
-        } else {
-          await this.disposeFailedSession(opts.sessionId, handle);
+        if (directoryOwned && failedHandle !== undefined) {
+          await throwAfterCleanup(error, () =>
+            this.rollbackOwnedSessionDirectory(
+              opts.sessionId,
+              failedHandle,
+              ctx.sessionDir,
+              opts.claim,
+            ),
+          );
+        } else if (directoryOwned) {
+          await throwAfterCleanup(error, () =>
+            this.removeOwnedSessionDirectory(opts.sessionId, ctx.sessionDir, opts.claim),
+          );
+        } else if (failedHandle !== undefined) {
+          await throwAfterCleanup(error, () =>
+            this.disposeFailedSession(opts.sessionId, failedHandle),
+          );
         }
       }
       throw error;
@@ -478,6 +526,9 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       }
     } catch {}
     try {
+      await handle.accessor.get(ISessionMetadata).whenIdle();
+    } catch {}
+    try {
       handle.dispose();
     } catch {}
   }
@@ -620,7 +671,17 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     return this.sessions.get(sessionId);
   }
 
-  private async rollbackFailedFork(
+  private async claimSessionDirectory(sessionId: string, sessionDir: string): Promise<void> {
+    await this.hostFs.mkdir(dirname(sessionDir), { recursive: true });
+    try {
+      await this.hostFs.mkdir(sessionDir);
+    } catch (error) {
+      if (isExistingFileError(error)) throw sessionAlreadyExistsError(sessionId);
+      throw error;
+    }
+  }
+
+  private async rollbackOwnedSessionDirectory(
     sessionId: string,
     handle: ISessionScopeHandle,
     sessionDir: string | undefined,
@@ -634,7 +695,17 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       this.sessions.delete(sessionId);
     }
     await this.disposeFailedSession(sessionId, handle);
-    await this.hostFs.remove(sessionDir).catch(() => {});
+    await this.appendLogStore.flush();
+    await this.removeOwnedSessionDirectory(sessionId, sessionDir, claim);
+  }
+
+  private async removeOwnedSessionDirectory(
+    sessionId: string,
+    sessionDir: string | undefined,
+    claim: SessionInitializationClaim,
+  ): Promise<void> {
+    if (this.initializations.get(sessionId) !== claim || sessionDir === undefined) return;
+    await this.hostFs.remove(sessionDir);
   }
 
   async fork(opts: ForkSessionOptions): Promise<ISessionScopeHandle> {
@@ -772,7 +843,17 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         targetClaim !== undefined &&
         !targetClaim.closing
       ) {
-        await this.rollbackFailedFork(targetId, target, targetSessionDir, targetClaim);
+        const failedTargetId = targetId;
+        const failedTarget = target;
+        const failedTargetClaim = targetClaim;
+        await throwAfterCleanup(error, () =>
+          this.rollbackOwnedSessionDirectory(
+            failedTargetId,
+            failedTarget,
+            targetSessionDir,
+            failedTargetClaim,
+          ),
+        );
       }
       throw error;
     } finally {
@@ -977,6 +1058,28 @@ function isMissingFileError(error: unknown): boolean {
   if (unwrapped === null || typeof unwrapped !== 'object') return false;
   const code = (unwrapped as { readonly code?: unknown }).code;
   return code === 'ENOENT';
+}
+
+function isExistingFileError(error: unknown): boolean {
+  const unwrapped = unwrapErrorCause(error);
+  if (unwrapped === null || typeof unwrapped !== 'object') return false;
+  const code = (unwrapped as { readonly code?: unknown }).code;
+  return code === 'EEXIST';
+}
+
+async function throwAfterCleanup(
+  error: unknown,
+  cleanup: () => Promise<void>,
+): Promise<never> {
+  try {
+    await cleanup();
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [error, cleanupError],
+      'Session initialization and cleanup both failed',
+    );
+  }
+  throw error;
 }
 
 /**
