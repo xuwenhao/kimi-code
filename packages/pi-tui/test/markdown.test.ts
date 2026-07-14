@@ -1,3 +1,5 @@
+// Scenarios: Markdown rendering contracts through the public component with the real parser and theme.
+// Run: pnpm --filter @moonshot-ai/pi-tui test
 import assert from "node:assert";
 import { afterEach, describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
@@ -720,6 +722,35 @@ describe("Markdown component", () => {
 			assert.ok(rendered.includes(chalk.italic("italic")));
 		});
 
+		it("keeps underscored environment variables in normal Markdown text", () => {
+			const source = "Use $MY_VAR and *italic*.";
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), "Use $MY_VAR and italic.");
+			assert.ok(rendered.includes(chalk.italic("italic")));
+		});
+
+		it("preserves strong TeX syntax after a currency-like prefix", () => {
+			const source = String.raw`$5 x^*_A + y^*_B`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source]);
+		});
+
+		it("preserves strong TeX syntax after an environment-like prefix", () => {
+			const source = String.raw`$HOME \theta^*_A + \phi^*_B`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source]);
+		});
+
 		it("preserves escaped dollars inside inline math", () => {
 			const source = String.raw`$\text{cost}=\$5^*_A$`;
 			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
@@ -786,6 +817,188 @@ describe("Markdown component", () => {
 			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
 		});
 
+		it("preserves closed math that crosses a direct-link boundary", () => {
+			const source = String.raw`[lead $a](b$) tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves closed math across link boundaries with mismatched backtick runs", () => {
+			const sources = [
+				"[pre $`[``](dest$) tail",
+				"[pre $``[```](dest$) tail",
+			];
+
+			for (const source of sources) {
+				const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+				const [rendered] = markdown.render(100);
+
+				assert.ok(rendered);
+				assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+			}
+		});
+
+		it("preserves closed math across a mismatched-backtick link while streaming", () => {
+			const source = "[pre $`[``](dest$) tail";
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves an escaped link-like boundary inside closed math", () => {
+			const source = String.raw`[lead $a\](b$ tail](https://example.com)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves an escaped opening bracket inside linked math", () => {
+			const source = String.raw`[lead $a\[b$ tail](https://example.com)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves an escaped closing bracket inside linked math", () => {
+			const source = String.raw`[lead $a\]b$ tail](https://example.com)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves consecutive backslashes before brackets inside linked math", () => {
+			const sources = [
+				String.raw`[value $[a\\]$](https://example.com)`,
+				String.raw`[value $\\[a]$](https://example.com)`,
+			];
+
+			for (const source of sources) {
+				const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+				const [rendered] = markdown.render(100);
+
+				assert.ok(rendered);
+				assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+			}
+		});
+
+		it("preserves closed math that crosses an image boundary", () => {
+			const source = String.raw`![lead $a](b$) tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves closed math that crosses a reference-link boundary", () => {
+			const source = String.raw`[lead $a][tier$] tail`;
+			const markdown = new Markdown(
+				`${source}\n\n[tier$]: https://example.com`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source, ""]);
+		});
+
+		it("preserves closed math that crosses a reference-image boundary", () => {
+			const source = String.raw`![lead $a][tier$] tail`;
+			const markdown = new Markdown(
+				`${source}\n\n[tier$]: https://example.com`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source, ""]);
+		});
+
+		it("preserves incomplete math that overlaps direct-link syntax while streaming", () => {
+			const source = String.raw`[lead $\text{a](b)} tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves math-like incomplete text that overlaps link syntax after finalization", () => {
+			const source = String.raw`[lead $\text{a](b)} tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves mismatched math that overlaps direct-link syntax while streaming", () => {
+			const source = String.raw`[lead $\text{a](b)}$$ tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves incomplete math that overlaps image syntax while streaming", () => {
+			const source = String.raw`![lead $\text{a](b)} tail`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const [rendered] = markdown.render(100);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), source);
+		});
+
+		it("preserves incomplete math that overlaps reference-link syntax while streaming", () => {
+			const source = String.raw`[lead $\text{a][tier] tail`;
+			const markdown = new Markdown(
+				`${source}\n\n[tier]: https://example.com`,
+				0,
+				0,
+				defaultMarkdownTheme,
+				undefined,
+				{ preserveIncompleteMath: true },
+			);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source, ""]);
+		});
+
 		it("keeps link formatting when math does not overlap link syntax", () => {
 			const source = String.raw`[value $x^*_A$](https://example.com)`;
 			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
@@ -801,6 +1014,17 @@ describe("Markdown component", () => {
 
 		it("preserves incomplete inline math during streaming", () => {
 			const source = String.raw`open $x^*_A + [y](z) + q~~r`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const lines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [source]);
+		});
+
+		it("preserves math-like incomplete inline text after finalization", () => {
+			const source = String.raw`$\theta^*_A + \phi^*_B`;
 			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
 
 			const lines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
@@ -821,6 +1045,19 @@ $$`;
 		});
 
 		it("preserves incomplete display math during streaming", () => {
+			const source = String.raw`$$
+# \theta^*_A
++ \phi^*_B`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const lines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, ["$$", String.raw`# \theta^*_A`, String.raw`+ \phi^*_B`]);
+		});
+
+		it("preserves incomplete display math after finalization", () => {
 			const source = String.raw`$$
 # \theta^*_A
 + \phi^*_B`;
@@ -862,6 +1099,270 @@ $$`;
 			assert.deepStrictEqual(lines, source.split("\n"));
 		});
 
+		it("renders a table normally when a cell contains a literal unmatched dollar", () => {
+			const source = `| Price | Meaning |
+| --- | --- |
+| $5 | cheap |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌───────┬─────────┐",
+				"│ Price │ Meaning │",
+				"├───────┼─────────┤",
+				"│ $5    │ cheap   │",
+				"└───────┴─────────┘",
+			]);
+		});
+
+		it("renders a table normally when a header contains a literal unmatched dollar", () => {
+			const source = `| $5 plan | Feature |
+| --- | --- |
+| Basic | yes |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌─────────┬─────────┐",
+				"│ $5 plan │ Feature │",
+				"├─────────┼─────────┤",
+				"│ Basic   │ yes     │",
+				"└─────────┴─────────┘",
+			]);
+		});
+
+		it("renders a table normally when separate cells contain currency amounts", () => {
+			const source = `| Price | Other |
+| --- | --- |
+| $5 | $10 |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌───────┬───────┐",
+				"│ Price │ Other │",
+				"├───────┼───────┤",
+				"│ $5    │ $10   │",
+				"└───────┴───────┘",
+			]);
+		});
+
+		it("renders a table normally when cells contain environment variables", () => {
+			const source = `| First | Second |
+| --- | --- |
+| $PATH | $MY_VAR |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌───────┬─────────┐",
+				"│ First │ Second  │",
+				"├───────┼─────────┤",
+				"│ $PATH │ $MY_VAR │",
+				"└───────┴─────────┘",
+			]);
+		});
+
+		it("renders common shell-variable forms as ordinary table text", () => {
+			const source = `| Variable |
+| --- |
+| $CI |
+| $X |
+| $foo |
+| \${HOME} |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌──────────┐",
+				"│ Variable │",
+				"├──────────┤",
+				"│ $CI      │",
+				"├──────────┤",
+				"│ $X       │",
+				"├──────────┤",
+				"│ $foo     │",
+				"├──────────┤",
+				"│ ${HOME}  │",
+				"└──────────┘",
+			]);
+		});
+
+		it("renders a table normally when inline code contains a literal dollar", () => {
+			const source = `| Value |
+| --- |
+| \`$HOME\` |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌───────┐",
+				"│ Value │",
+				"├───────┤",
+				"│ $HOME │",
+				"└───────┘",
+			]);
+		});
+
+		it("preserves a table when inline code contains an unescaped pipe", () => {
+			const source = `| Value |
+| --- |
+| \`$A|B\` |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("renders a compact currency table normally", () => {
+			const source = `|Price|Meaning|
+|---|---|
+|$5|cheap|`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, [
+				"┌───────┬─────────┐",
+				"│ Price │ Meaning │",
+				"├───────┼─────────┤",
+				"│ $5    │ cheap   │",
+				"└───────┴─────────┘",
+			]);
+		});
+
+		it("preserves an incomplete table formula before another cell arrives while streaming", () => {
+			const source = `| Formula | Meaning |
+| --- | --- |
+| $p(A|B)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an incomplete table formula containing an escaped pipe while streaming", () => {
+			const source = String.raw`| Formula | Meaning |
+| --- | --- |
+| $p(A\|B)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, {
+				preserveIncompleteMath: true,
+			});
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an incomplete table formula after finalization", () => {
+			const source = `| Formula | Meaning |
+| --- | --- |
+| $p(A|B) | conditional |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an incomplete uppercase table formula after finalization", () => {
+			const source = `| Formula | Meaning |
+| --- | --- |
+| $A|B`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an overflowing numeric table formula after finalization", () => {
+			const source = `| Formula | Meaning |
+| --- | --- |
+| $5|B | conditional |`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves a short numeric table formula after finalization", () => {
+			const source = `| Left | Right |
+| --- | --- |
+| $5|B`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves a short subscript table formula after finalization", () => {
+			const source = `| Left | Right |
+| --- | --- |
+| $A_B|C`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves a subscript after a short formula pipe", () => {
+			const source = `| Left | Right |
+| --- | --- |
+| $A|B_1`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an uppercase term after a short formula pipe", () => {
+			const source = `| Left | Right |
+| --- | --- |
+| $A|BC`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an expression after a short formula pipe", () => {
+			const source = `| Left | Right |
+| --- | --- |
+| $A|B+C`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
+		it("preserves an incomplete escaped table formula after finalization", () => {
+			const source = String.raw`| Formula | Meaning |
+| --- | --- |
+| $p(A\|B)`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+
+			const lines = markdown.render(100).map((line) => stripAnsi(line).trimEnd());
+
+			assert.deepStrictEqual(lines, source.split("\n"));
+		});
+
 		it("keeps math-like text inside inline code", () => {
 			const markdown = new Markdown("Use `$\\theta^*_A$` literally.", 0, 0, defaultMarkdownTheme);
 
@@ -870,6 +1371,18 @@ $$`;
 			assert.ok(rendered);
 			assert.strictEqual(stripAnsi(rendered).trimEnd(), String.raw`Use $\theta^*_A$ literally.`);
 			assert.ok(rendered.includes(defaultMarkdownTheme.code(String.raw`$\theta^*_A$`)));
+		});
+
+		it("renders a long unmatched backtick run without quadratic slowdown", { timeout: 2_000 }, () => {
+			const source = `prefix ${"`".repeat(64_000)} suffix`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+			const startedAt = performance.now();
+
+			const lines = markdown.render(100_000).map((line) => stripAnsi(line).trimEnd());
+
+			const elapsedMs = performance.now() - startedAt;
+			assert.deepStrictEqual(lines, [source]);
+			assert.ok(elapsedMs < 1_000, `Expected linear rendering, took ${elapsedMs.toFixed(1)}ms`);
 		});
 
 		it("keeps delimiter-only display math inside fenced code", () => {
@@ -1542,6 +2055,174 @@ bar`,
 				line.replace(/\x1b\]8;;[^\x1b]*\x1b\\/g, "").replace(/\x1b\[[0-9;]*m/g, ""),
 			);
 			assert.ok(!rawPlain.join("").includes("(https://example.com)"), "URL should not appear inline in parentheses");
+		});
+
+		it("keeps a link label with a literal dollar clickable", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[$5 plan](https://example.com) after text",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$5 plan\x1b]8;;\x1b\\"));
+		});
+
+		it("keeps an underscored environment-variable label clickable", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown("[$API_KEY](https://example.com)", 0, 0, defaultMarkdownTheme);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$API_KEY\x1b]8;;\x1b\\"));
+		});
+
+		it("preserves backslashes before brackets inside a code-span link label", () => {
+			for (const bracket of ["[", "]"]) {
+				for (let slashCount = 1; slashCount <= 4; slashCount++) {
+					const source = "[`$a" + "\\".repeat(slashCount) + bracket + "b$`](https://example.com)";
+					const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+					const [rendered] = markdown.render(100);
+
+					assert.ok(rendered);
+					assert.strictEqual(stripAnsi(rendered).trimEnd(), source.replaceAll("`", ""));
+				}
+			}
+		});
+
+		it("keeps a code-span label containing a dollar clickable", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown("[`$HOME`](https://example.com)", 0, 0, defaultMarkdownTheme);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$HOME\x1b]8;;\x1b\\"));
+		});
+
+		it("preserves math after a code span containing a closing bracket", () => {
+			const markdown = new Markdown("[`]` $a](b$) tail", 0, 0, defaultMarkdownTheme);
+
+			const [rendered] = markdown.render(80);
+
+			assert.ok(rendered);
+			assert.strictEqual(stripAnsi(rendered).trimEnd(), "[] $a](b$) tail");
+		});
+
+		it("keeps a link clickable when closed math contains link-like text", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const label = String.raw`lead $\text{[a](b)}$ tail`;
+			const markdown = new Markdown(`[${label}](https://example.com)`, 0, 0, defaultMarkdownTheme);
+
+			const rendered = markdown.render(100).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(
+				hyperlink.includes(`\x1b]8;;https://example.com\x1b\\${label}\x1b]8;;\x1b\\`),
+			);
+		});
+
+		it("keeps a currency link clickable when another amount follows", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[$5 plan](https://example.com), then $10",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$5 plan\x1b]8;;\x1b\\"));
+		});
+
+		it("keeps a currency link clickable when a formula follows", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[$5 plan](https://example.com), then $x$",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$5 plan\x1b]8;;\x1b\\"));
+			assert.ok(hyperlink.includes("$x$"));
+		});
+
+		it("uses a destination containing a literal dollar as the OSC 8 target", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[docs](https://example.com/$metadata) after text",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(
+				hyperlink.includes("\x1b]8;;https://example.com/$metadata\x1b\\docs\x1b]8;;\x1b\\"),
+			);
+		});
+
+		it("keeps a dollar destination clickable when a formula follows", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[docs](https://example.com/$metadata), then $x$",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(
+				hyperlink.includes("\x1b]8;;https://example.com/$metadata\x1b\\docs\x1b]8;;\x1b\\"),
+			);
+			assert.ok(hyperlink.includes("$x$"));
+		});
+
+		it("uses a destination containing an underscored dollar term", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[docs](https://example.com/$meta_data) after text",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(
+				hyperlink.includes("\x1b]8;;https://example.com/$meta_data\x1b\\docs\x1b]8;;\x1b\\"),
+			);
+		});
+
+		it("keeps a reference-link label with a literal dollar clickable", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const markdown = new Markdown(
+				"[$5 plan][tier]\n\n[tier]: https://example.com",
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const rendered = markdown.render(80).join("");
+			const hyperlink = stripAnsi(rendered).trimEnd();
+
+			assert.ok(hyperlink.includes("\x1b]8;;https://example.com\x1b\\$5 plan\x1b]8;;\x1b\\"));
 		});
 
 		it("should use OSC 8 for mailto links when terminal supports hyperlinks", () => {

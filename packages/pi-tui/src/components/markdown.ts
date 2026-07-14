@@ -9,8 +9,8 @@ const DISPLAY_MATH_OPEN_LINE_SEARCH_REGEX = /\n {0,3}\$\$(?!\$)/;
 
 // Marked does not recognize TeX dollar delimiters, so Markdown markers inside
 // math must be tokenized as opaque text before the built-in tokenizers see them.
-// Ambiguous dollar-delimited text is also kept literal: source preservation
-// takes priority over applying Markdown styles inside a possible formula.
+// Streaming keeps every incomplete span opaque; finalized text keeps only
+// source-sensitive candidates opaque so `$5` and `$HOME` remain normal text.
 interface LiteralMathToken extends Tokens.Generic {
 	type: "math_block" | "math_inline";
 	raw: string;
@@ -42,7 +42,118 @@ function getDollarRunLength(text: string, index: number): number {
 	return end - index;
 }
 
-function findInlineMathEnd(src: string, start: number): number | undefined {
+function getBacktickRunLength(text: string, index: number): number {
+	let end = index;
+	while (text[end] === "`") {
+		end++;
+	}
+	return end - index;
+}
+
+function findInlineCodeSpanEnd(text: string, start: number): number | undefined {
+	const delimiterLength = getBacktickRunLength(text, start);
+	if (delimiterLength === 0 || isEscapedAt(text, start)) {
+		return undefined;
+	}
+
+	for (let i = start + delimiterLength; i < text.length; i++) {
+		if (text[i] !== "`") {
+			continue;
+		}
+		const runLength = getBacktickRunLength(text, i);
+		if (runLength === delimiterLength) {
+			return i + delimiterLength;
+		}
+		i += runLength - 1;
+	}
+	return undefined;
+}
+
+function findNextDollarOutsideInlineCode(text: string, start: number): number {
+	for (let i = start; i < text.length; i++) {
+		if (text[i] === "`") {
+			const runLength = getBacktickRunLength(text, i);
+			const codeSpanEnd = findInlineCodeSpanEnd(text, i);
+			if (codeSpanEnd !== undefined) {
+				i = codeSpanEnd - 1;
+				continue;
+			}
+			// A contiguous backtick run is one delimiter candidate. Once it has
+			// no closer, retrying every suffix of the same run is both incorrect
+			// and quadratic. An escaped first tick is skipped alone so the
+			// unescaped suffix can still begin a valid code span.
+			if (!isEscapedAt(text, i)) {
+				i += runLength - 1;
+			}
+		}
+		if (text[i] === "$") {
+			return i;
+		}
+	}
+	return -1;
+}
+
+function inlineCodeSpanContainsUnescapedPipe(text: string): boolean {
+	for (let i = 0; i < text.length; i++) {
+		if (text[i] !== "`") {
+			continue;
+		}
+		const delimiterLength = getBacktickRunLength(text, i);
+		const codeSpanEnd = findInlineCodeSpanEnd(text, i);
+		if (codeSpanEnd === undefined) {
+			if (!isEscapedAt(text, i)) {
+				i += delimiterLength - 1;
+			}
+			continue;
+		}
+		const closingStart = codeSpanEnd - delimiterLength;
+		for (let j = i + delimiterLength; j < closingStart; j++) {
+			if (text[j] === "|" && !isEscapedAt(text, j)) {
+				return true;
+			}
+		}
+		i = codeSpanEnd - 1;
+	}
+	return false;
+}
+
+function isClearCurrencyDollarStart(text: string, index: number): boolean {
+	if (getDollarRunLength(text, index) !== 1) {
+		return false;
+	}
+
+	const rest = text.slice(index + 1);
+	return /^\d+(?:[.,]\d+)?(?=$|[\s/.,;:!?|)\]])/.test(rest);
+}
+
+function isClearLiteralDollarStart(text: string, index: number): boolean {
+	if (isClearCurrencyDollarStart(text, index)) {
+		return true;
+	}
+	if (getDollarRunLength(text, index) !== 1) {
+		return false;
+	}
+
+	const rest = text.slice(index + 1);
+	return /^(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})(?=$|[\s/.,;:!?|)\]])/.test(
+		rest,
+	);
+}
+
+function startsAnotherDollarTerm(text: string, index: number): boolean {
+	const next = text[index + 1];
+	return next !== undefined && /[A-Za-z0-9\\{_^]/.test(next);
+}
+
+interface InlineMathSpan {
+	// `end` is also the opaque rendering boundary for streamed input. `closed`
+	// distinguishes that boundary from a real closing dollar delimiter.
+	closed: boolean;
+	delimiterLength: number;
+	end: number;
+}
+
+function findInlineMathSpan(src: string, start: number): InlineMathSpan | undefined {
 	const delimiterLength = getDollarRunLength(src, start);
 	if (delimiterLength !== 1 && delimiterLength !== 2) {
 		return undefined;
@@ -50,7 +161,7 @@ function findInlineMathEnd(src: string, start: number): number | undefined {
 
 	for (let i = start + delimiterLength; i < src.length; i++) {
 		if (delimiterLength === 1 && src[i] === "\n") {
-			return i;
+			return { closed: false, delimiterLength, end: i };
 		}
 		if (src[i] !== "$" || isEscapedAt(src, i)) {
 			continue;
@@ -58,28 +169,64 @@ function findInlineMathEnd(src: string, start: number): number | undefined {
 
 		const closingRunLength = getDollarRunLength(src, i);
 		if (closingRunLength === delimiterLength) {
-			return i + delimiterLength;
+			// `$5 ... $10` and `$PATH/$HOME` contain two literal dollar
+			// prefixes, not one math span. Do not pair a clear literal opener
+			// with a dollar that itself starts another term.
+			if (
+				delimiterLength === 1 &&
+				isClearLiteralDollarStart(src, start) &&
+				startsAnotherDollarTerm(src, i)
+			) {
+				return { closed: false, delimiterLength, end: i };
+			}
+			return { closed: true, delimiterLength, end: i + delimiterLength };
 		}
 
 		// An unescaped dollar run of another length starts a new candidate.
 		// Treat the current span as incomplete instead of scanning past it.
-		return i;
+		return { closed: false, delimiterLength, end: i };
 	}
 
 	// Preservation takes priority over Markdown styling while a delimiter is
 	// incomplete (including during streaming), so keep the rest opaque.
-	return src.length;
+	return { closed: false, delimiterLength, end: src.length };
 }
 
-function readInlineMath(src: string): string | undefined {
-	const end = findInlineMathEnd(src, 0);
-	return end === undefined ? undefined : src.slice(0, end);
+function incompleteMathNeedsProtection(src: string, start: number, span: InlineMathSpan): boolean {
+	const interruptedByAnotherDollar = src[span.end] === "$";
+	const body = src.slice(start + span.delimiterLength, span.end);
+
+	// Finalized input can still end mid-formula after cancellation, truncation,
+	// or a malformed response. Strong TeX evidence takes precedence even when
+	// the candidate begins like currency or an environment variable.
+	const bracedShellVariable = /^\{[A-Za-z_][A-Za-z0-9_]*\}(?=$|[\s/.,;:!?|)\]])/.test(body);
+	if (!bracedShellVariable && /[\\^{}]/.test(body)) {
+		return true;
+	}
+	if (isClearLiteralDollarStart(src, start) && !interruptedByAnotherDollar) {
+		return false;
+	}
+
+	// Protect remaining candidates only when Markdown could consume or
+	// normalize their source characters. Plain `$word` stays ordinary text.
+	return /[*~<>\[\]`&]/.test(body);
 }
 
-function hasIncompleteMathSpan(src: string): boolean {
+function readInlineMath(src: string, preserveIncompleteMath: boolean): string | undefined {
+	const span = findInlineMathSpan(src, 0);
+	if (
+		span === undefined ||
+		(!span.closed && !preserveIncompleteMath && !incompleteMathNeedsProtection(src, 0, span))
+	) {
+		return undefined;
+	}
+	return src.slice(0, span.end);
+}
+
+function hasProtectedIncompleteMathSpan(src: string, preserveIncompleteMath: boolean): boolean {
 	let searchStart = 0;
 	while (searchStart < src.length) {
-		const mathStart = src.indexOf("$", searchStart);
+		const mathStart = findNextDollarOutsideInlineCode(src, searchStart);
 		if (mathStart === -1) {
 			return false;
 		}
@@ -88,21 +235,148 @@ function hasIncompleteMathSpan(src: string): boolean {
 			continue;
 		}
 
-		const delimiterLength = getDollarRunLength(src, mathStart);
-		const mathEnd = findInlineMathEnd(src, mathStart);
-		if (mathEnd === undefined) {
-			searchStart = mathStart + delimiterLength;
+		const span = findInlineMathSpan(src, mathStart);
+		if (span === undefined) {
+			searchStart = mathStart + getDollarRunLength(src, mathStart);
 			continue;
 		}
-		const closingStart = mathEnd - delimiterLength;
-		if (
-			mathEnd - mathStart < delimiterLength * 2 ||
-			getDollarRunLength(src, closingStart) !== delimiterLength ||
-			isEscapedAt(src, closingStart)
-		) {
+		if (!span.closed && (preserveIncompleteMath || incompleteMathNeedsProtection(src, mathStart, span))) {
 			return true;
 		}
-		searchStart = mathEnd;
+		searchStart = span.closed ? span.end : mathStart + span.delimiterLength;
+	}
+	return false;
+}
+
+function findLinkLabelBacktickSpanEnd(text: string, start: number): number | undefined {
+	const openingRunLength = getBacktickRunLength(text, start);
+	if (openingRunLength === 0 || isEscapedAt(text, start)) {
+		return undefined;
+	}
+
+	const openingEnd = start + openingRunLength;
+	for (let i = openingEnd; i < text.length; i++) {
+		if (text[i] === "`") {
+			return i + getBacktickRunLength(text, i);
+		}
+	}
+
+	// Marked also masks a terminal run of at least two backticks immediately
+	// before the label's closing bracket.
+	return openingRunLength >= 2 && text[openingEnd] === "]" ? openingEnd : undefined;
+}
+
+function findLinkLabelEnd(raw: string): number {
+	const openingBracket = raw.startsWith("![") ? 1 : raw.startsWith("[") ? 0 : -1;
+	if (openingBracket === -1) {
+		return raw.length;
+	}
+
+	let depth = 1;
+	for (let i = openingBracket + 1; i < raw.length; i++) {
+		if (raw[i] === "`") {
+			const runLength = getBacktickRunLength(raw, i);
+			// Link-label parsing masks the next backtick run even when its
+			// length differs from the opener. This deliberately differs from
+			// CommonMark inline-code parsing.
+			const maskedSpanEnd = findLinkLabelBacktickSpanEnd(raw, i);
+			if (maskedSpanEnd !== undefined) {
+				i = maskedSpanEnd - 1;
+				continue;
+			}
+			if (!isEscapedAt(raw, i)) {
+				i += runLength - 1;
+			}
+		}
+		if (raw[i] !== "[" && raw[i] !== "]") {
+			continue;
+		}
+		if (isEscapedAt(raw, i)) {
+			continue;
+		}
+		if (raw[i] === "[") {
+			depth++;
+		} else if (raw[i] === "]") {
+			depth--;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return raw.length;
+}
+
+function linkLabelCodeSpanNeedsSourceProtection(raw: string, labelEnd: number): boolean {
+	const openingBracket = raw.startsWith("![") ? 1 : raw.startsWith("[") ? 0 : -1;
+	if (openingBracket === -1) {
+		return false;
+	}
+
+	for (let i = openingBracket + 1; i < labelEnd; i++) {
+		if (raw[i] !== "`") {
+			continue;
+		}
+		const delimiterLength = getBacktickRunLength(raw, i);
+		const codeSpanEnd = findInlineCodeSpanEnd(raw, i);
+		if (codeSpanEnd === undefined || codeSpanEnd > labelEnd) {
+			if (!isEscapedAt(raw, i)) {
+				i += delimiterLength - 1;
+			}
+			continue;
+		}
+
+		const closingStart = codeSpanEnd - delimiterLength;
+		for (let j = i + delimiterLength; j < closingStart; j++) {
+			if ((raw[j] === "[" || raw[j] === "]") && raw[j - 1] === "\\") {
+				return true;
+			}
+		}
+		i = codeSpanEnd - 1;
+	}
+	return false;
+}
+
+function tokenOverlapsClosedMathSpan(src: string, tokenEnd: number, labelEnd: number): boolean {
+	const boundedTokenEnd = Math.min(tokenEnd, src.length);
+	let searchStart = 0;
+	while (searchStart < boundedTokenEnd) {
+		const mathStart = findNextDollarOutsideInlineCode(src, searchStart);
+		// Dollar text in a link destination or reference id belongs to the URL,
+		// not the visible label. Only spans that start in the label can have link
+		// syntax consume part of a displayed formula.
+		if (mathStart === -1 || mathStart >= boundedTokenEnd || mathStart >= labelEnd) {
+			return false;
+		}
+		if (isEscapedAt(src, mathStart)) {
+			searchStart = mathStart + 1;
+			continue;
+		}
+
+		const span = findInlineMathSpan(src, mathStart);
+		if (span === undefined) {
+			searchStart = mathStart + getDollarRunLength(src, mathStart);
+			continue;
+		}
+		if (span.closed) {
+			if (mathStart < boundedTokenEnd && boundedTokenEnd < span.end) {
+				return true;
+			}
+			// Fall back when Marked chose a label boundary from inside the formula.
+			if (mathStart < labelEnd && labelEnd < span.end) {
+				return true;
+			}
+			// Marked normalizes escaped brackets in link labels before the math
+			// extension sees them, so preserve any such source inside the formula.
+			const overlapEnd = Math.min(span.end, boundedTokenEnd);
+			for (let i = mathStart + span.delimiterLength; i < overlapEnd; i++) {
+				if ((src[i] === "[" || src[i] === "]") && src[i - 1] === "\\") {
+					return true;
+				}
+			}
+			searchStart = span.end;
+			continue;
+		}
+		searchStart = mathStart + span.delimiterLength;
 	}
 	return false;
 }
@@ -134,7 +408,6 @@ function readDisplayMath(src: string): LiteralMathToken | undefined {
 		// A same-line $$...$$ span belongs to the inline tokenizer.
 		return undefined;
 	}
-
 	let rawEnd = closingStart === undefined ? src.length : closingStart + 2;
 	if (closingStart !== undefined) {
 		const closingLineEnd = src.indexOf("\n", rawEnd);
@@ -152,13 +425,13 @@ function readDisplayMath(src: string): LiteralMathToken | undefined {
 	};
 }
 
-function maskInlineMath(src: string): string {
+function maskInlineMath(src: string, preserveIncompleteMath: boolean): string {
 	const parts: string[] = [];
 	let cursor = 0;
 	let searchStart = 0;
 
 	while (searchStart < src.length) {
-		const mathStart = src.indexOf("$", searchStart);
+		const mathStart = findNextDollarOutsideInlineCode(src, searchStart);
 		if (mathStart === -1) {
 			break;
 		}
@@ -167,16 +440,24 @@ function maskInlineMath(src: string): string {
 			continue;
 		}
 
-		const mathEnd = findInlineMathEnd(src, mathStart);
-		if (mathEnd === undefined) {
+		const span = findInlineMathSpan(src, mathStart);
+		if (span === undefined) {
 			searchStart = mathStart + getDollarRunLength(src, mathStart);
+			continue;
+		}
+		if (
+			!span.closed &&
+			!preserveIncompleteMath &&
+			!incompleteMathNeedsProtection(src, mathStart, span)
+		) {
+			searchStart = mathStart + span.delimiterLength;
 			continue;
 		}
 
 		parts.push(src.slice(cursor, mathStart));
-		parts.push(src.slice(mathStart, mathEnd).replace(/[^\n]/g, "a"));
-		cursor = mathEnd;
-		searchStart = mathEnd;
+		parts.push(src.slice(mathStart, span.end).replace(/[^\n]/g, "a"));
+		cursor = span.end;
+		searchStart = span.end;
 	}
 
 	if (parts.length === 0) {
@@ -186,10 +467,79 @@ function maskInlineMath(src: string): string {
 	return parts.join("");
 }
 
-function mathSpanContainsTableDelimiter(src: string): boolean {
+function countTableCells(row: string): number {
+	const trimmed = row.trim();
+	if (trimmed.length === 0) {
+		return 0;
+	}
+
+	let cells = 1;
+	for (let i = 0; i < trimmed.length; i++) {
+		if (trimmed[i] === "|" && !isEscapedAt(trimmed, i)) {
+			cells++;
+		}
+	}
+	if (trimmed[0] === "|") {
+		cells--;
+	}
+	const trailingPipe = trimmed.lastIndexOf("|");
+	if (trailingPipe === trimmed.length - 1 && !isEscapedAt(trimmed, trailingPipe)) {
+		cells--;
+	}
+	return cells;
+}
+
+function tableHasOverflowingRow(src: string, columnCount: number): boolean {
+	return src.split("\n").some((row) => countTableCells(row) > columnCount);
+}
+
+function incompleteSpanHasLikelyFormulaPipe(src: string, start: number, span: InlineMathSpan): boolean {
+	if (span.closed) {
+		return false;
+	}
+	const body = src.slice(start + span.delimiterLength, span.end);
+	for (let pipeIndex = 0; pipeIndex < body.length; pipeIndex++) {
+		if (body[pipeIndex] !== "|" || isEscapedAt(body, pipeIndex)) {
+			continue;
+		}
+
+		let rightEnd = pipeIndex + 1;
+		while (rightEnd < body.length && (body[rightEnd] !== "|" || isEscapedAt(body, rightEnd))) {
+			rightEnd++;
+		}
+		const rawLeft = body.slice(0, pipeIndex);
+		const left = rawLeft.trim();
+		const right = body.slice(pipeIndex + 1, rightEnd).trim();
+		if (left.length === 0 || right.length === 0) {
+			continue;
+		}
+
+		// A compact symbolic left-hand side (`$A|...`) is stronger formula
+		// evidence than a shell variable separated from the next table cell.
+		// Keep compact numeric currency (`$5|cheap`) boxed unless the right-hand
+		// side itself carries formula evidence.
+		const compactSymbolicLeft =
+			!/[\t ]$/.test(rawLeft) && !/^\d+(?:[.,]\d+)?$/.test(left);
+		const rightHasFormulaEvidence =
+			/^[A-Z][A-Z0-9_]*$/.test(right) ||
+			/^[A-Za-z0-9]$/.test(right) ||
+			/[+\-*/^_=<>()[\]{}\\]/.test(right);
+		if (compactSymbolicLeft || rightHasFormulaEvidence) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function mathSpanContainsTableDelimiter(
+	src: string,
+	columnCount: number,
+	preserveIncompleteMath: boolean,
+): boolean {
+	const hasOverflowingRow = tableHasOverflowingRow(src, columnCount);
 	let searchStart = 0;
 	while (searchStart < src.length) {
-		const mathStart = src.indexOf("$", searchStart);
+		const mathStart = findNextDollarOutsideInlineCode(src, searchStart);
 		if (mathStart === -1) {
 			return false;
 		}
@@ -198,62 +548,100 @@ function mathSpanContainsTableDelimiter(src: string): boolean {
 			continue;
 		}
 
-		const mathEnd = findInlineMathEnd(src, mathStart);
-		if (mathEnd === undefined) {
+		const span = findInlineMathSpan(src, mathStart);
+		if (span === undefined) {
 			searchStart = mathStart + getDollarRunLength(src, mathStart);
 			continue;
 		}
-		if (src.slice(mathStart, mathEnd).includes("|")) {
+		const spanContainsPipe = src.slice(mathStart, span.end).includes("|");
+		const protectSpan =
+			span.closed ||
+			preserveIncompleteMath ||
+			incompleteMathNeedsProtection(src, mathStart, span) ||
+			incompleteSpanHasLikelyFormulaPipe(src, mathStart, span) ||
+			(spanContainsPipe &&
+				(!isClearLiteralDollarStart(src, mathStart) || hasOverflowingRow));
+		if (protectSpan && spanContainsPipe) {
 			return true;
 		}
-		searchStart = mathEnd;
+		searchStart = protectSpan ? span.end : mathStart + span.delimiterLength;
 	}
 	return false;
 }
 
-const literalMathBlockExtension: TokenizerExtension = {
-	name: "math_block",
-	level: "block",
-	start(src): number | undefined {
-		const match = DISPLAY_MATH_OPEN_LINE_SEARCH_REGEX.exec(src);
-		return match === null ? undefined : match.index + 1;
-	},
-	tokenizer(src): LiteralMathToken | undefined {
-		return readDisplayMath(src);
-	},
-};
+function createLiteralMathBlockExtension(): TokenizerExtension {
+	return {
+		name: "math_block",
+		level: "block",
+		start(src): number | undefined {
+			const match = DISPLAY_MATH_OPEN_LINE_SEARCH_REGEX.exec(src);
+			return match === null ? undefined : match.index + 1;
+		},
+		tokenizer(src): LiteralMathToken | undefined {
+			return readDisplayMath(src);
+		},
+	};
+}
 
-const literalMathInlineExtension: TokenizerExtension = {
-	name: "math_inline",
-	level: "inline",
-	start(src): number | undefined {
-		const index = src.indexOf("$");
-		return index === -1 ? undefined : index;
-	},
-	tokenizer(src): LiteralMathToken | undefined {
-		const raw = readInlineMath(src);
-		if (raw === undefined) {
-			return undefined;
-		}
-		return {
-			type: "math_inline",
-			raw,
-			text: raw,
-		};
-	},
-};
+function createLiteralMathInlineExtension(preserveIncompleteMath: boolean): TokenizerExtension {
+	return {
+		name: "math_inline",
+		level: "inline",
+		start(src): number | undefined {
+			const index = src.indexOf("$");
+			return index === -1 ? undefined : index;
+		},
+		tokenizer(src): LiteralMathToken | undefined {
+			const raw = readInlineMath(src, preserveIncompleteMath);
+			if (raw === undefined) {
+				return undefined;
+			}
+			return {
+				type: "math_inline",
+				raw,
+				text: raw,
+			};
+		},
+	};
+}
 
 class LiteralMathTokenizer extends Tokenizer {
+	private readonly preserveIncompleteMath: boolean;
+
+	constructor(preserveIncompleteMath: boolean) {
+		super();
+		this.preserveIncompleteMath = preserveIncompleteMath;
+	}
+
 	override link(src: string): Tokens.Link | Tokens.Image | undefined {
 		const token = super.link(src);
+		const labelEnd = token === undefined ? 0 : findLinkLabelEnd(token.raw);
 		// Link labels are parsed before inline extensions. Falling back lets the
 		// math tokenizer preserve brackets and parentheses inside the formula.
-		return token && hasIncompleteMathSpan(token.raw) ? undefined : token;
+		return token &&
+			(tokenOverlapsClosedMathSpan(src, token.raw.length, labelEnd) ||
+				linkLabelCodeSpanNeedsSourceProtection(token.raw, labelEnd) ||
+				hasProtectedIncompleteMathSpan(
+					token.raw.slice(0, labelEnd + 1),
+					this.preserveIncompleteMath,
+				))
+			? undefined
+			: token;
 	}
 
 	override reflink(src: string, links: Links): Tokens.Link | Tokens.Image | Tokens.Text | undefined {
 		const token = super.reflink(src, links);
-		if ((token?.type === "link" || token?.type === "image") && hasIncompleteMathSpan(token.raw)) {
+		const labelEnd =
+			token?.type === "link" || token?.type === "image" ? findLinkLabelEnd(token.raw) : 0;
+		if (
+			(token?.type === "link" || token?.type === "image") &&
+			(tokenOverlapsClosedMathSpan(src, token.raw.length, labelEnd) ||
+				linkLabelCodeSpanNeedsSourceProtection(token.raw, labelEnd) ||
+				hasProtectedIncompleteMathSpan(
+					token.raw.slice(0, labelEnd + 1),
+					this.preserveIncompleteMath,
+				))
+		) {
 			return { type: "text", raw: src[0]!, text: src[0]! };
 		}
 		return token;
@@ -302,16 +690,25 @@ function trimPartialClosingFences(tokens: readonly Token[]): void {
 	token.text = token.text.slice(0, -lastLine.length).replace(/\n$/, "");
 }
 
-const markdownParser = new Marked();
-markdownParser.setOptions({
-	tokenizer: new LiteralMathTokenizer(),
-});
-markdownParser.use({
-	extensions: [literalMathBlockExtension, literalMathInlineExtension],
-	hooks: {
-		emStrongMask: maskInlineMath,
-	},
-});
+function createMarkdownParser(preserveIncompleteMath: boolean): Marked {
+	const parser = new Marked();
+	parser.setOptions({
+		tokenizer: new LiteralMathTokenizer(preserveIncompleteMath),
+	});
+	parser.use({
+		extensions: [
+			createLiteralMathBlockExtension(),
+			createLiteralMathInlineExtension(preserveIncompleteMath),
+		],
+		hooks: {
+			emStrongMask: (src) => maskInlineMath(src, preserveIncompleteMath),
+		},
+	});
+	return parser;
+}
+
+const markdownParser = createMarkdownParser(false);
+const streamingMarkdownParser = createMarkdownParser(true);
 
 /**
  * Default text styling for markdown content.
@@ -361,6 +758,8 @@ export interface MarkdownOptions {
 	preserveOrderedListMarkers?: boolean;
 	/** Preserve source backslash escapes instead of normalizing escaped punctuation. */
 	preserveBackslashEscapes?: boolean;
+	/** Keep unclosed dollar spans opaque while their closing delimiter may still arrive. */
+	preserveIncompleteMath?: boolean;
 }
 
 interface InlineStyleContext {
@@ -432,7 +831,8 @@ export class Markdown implements Component {
 		const normalizedText = this.text.replace(/\t/g, "   ");
 
 		// Parse markdown to HTML-like tokens
-		const tokens = markdownParser.lexer(normalizedText);
+		const parser = this.options.preserveIncompleteMath ? streamingMarkdownParser : markdownParser;
+		const tokens = parser.lexer(normalizedText);
 		trimPartialClosingFences(tokens);
 
 		// Convert tokens to styled terminal output
@@ -676,9 +1076,16 @@ export class Markdown implements Component {
 
 			case "table": {
 				const tableToken = token as Tokens.Table;
-				if (mathSpanContainsTableDelimiter(tableToken.raw)) {
-					// The block table tokenizer splits on pipes before inline math is
-					// tokenized, so fall back to the raw table when a pipe belongs to math.
+				if (
+					inlineCodeSpanContainsUnescapedPipe(tableToken.raw) ||
+					mathSpanContainsTableDelimiter(
+						tableToken.raw,
+						tableToken.header.length,
+						this.options.preserveIncompleteMath === true,
+					)
+				) {
+					// The block table tokenizer splits on pipes before inline math or code
+					// is tokenized, so fall back when a pipe belongs to either inline span.
 					const text = tableToken.raw.endsWith("\n") ? tableToken.raw.slice(0, -1) : tableToken.raw;
 					const applyText = styleContext?.applyText ?? ((line: string) => this.applyDefaultStyle(line));
 					lines.push(...text.split("\n").map(applyText));
