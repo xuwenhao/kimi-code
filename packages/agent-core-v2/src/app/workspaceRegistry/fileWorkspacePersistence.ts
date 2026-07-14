@@ -27,8 +27,6 @@ import {
 } from './workspacePersistence';
 
 const WORKSPACE_REGISTRY_VERSION = 1;
-// Empty scope resolves to `<homeDir>/<key>` (join skips empty segments),
-// preserving the historical `<homeDir>/workspaces.json` location.
 const WORKSPACE_REGISTRY_SCOPE = '';
 const WORKSPACE_REGISTRY_KEY = 'workspaces.json';
 const WORKSPACE_REGISTRY_LOCK_RETRIES = {
@@ -59,8 +57,6 @@ export class FileWorkspacePersistence implements IWorkspacePersistence {
       typeof (file as { workspaces?: unknown }).workspaces !== 'object' ||
       (file as { workspaces?: unknown }).workspaces === null
     ) {
-      // Structurally malformed catalog → treat as unusable so the registry
-      // rebuilds from the legacy session index instead of sticking on empty.
       return undefined;
     }
     const now = Date.now();
