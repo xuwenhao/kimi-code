@@ -182,7 +182,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
       return handle;
     } catch (error) {
       const failedHandle = handle;
-      if (failedHandle !== undefined && !claim.closing) {
+      if (failedHandle !== undefined && !claim.published && !claim.closing) {
         await throwAfterCleanup(error, () =>
           directoryOwnership.owned
             ? this.rollbackOwnedSessionDirectory(
@@ -305,14 +305,19 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     event: SessionCreatedEvent,
     claim: SessionInitializationClaim,
   ): Promise<void> {
-    await this.hooks.onDidCreateSession.run(event);
+    let hookFailure: { readonly error: unknown } | undefined;
+    try {
+      await this.hooks.onDidCreateSession.run(event);
+    } catch (error) {
+      hookFailure = { error };
+    }
     this.assertSessionHandleOwned(event.sessionId, event.handle, claim);
     this._onDidCreateSession.fire(event);
     // Deliberately broader than v1: resumes also emit, with `resumed: true` —
     // the flag exists precisely to distinguish them (v1's resume path never
     // emitted despite the schema having the flag).
     this.telemetry.track2('session_started', { resumed: event.source === 'resume' });
-    event.handle.accessor.get(ISessionActivityKernel).markActive();
+    if (hookFailure !== undefined) throw hookFailure.error;
   }
 
   get(sessionId: string): ISessionScopeHandle | undefined {
@@ -417,7 +422,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         this.assertSessionHandleOwned(sessionId, handle, claim);
         return handle;
       } catch (error) {
-        if (handle !== undefined && !claim.closing) {
+        if (handle !== undefined && !claim.published && !claim.closing) {
           await this.disposeFailedSession(sessionId, handle);
         }
         throw error;
@@ -619,6 +624,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
     claim: SessionInitializationClaim,
   ): void {
     this.assertSessionHandleOwned(sessionId, handle, claim);
+    handle.accessor.get(ISessionActivityKernel).markActive();
     claim.markPublished();
     this.assertSessionHandleOwned(sessionId, handle, claim);
   }
@@ -841,6 +847,7 @@ export class SessionLifecycleService extends Disposable implements ISessionLifec
         targetId !== undefined &&
         target !== undefined &&
         targetClaim !== undefined &&
+        !targetClaim.published &&
         !targetClaim.closing
       ) {
         const failedTargetId = targetId;

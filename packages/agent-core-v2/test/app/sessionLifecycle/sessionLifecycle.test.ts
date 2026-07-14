@@ -818,6 +818,38 @@ describe('SessionLifecycleService', () => {
     hook.dispose();
   });
 
+  it('keeps a handle returned by resume when the create hook later fails', async () => {
+    const hookStarted = deferred();
+    const finishHook = deferred();
+    const failure = new Error('session creation hook failed');
+    const createdEvents: ISessionScopeHandle[] = [];
+    const svc = build();
+    svc.onDidCreateSession((event) => createdEvents.push(event.handle));
+    const hook = svc.hooks.onDidCreateSession.register('fail-created-session', async () => {
+      hookStarted.resolve();
+      await finishHook.promise;
+      throw failure;
+    });
+
+    const creating = svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+    const createResult = creating.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await hookStarted.promise;
+    const resumed = await svc.resume('s1');
+
+    expect(resumed).toBeDefined();
+    expect(resumed!.accessor.get(ISessionActivityKernel).lane()).toBe('active');
+    finishHook.resolve();
+    await expect(createResult).resolves.toBe(failure);
+
+    expect(svc.get('s1')).toBe(resumed);
+    await expect(svc.resume('s1')).resolves.toBe(resumed);
+    expect(createdEvents).toEqual([resumed]);
+    hook.dispose();
+  });
+
   it('rejects create when its creation hook closes the published session', async () => {
     const svc = build();
     const closed: string[] = [];
@@ -1561,7 +1593,7 @@ describe('SessionLifecycleService', () => {
     expect(workspaceTouches).toBe(2);
   });
 
-  it('allows a same-id resume retry after its creation hook fails', async () => {
+  it('keeps a resumed session published when its creation hook fails', async () => {
     const failure = new Error('session creation hook failed');
     let attempts = 0;
     const svc = build([
@@ -1575,10 +1607,11 @@ describe('SessionLifecycleService', () => {
     });
 
     await expect(svc.resume('s1')).rejects.toBe(failure);
-    expect(svc.get('s1')).toBeUndefined();
+    const published = svc.get('s1');
 
-    const retried = await svc.resume('s1');
-    expect(svc.get('s1')).toBe(retried);
+    expect(published).toBeDefined();
+    await expect(svc.resume('s1')).resolves.toBe(published);
+    expect(attempts).toBe(1);
     hook.dispose();
   });
 
@@ -1868,6 +1901,32 @@ describe('SessionLifecycleService', () => {
           }),
       });
     }
+
+    it('keeps a fork target published when its creation hook fails', async () => {
+      const failure = new Error('fork creation hook failed');
+      let published: ISessionScopeHandle | undefined;
+      const svc = build([workspaceGetStub()]);
+      const hook = svc.hooks.onDidCreateSession.register(
+        'fail-fork-session',
+        async (event, next) => {
+          if (event.source === 'fork') {
+            published = event.handle;
+            throw failure;
+          }
+          await next();
+        },
+      );
+      await svc.create({ sessionId: 'src', workDir: '/tmp/proj' });
+
+      await expect(
+        svc.fork({ sourceSessionId: 'src', newSessionId: 'dst' }),
+      ).rejects.toBe(failure);
+
+      expect(published).toBeDefined();
+      expect(svc.get('dst')).toBe(published);
+      await expect(svc.resume('dst')).resolves.toBe(published);
+      hook.dispose();
+    });
 
     it('waits for a creating source to publish before forking it', async () => {
       const mcpStarted = deferred();
