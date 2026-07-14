@@ -51,7 +51,6 @@ export class WorkspaceQueryService implements IWorkspaceQueryService {
       const canonicalId = encodeWorkDirKey(root);
       const candidate: WorkspaceListItem = {
         ...workspace,
-        id: canonicalId,
         root,
         sessionCount: 0,
       };
@@ -71,7 +70,7 @@ export class WorkspaceQueryService implements IWorkspaceQueryService {
       if (existing === undefined) {
         byRoot.set(root, {
           workspace: {
-            id: encodeWorkDirKey(root),
+            id: session.workspaceId,
             root,
             name: basename(root),
             createdAt: finiteTimestamp(session.createdAt),
@@ -79,15 +78,20 @@ export class WorkspaceQueryService implements IWorkspaceQueryService {
             sessionCount: 1,
           },
           registered: false,
-          canonical: true,
+          canonical: session.workspaceId === encodeWorkDirKey(root),
         });
         continue;
       }
       const workspace = existing.workspace;
+      const canonicalId = encodeWorkDirKey(root);
+      const shouldPromote =
+        !existing.registered && !existing.canonical && session.workspaceId === canonicalId;
       byRoot.set(root, {
         ...existing,
+        canonical: existing.canonical || shouldPromote,
         workspace: {
           ...workspace,
+          ...(shouldPromote ? { id: canonicalId } : {}),
           createdAt: existing.registered
             ? workspace.createdAt
             : Math.min(workspace.createdAt, finiteTimestamp(session.createdAt)),
@@ -141,15 +145,31 @@ function resolveRegisteredWorkspace(
   workspaceId: string,
 ): Workspace | undefined {
   if (snapshot.deletedWorkspaceIds.has(workspaceId)) return undefined;
-  const workspace =
-    snapshot.workspaces.find((candidate) => candidate.id === workspaceId) ??
-    snapshot.workspaces.find(
-      (candidate) => encodeWorkDirKey(normalizeWorkDir(candidate.root)) === workspaceId,
-    );
+  const workspace = findRepresentativeWorkspace(snapshot.workspaces, workspaceId);
   if (workspace === undefined) return undefined;
   const root = normalizeWorkDir(workspace.root);
   if (normalizedDeletedRoots(snapshot).has(root)) return undefined;
-  return { ...workspace, id: encodeWorkDirKey(root), root };
+  return { ...workspace, root };
+}
+
+function findRepresentativeWorkspace(
+  workspaces: readonly Workspace[],
+  workspaceId: string,
+): Workspace | undefined {
+  const exact = workspaces.find((workspace) => workspace.id === workspaceId);
+  const candidates =
+    exact === undefined
+      ? workspaces.filter(
+          (workspace) => encodeWorkDirKey(normalizeWorkDir(workspace.root)) === workspaceId,
+        )
+      : workspaces.filter(
+          (workspace) =>
+            normalizeWorkDir(workspace.root) === normalizeWorkDir(exact.root),
+        );
+  if (candidates.length === 0) return undefined;
+  const root = normalizeWorkDir(candidates[0]!.root);
+  const canonicalId = encodeWorkDirKey(root);
+  return candidates.find((workspace) => workspace.id === canonicalId) ?? candidates[0];
 }
 
 function sessionsForWorkspace(
@@ -158,7 +178,7 @@ function sessionsForWorkspace(
   workspaceId: string,
 ): SessionSummary[] {
   const registered = resolveRegisteredWorkspace(snapshot, workspaceId);
-  const requestedRoot = registered?.root;
+  const requestedRoot = registered?.root ?? rootForWorkspaceId(sessions, snapshot, workspaceId);
   const deletedRoots = normalizedDeletedRoots(snapshot);
   if (snapshot.deletedWorkspaceIds.has(workspaceId)) return [];
   return sessions.filter((session) => {
@@ -169,6 +189,15 @@ function sessionsForWorkspace(
     if (requestedRoot !== undefined) return root === requestedRoot;
     return session.workspaceId === workspaceId || encodeWorkDirKey(root) === workspaceId;
   });
+}
+
+function rootForWorkspaceId(
+  sessions: readonly SessionSummary[],
+  snapshot: WorkspaceRegistrySnapshot,
+  workspaceId: string,
+): string | undefined {
+  const matching = sessions.find((session) => session.workspaceId === workspaceId);
+  return matching === undefined ? undefined : sessionRoot(matching, snapshot);
 }
 
 function sessionRoot(
@@ -196,13 +225,31 @@ function deriveWorkspace(
     .map((session) => sessionRoot(session, snapshot))
     .find((candidate): candidate is string => candidate !== undefined);
   if (root === undefined) return undefined;
+  const representativeId = representativeSessionWorkspaceId(sessions, snapshot, root);
   return {
-    id: encodeWorkDirKey(root),
+    id: representativeId,
     root,
     name: basename(root),
     createdAt: Math.min(...sessions.map((session) => finiteTimestamp(session.createdAt))),
     lastOpenedAt: Math.max(...sessions.map((session) => finiteTimestamp(session.updatedAt))),
   };
+}
+
+function representativeSessionWorkspaceId(
+  sessions: readonly SessionSummary[],
+  snapshot: WorkspaceRegistrySnapshot,
+  root: string,
+): string {
+  const canonicalId = encodeWorkDirKey(root);
+  if (
+    sessions.some(
+      (session) =>
+        session.workspaceId === canonicalId && sessionRoot(session, snapshot) === root,
+    )
+  ) {
+    return canonicalId;
+  }
+  return sessions.find((session) => sessionRoot(session, snapshot) === root)?.workspaceId ?? canonicalId;
 }
 
 function normalizedDeletedRoots(snapshot: WorkspaceRegistrySnapshot): ReadonlySet<string> {

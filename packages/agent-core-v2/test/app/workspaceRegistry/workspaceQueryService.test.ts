@@ -169,6 +169,48 @@ describe('WorkspaceQueryService', () => {
     ]);
   });
 
+  it('uses the canonical representative and aggregates duplicate-root sessions', async () => {
+    const { query, registry, index } = build();
+    const root = '/work/duplicate-query';
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_duplicate_legacy_deadbeef0000';
+    registry.workspaces = [
+      { id: alias, root, name: 'Duplicate', createdAt: 1, lastOpenedAt: 2 },
+      { id: canonicalId, root, name: 'Duplicate', createdAt: 1, lastOpenedAt: 3 },
+    ];
+    index.items = [
+      summary('canonical-session', canonicalId, 200, root),
+      summary('alias-session', alias, 100, root),
+    ];
+
+    await expect(query.list()).resolves.toEqual([
+      expect.objectContaining({ id: canonicalId, sessionCount: 2 }),
+    ]);
+    await expect(query.get(alias)).resolves.toMatchObject({ id: canonicalId, root });
+    await expect(query.listSessions(alias)).resolves.toHaveLength(2);
+    await expect(query.countActiveSessions(canonicalId)).resolves.toBe(2);
+  });
+
+  it('keeps an alias-only representative while aggregating its root sessions', async () => {
+    const { query, registry, index } = build();
+    const root = '/work/alias-only-query';
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_alias_query_deadbeef0000';
+    registry.workspaces = [
+      { id: alias, root, name: 'Alias only', createdAt: 1, lastOpenedAt: 2 },
+    ];
+    index.items = [
+      summary('alias-session', alias, 200, root),
+      summary('canonical-session', canonicalId, 100, root),
+    ];
+
+    await expect(query.list()).resolves.toEqual([
+      expect.objectContaining({ id: alias, sessionCount: 2 }),
+    ]);
+    await expect(query.get(canonicalId)).resolves.toMatchObject({ id: alias, root });
+    await expect(query.listSessions(canonicalId)).resolves.toHaveLength(2);
+  });
+
   it('derives an active workspace and excludes archived sessions from its count', async () => {
     const { query, index } = build();
     const workspaceId = encodeWorkDirKey('/work/derived');
@@ -200,7 +242,7 @@ describe('WorkspaceQueryService', () => {
 
     await expect(query.list()).resolves.toEqual([
       expect.objectContaining({
-        id: encodeWorkDirKey(root),
+        id: alias,
         root,
         sessionCount: 1,
       }),

@@ -267,6 +267,58 @@ describe('WorkspaceRegistryService (file-backed)', () => {
     expect(matches[0]?.id).toBe(canonicalId);
   });
 
+  it('preserves an alias-only representative across registry operations', async () => {
+    const root = join(homeDir, 'alias-only');
+    const canonicalId = encodeWorkDirKey(root);
+    const alias = 'wd_alias_only_deadbeef0000';
+    await fsp.mkdir(root, { recursive: true });
+    await writeWorkspacesJson({
+      [alias]: {
+        root,
+        name: 'alias-only',
+        created_at: '2026-01-01T00:00:00.000Z',
+        last_opened_at: '2026-01-01T00:00:00.000Z',
+      },
+    });
+
+    const registry = build();
+    await expect(registry.list()).resolves.toEqual([
+      expect.objectContaining({ id: alias, root }),
+    ]);
+    await expect(registry.get(canonicalId)).resolves.toMatchObject({ id: alias, root });
+    await expect(registry.createOrTouch(root)).resolves.toMatchObject({ id: alias, root });
+    await expect(registry.update(alias, { name: 'renamed' })).resolves.toMatchObject({
+      id: alias,
+      name: 'renamed',
+    });
+  });
+
+  it('rebuilds an alias-only workspace from the physical session bucket id', async () => {
+    const root = join(homeDir, 'rebuild-alias');
+    const alias = 'wd_rebuild_alias_deadbeef0000';
+    await seedSessionIndex([
+      {
+        sessionId: 'legacy-session',
+        sessionDir: join(homeDir, 'sessions', alias, 'legacy-session'),
+        workDir: root,
+      },
+    ]);
+
+    const registry = build();
+    await expect(registry.list()).resolves.toEqual([
+      expect.objectContaining({ id: alias, root }),
+    ]);
+    await expect(registry.get(alias)).resolves.toMatchObject({ id: alias, root });
+  });
+
+  it('creates the home directory before acquiring the first workspace lock', async () => {
+    const registry = build();
+    await fsp.rm(homeDir, { recursive: true, force: true });
+
+    await expect(registry.list()).resolves.toEqual([]);
+    expect((await fsp.stat(homeDir)).isDirectory()).toBe(true);
+  });
+
   it('keeps a derived workspace tombstoned after a registry restart', async () => {
     const root = join(homeDir, 'derived');
     const id = encodeWorkDirKey(root);

@@ -8,6 +8,8 @@
  * scope.
  */
 
+import { mkdir } from 'node:fs/promises';
+
 import { join } from 'pathe';
 import lockfile from 'proper-lockfile';
 
@@ -108,6 +110,7 @@ export class FileWorkspacePersistence implements IWorkspacePersistence {
   }
 
   async withWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+    await mkdir(this.bootstrap.homeDir, { recursive: true, mode: 0o700 });
     const release = await lockfile.lock(
       join(this.bootstrap.homeDir, WORKSPACE_REGISTRY_KEY),
       {

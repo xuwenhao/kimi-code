@@ -4,12 +4,13 @@
  * Owns explicitly registered workspaces and deletion tombstones. Reads a fresh
  * catalog for every operation; mutations hold the persistence write lock from
  * load through atomic save so v1, v2, and multiple daemon processes cannot
- * overwrite each other. Normalizes roots and collapses legacy aliases onto the
- * current canonical id. Session-derived workspaces are composed by
+ * overwrite each other. Normalizes roots and chooses one public representative
+ * per root (canonical when present, otherwise the persisted alias). Session-
+ * derived workspaces are composed by
  * `workspaceQuery`. Bound at App scope.
  */
 
-import { basename, isAbsolute } from 'pathe';
+import { basename, dirname, isAbsolute } from 'pathe';
 
 import { InstantiationType } from '#/_base/di/extensions';
 import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
@@ -76,15 +77,11 @@ export class WorkspaceRegistryService implements IWorkspaceRegistry {
   async get(id: string): Promise<Workspace | undefined> {
     const snapshot = await this.snapshot();
     if (snapshot.deletedWorkspaceIds.has(id)) return undefined;
-    const workspace =
-      snapshot.workspaces.find((candidate) => candidate.id === id) ??
-      snapshot.workspaces.find(
-        (candidate) => encodeWorkDirKey(normalizeWorkDir(candidate.root)) === id,
-      );
+    const workspace = findRepresentativeWorkspace(snapshot.workspaces, id);
     if (workspace === undefined) return undefined;
     const root = normalizeWorkDir(workspace.root);
     if (normalizedDeletedRoots(snapshot).has(root)) return undefined;
-    return { ...workspace, id, root };
+    return { ...workspace, root };
   }
 
   async createOrTouch(root: string, name?: string): Promise<Workspace> {
@@ -115,43 +112,50 @@ export class WorkspaceRegistryService implements IWorkspaceRegistry {
       const aliases = [...next.workspaces.values()].filter(
         (workspace) => normalizeWorkDir(workspace.root) === normalizedRoot,
       );
-      const existing = next.workspaces.get(id) ?? aliases[0];
+      const existing = aliases.find((workspace) => workspace.id === id) ?? aliases[0];
+      const representativeId = existing?.id ?? id;
       const now = Date.now();
       const workspace: Workspace = {
-        id,
+        id: representativeId,
         root: normalizedRoot,
         name: name ?? existing?.name ?? basename(normalizedRoot),
         createdAt: existing?.createdAt ?? now,
         lastOpenedAt: now,
       };
-      for (const alias of aliases) next.workspaces.delete(alias.id);
-      next.workspaces.set(id, workspace);
-      clearTombstones(next, id, normalizedRoot);
+      for (const alias of aliases) {
+        if (alias.id !== representativeId) next.workspaces.delete(alias.id);
+      }
+      next.workspaces.set(representativeId, workspace);
+      clearTombstones(next, representativeId, normalizedRoot);
       return { next, value: workspace };
     });
   }
 
   update(id: string, patch: WorkspaceUpdate): Promise<Workspace | undefined> {
     return this.mutate((catalog) => {
-      const existing =
-        catalog.workspaces.get(id) ??
-        [...catalog.workspaces.values()].find(
-          (workspace) => encodeWorkDirKey(normalizeWorkDir(workspace.root)) === id,
-        );
+      const existing = findRepresentativeWorkspace([...catalog.workspaces.values()], id);
       if (existing === undefined) return { next: catalog, value: undefined };
       const next = cloneCatalog(catalog);
       const root = normalizeWorkDir(existing.root);
-      const canonicalId = encodeWorkDirKey(root);
+      const aliases = [...next.workspaces.values()].filter(
+        (workspace) => normalizeWorkDir(workspace.root) === root,
+      );
+      const representativeId =
+        aliases.find((workspace) => workspace.id === encodeWorkDirKey(root))?.id ??
+        aliases[0]?.id ??
+        existing.id;
       for (const [aliasId, workspace] of next.workspaces) {
-        if (normalizeWorkDir(workspace.root) === root) next.workspaces.delete(aliasId);
+        if (normalizeWorkDir(workspace.root) === root && aliasId !== representativeId) {
+          next.workspaces.delete(aliasId);
+        }
       }
       const updated: Workspace = {
-        ...existing,
-        id: canonicalId,
+        ...(next.workspaces.get(representativeId) ?? existing),
+        id: representativeId,
         root,
         name: patch.name ?? existing.name,
       };
-      next.workspaces.set(canonicalId, updated);
+      next.workspaces.set(representativeId, updated);
       return { next, value: updated };
     });
   }
@@ -214,8 +218,12 @@ export class WorkspaceRegistryService implements IWorkspaceRegistry {
       const entry = parseSessionIndexLine(line.trim());
       if (entry === undefined || !isAbsolute(entry.workDir)) continue;
       const root = normalizeWorkDir(entry.workDir);
-      const id = encodeWorkDirKey(root);
-      if (result.has(id)) continue;
+      // The session index records the physical bucket in `sessionDir`. Keep
+      // that id when rebuilding so legacy alias-only buckets remain queryable;
+      // `list()`/`get()` will choose the canonical id only when it is actually
+      // present in the catalog.
+      const id = basename(dirname(entry.sessionDir));
+      if (id === '' || result.has(id)) continue;
       result.set(id, {
         id,
         root,
@@ -292,12 +300,32 @@ function toPersistedCatalog(catalog: WorkspaceCatalogState): WorkspaceCatalog {
   };
 }
 
+function findRepresentativeWorkspace(
+  workspaces: readonly Workspace[],
+  workspaceId: string,
+): Workspace | undefined {
+  const exact = workspaces.find((workspace) => workspace.id === workspaceId);
+  const candidates =
+    exact === undefined
+      ? workspaces.filter(
+          (workspace) => encodeWorkDirKey(normalizeWorkDir(workspace.root)) === workspaceId,
+        )
+      : workspaces.filter(
+          (workspace) =>
+            normalizeWorkDir(workspace.root) === normalizeWorkDir(exact.root),
+        );
+  if (candidates.length === 0) return undefined;
+  const root = normalizeWorkDir(candidates[0]!.root);
+  const canonicalId = encodeWorkDirKey(root);
+  return candidates.find((workspace) => workspace.id === canonicalId) ?? candidates[0];
+}
+
 function dedupeByRoot(workspaces: readonly Workspace[]): Workspace[] {
   const byRoot = new Map<string, { workspace: Workspace; canonical: boolean }>();
   for (const workspace of workspaces) {
     const root = normalizeWorkDir(workspace.root);
     const canonicalId = encodeWorkDirKey(root);
-    const candidate = { ...workspace, id: canonicalId, root };
+    const candidate = { ...workspace, root };
     const existing = byRoot.get(root);
     const canonical = workspace.id === canonicalId;
     if (existing === undefined || (!existing.canonical && canonical)) {

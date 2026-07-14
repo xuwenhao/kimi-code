@@ -353,9 +353,8 @@ describe('WorkspaceRegistryService', () => {
     );
     // One active session in the canonical bucket (via the index)...
     await seedSessionBucket(root, 'sess-canonical-1');
-    // ...and one stranded in the legacy bucket. It is NOT counted: the returned
-    // workspace can only page the canonical bucket via GET /sessions, so the
-    // count stays consistent with what the list can retrieve.
+    // ...and one stranded in the legacy bucket. Root-based session queries
+    // include both buckets, so the workspace count does too.
     const legacySessionDir = join(ctx.homeDir, 'sessions', legacyId, 'sess-legacy-1');
     await mkdir(legacySessionDir, { recursive: true });
     await writeFile(
@@ -373,11 +372,11 @@ describe('WorkspaceRegistryService', () => {
     const matches = list.filter((w) => w.root === root);
     expect(matches).toHaveLength(1);
     expect(matches[0]?.id).toBe(canonicalId);
-    // Count is scoped to the representative's (canonical) bucket only.
-    expect(matches[0]?.session_count).toBe(1);
+    expect(matches[0]?.session_count).toBe(2);
 
-    expect((await ctx.registry.get(canonicalId)).session_count).toBe(1);
-    expect((await ctx.registry.createOrTouch(root)).session_count).toBe(1);
-    expect((await ctx.registry.update(canonicalId, { name: 'renamed' })).session_count).toBe(1);
+    expect((await ctx.registry.get(canonicalId)).session_count).toBe(2);
+    expect((await ctx.registry.get(legacyId)).id).toBe(canonicalId);
+    expect((await ctx.registry.createOrTouch(root)).session_count).toBe(2);
+    expect((await ctx.registry.update(canonicalId, { name: 'renamed' })).session_count).toBe(2);
   });
 });
