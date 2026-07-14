@@ -46,7 +46,7 @@ export class FetchURLTool implements BuiltinTool<FetchURLInput> {
     return {
       accesses: ToolAccesses.none(),
       description: `Fetching: ${preview}`,
-      display: { kind: 'url_fetch', url: args.url },
+      toolData: { kind: 'url_fetch', url: args.url },
       approvalRule: literalRulePattern(this.name, args.url),
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.url),
       execute: (ctx) => this.execution(args, ctx),

@@ -788,6 +788,7 @@ function applyEvent(event: ReturnType<typeof toAppEvent>, sessionId: string, seq
     messagesBySession: rawState.messagesBySession,
     approvalsBySession: rawState.approvalsBySession,
     planReviewByToolCallId: rawState.planReviewByToolCallId,
+    approvalResultsByToolCallId: rawState.approvalResultsByToolCallId,
     questionsBySession: rawState.questionsBySession,
     tasksBySession: rawState.tasksBySession,
     goalBySession: rawState.goalBySession,
@@ -804,6 +805,7 @@ function applyEvent(event: ReturnType<typeof toAppEvent>, sessionId: string, seq
   setMessagesBySession(next.messagesBySession);
   rawState.approvalsBySession = next.approvalsBySession;
   rawState.planReviewByToolCallId = next.planReviewByToolCallId;
+  rawState.approvalResultsByToolCallId = next.approvalResultsByToolCallId;
   rawState.questionsBySession = next.questionsBySession;
   rawState.tasksBySession = next.tasksBySession;
   rawState.goalBySession = next.goalBySession;
@@ -1334,6 +1336,13 @@ async function syncSessionFromSnapshot(sessionId: string): Promise<SyncSessionRe
       ...rawState.approvalsBySession,
       [sessionId]: snap.pendingApprovals,
     };
+    // Hydrate the approval-results map from the snapshot's side map (merge —
+    // toolCallIds are unique, and a page-scoped snapshot must not drop records
+    // learned from older pages or live approval.resolved broadcasts).
+    rawState.approvalResultsByToolCallId = {
+      ...rawState.approvalResultsByToolCallId,
+      ...snap.approvalResults,
+    };
     // Preserve plan_review paths from the snapshot so the ExitPlanMode tool
     // card can link to the plan file even after a reload.
     for (const a of snap.pendingApprovals) {
@@ -1860,6 +1869,7 @@ const turns = computed<ChatTurn[]>(() => {
     (fileId) => getKimiWebApi().getFileUrl(fileId),
     activity.value !== 'idle',
     rawState.planReviewByToolCallId,
+    rawState.approvalResultsByToolCallId,
   );
 });
 

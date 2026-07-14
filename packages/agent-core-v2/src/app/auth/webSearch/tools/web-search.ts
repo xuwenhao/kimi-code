@@ -67,7 +67,7 @@ export class WebSearchTool implements BuiltinTool<WebSearchInput> {
     return {
       accesses: ToolAccesses.none(),
       description: `Searching: ${preview}`,
-      display: { kind: 'search', query: args.query },
+      toolData: { kind: 'search', query: args.query },
       approvalRule: literalRulePattern(this.name, args.query),
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.query),
       execute: (ctx) => this.execution(args, ctx),

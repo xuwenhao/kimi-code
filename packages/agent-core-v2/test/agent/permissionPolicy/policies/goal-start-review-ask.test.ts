@@ -24,7 +24,7 @@ function fakeModeService(initialMode: PermissionMode) {
 
 function policyContext(
   toolName: string,
-  display: ToolInputDisplay | undefined,
+  toolData: ToolInputDisplay | undefined,
 ): ResolvedToolExecutionHookContext {
   return {
     turnId: '0',
@@ -41,7 +41,7 @@ function policyContext(
     execution: {
       accesses: ToolAccesses.none(),
       approvalRule: toolName,
-      display,
+      toolData,
       execute: async () => ({ output: '' }),
     },
   } as unknown as ResolvedToolExecutionHookContext;

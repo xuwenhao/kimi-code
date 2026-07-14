@@ -45,6 +45,26 @@ describe('listMessagesResponseSchema', () => {
     });
   });
 
+  it('parses a page with an approval_results side map', () => {
+    const parsed = listMessagesResponseSchema.parse({
+      items: [],
+      has_more: false,
+      approval_results: {
+        call_8f3a: {
+          decision: 'rejected',
+          source: 'user',
+          feedback: 'Add verification steps.',
+          selected_label: 'Revise',
+        },
+      },
+    });
+    expect(parsed.approval_results?.['call_8f3a']).toMatchObject({
+      decision: 'rejected',
+      source: 'user',
+      selected_label: 'Revise',
+    });
+  });
+
   it('parses a page with one message', () => {
     const parsed = listMessagesResponseSchema.parse({
       items: [

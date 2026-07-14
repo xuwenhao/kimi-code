@@ -5,6 +5,7 @@ import {
   approvalScopeSchema,
   approvalRequestSchema,
   approvalResponseSchema,
+  approvalResultSchema,
 } from '../approval';
 import {
   approvalResolveRequestSchema,
@@ -41,7 +42,7 @@ describe('approvalRequestSchema (SCHEMAS §6.1)', () => {
     tool_call_id: 'tc_1',
     tool_name: 'shell.run',
     action: 'Run `rm -rf foo/`',
-    tool_input_display: { kind: 'command', command: 'rm -rf foo/', summary: 'rm' },
+    approval_data: { kind: 'command', command: 'rm -rf foo/', summary: 'rm' },
     created_at: '2026-06-04T10:30:00Z',
     expires_at: '2026-06-04T10:31:00Z',
   };
@@ -52,10 +53,20 @@ describe('approvalRequestSchema (SCHEMAS §6.1)', () => {
     expect(parsed.tool_call_id).toBe('tc_1');
   });
 
-  it('accepts arbitrary tool_input_display shapes (12-arm passthrough)', () => {
-    const exotic = { ...base, tool_input_display: { kind: 'future_unknown_kind', summary: 'hi' } };
+  it('accepts arbitrary approval_data shapes (12-arm passthrough)', () => {
+    const exotic = { ...base, approval_data: { kind: 'future_unknown_kind', summary: 'hi' } };
     const parsed = approvalRequestSchema.parse(exotic);
-    expect((parsed.tool_input_display as { kind: string }).kind).toBe('future_unknown_kind');
+    expect((parsed.approval_data as { kind: string }).kind).toBe('future_unknown_kind');
+  });
+
+  it('still accepts the legacy tool_input_display field', () => {
+    const { approval_data: _, ...rest } = base;
+    void _;
+    const parsed = approvalRequestSchema.parse({
+      ...rest,
+      tool_input_display: { kind: 'command', command: 'ls' },
+    });
+    expect((parsed.tool_input_display as { kind: string }).kind).toBe('command');
   });
 
   it('accepts optional turn_id', () => {
@@ -145,7 +156,7 @@ describe('listPendingApprovalsResponseSchema (REST pending recovery)', () => {
     tool_call_id: 'tc_1',
     tool_name: 'shell.run',
     action: 'Run `ls`',
-    tool_input_display: { kind: 'command', command: 'ls', summary: 'ls' },
+    approval_data: { kind: 'command', command: 'ls', summary: 'ls' },
     created_at: '2026-06-04T10:30:00Z',
     expires_at: '2026-06-04T10:31:00Z',
   };
@@ -167,10 +178,43 @@ describe('listPendingApprovalsResponseSchema (REST pending recovery)', () => {
       items: [pendingApproval],
     });
     expect(parsed.items[0]?.approval_id).toBe('01J0000000APPROVAL');
-    expect(parsed.items[0]?.tool_input_display).toEqual({
+    expect(parsed.items[0]?.approval_data).toEqual({
       kind: 'command',
       command: 'ls',
       summary: 'ls',
     });
+  });
+});
+
+describe('approvalResultSchema (approval_results side map)', () => {
+  it('accepts a user rejection with feedback', () => {
+    const parsed = approvalResultSchema.parse({
+      decision: 'rejected',
+      source: 'user',
+      feedback: 'Add verification steps.',
+      selected_label: 'Revise',
+    });
+    expect(parsed.decision).toBe('rejected');
+    expect(parsed.source).toBe('user');
+    expect(parsed.selected_label).toBe('Revise');
+  });
+
+  it('accepts a policy denial', () => {
+    expect(approvalResultSchema.parse({ decision: 'denied', source: 'policy' })).toEqual({
+      decision: 'denied',
+      source: 'policy',
+    });
+  });
+
+  it('rejects an unknown source', () => {
+    expect(() =>
+      approvalResultSchema.parse({ decision: 'approved', source: 'robot' }),
+    ).toThrow();
+  });
+
+  it('rejects a denied decision from a user source shape violation', () => {
+    expect(() =>
+      approvalResultSchema.parse({ decision: 'denied', source: 'maybe' }),
+    ).toThrow();
   });
 });

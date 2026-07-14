@@ -600,7 +600,7 @@ describe('SessionEventBroadcaster', () => {
         toolCallId: 'call_9',
         toolName: 'Bash',
         action: 'run',
-        display: { kind: 'command', command: 'ls' },
+        approvalData: { kind: 'command', command: 'ls' },
       },
       origin: { turnId: 3 },
     });
@@ -618,7 +618,7 @@ describe('SessionEventBroadcaster', () => {
         tool_call_id: 'call_9',
         tool_name: 'Bash',
         action: 'run',
-        tool_input_display: { kind: 'command', command: 'ls' },
+        approval_data: { kind: 'command', command: 'ls' },
       },
     });
     expect(envelopes[1]).toMatchObject({
@@ -636,7 +636,9 @@ describe('SessionEventBroadcaster', () => {
       session_id: 's1',
       payload: {
         approval_id: 'a1',
+        tool_call_id: 'call_9',
         decision: 'approved',
+        source: 'user',
         scope: 'session',
       },
     });
@@ -645,6 +647,51 @@ describe('SessionEventBroadcaster', () => {
       type: 'event.session.status_changed',
       payload: { status: 'idle', previous_status: 'awaiting_approval' },
     });
+  });
+
+  it('maps permission.approval.resolved domain events (policy/auto) onto event.approval.resolved', async () => {
+    const lc = new FakeLifecycle();
+    const main = lc.addAgent('main');
+    sessions.set('s1', lc);
+    const { target, envelopes } = collectingTarget();
+    await bc.subscribe('s1', target);
+
+    const resolvedDomain = (extra: Record<string, unknown>): AgentEvent =>
+      agentEvent('permission.approval.resolved', {
+        agentId: 'main',
+        sessionId: 's1',
+        turnId: 1,
+        toolName: 'Bash',
+        action: 'run',
+        ...extra,
+      });
+
+    // Policy denial and auto approval never create a pending interaction, so
+    // they only reach clients via this domain-event mapping.
+    main.bus.emit(resolvedDomain({ toolCallId: 'call_deny', decision: 'denied', source: 'policy' }));
+    main.bus.emit(resolvedDomain({ toolCallId: 'call_auto', decision: 'approved', source: 'auto' }));
+    // User decisions are broadcast by the interaction kernel instead (and a
+    // transport 'error' made no decision) — neither is re-emitted here.
+    main.bus.emit(resolvedDomain({ toolCallId: 'call_user', decision: 'approved', source: 'user' }));
+    main.bus.emit(resolvedDomain({ toolCallId: 'call_err', decision: 'error', error: 'boom' }));
+    await bc.getCursor('s1'); // drain
+
+    const resolved = envelopes.filter((e) => e.type === 'event.approval.resolved');
+    expect(resolved).toHaveLength(2);
+    expect(resolved[0]!.payload).toMatchObject({
+      approval_id: 'call_deny',
+      tool_call_id: 'call_deny',
+      decision: 'denied',
+      source: 'policy',
+    });
+    expect(resolved[1]!.payload).toMatchObject({
+      approval_id: 'call_auto',
+      tool_call_id: 'call_auto',
+      decision: 'approved',
+      source: 'auto',
+    });
+    // The raw v2 domain event type never leaks onto the v1 wire.
+    expect(envelopes.some((e) => e.type === 'permission.approval.resolved')).toBe(false);
   });
 
   it('keeps parallel interaction priority, dedupes status, and globally fans status out', async () => {

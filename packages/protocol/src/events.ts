@@ -1,7 +1,15 @@
 import { z } from 'zod';
 
-import { ToolInputDisplaySchema, type ToolInputDisplay } from './display';
-import { messageContentSchema, type MessageContent } from './message';
+import {
+  ToolInputDisplaySchema,
+  type ToolInputDisplay,
+} from './display';
+import {
+  messageContentSchema,
+  toolOutcomeSchema,
+  type MessageContent,
+  type ToolOutcome,
+} from './message';
 import { sessionSchema, sessionStatusSchema, type Session, type SessionStatus } from './session';
 import { isoDateTimeSchema } from './time';
 import { configResponseSchema, type ConfigResponse } from './rest/config';
@@ -682,7 +690,9 @@ export interface ToolCallStartedEvent {
   readonly name: string;
   readonly args: unknown;
   readonly description?: string;
+  /** @deprecated Use `toolData`. Kept for legacy (v1 engine / TUI) emitters and consumers. */
   readonly display?: ToolInputDisplay;
+  readonly toolData?: ToolInputDisplay;
 }
 
 export interface ToolProgressEvent {
@@ -721,6 +731,9 @@ export interface ToolResultEvent {
   readonly output: unknown;
   readonly isError?: boolean;
   readonly synthetic?: boolean;
+  // Execution outcome — the only structured result-side field (orthogonal to
+  // `isError`; see `toolOutcomeSchema` for the semantics).
+  readonly outcome?: ToolOutcome;
 }
 
 export interface SubagentSpawnedEvent {
@@ -1533,6 +1546,7 @@ export const toolCallStartedEventSchema = z.object({
   args: z.unknown(),
   description: z.string().optional(),
   display: ToolInputDisplaySchema.optional(),
+  toolData: ToolInputDisplaySchema.optional(),
 }) satisfies z.ZodType<ToolCallStartedEvent>;
 
 export const toolProgressEventSchema = z.object({
@@ -1561,6 +1575,7 @@ export const toolResultEventSchema = z.object({
   output: z.unknown(),
   isError: z.boolean().optional(),
   synthetic: z.boolean().optional(),
+  outcome: toolOutcomeSchema.optional(),
 }) satisfies z.ZodType<ToolResultEvent>;
 
 export const subagentSpawnedEventSchema = z.object({

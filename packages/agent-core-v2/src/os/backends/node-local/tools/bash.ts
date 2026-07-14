@@ -218,7 +218,7 @@ export class BashTool implements BuiltinTool<BashInput> {
       description: args.run_in_background
         ? `Starting background: ${preview}`
         : `Running: ${preview}`,
-      display: {
+      toolData: {
         kind: 'command',
         command: args.command,
         cwd: args.cwd ?? this.ctx.cwd,

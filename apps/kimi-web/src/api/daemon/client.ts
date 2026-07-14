@@ -6,7 +6,6 @@ import { buildRestUrl, buildWsUrl } from '../config';
 import type {
   AppConfig,
   AppGoal,
-  AppMessage,
   AppMessageRole,
   AppModel,
   AppProvider,
@@ -27,6 +26,7 @@ import type {
   KimiEventConnection,
   KimiEventHandlers,
   KimiWebApi,
+  MessagesPage,
   OAuthLoginStartResult,
   Page,
   PageRequest,
@@ -38,6 +38,7 @@ import { createAgentProjector } from './agentEventProjector';
 import { DaemonHttpClient } from './http';
 import {
   toAppApprovalRequest,
+  toAppApprovalResults,
   toAppConfig,
   toAppEvent,
   toAppFsEntry,
@@ -66,7 +67,7 @@ import type {
   WireFsEntry,
   WireFsHomeResult,
   WireGoalSnapshot,
-  WireMessage,
+  WireMessagesPage,
   WireModel,
   WireOAuthCancelResult,
   WireOAuthLoginPollResult,
@@ -459,20 +460,23 @@ export class DaemonKimiWebApi implements KimiWebApi {
   async listMessages(
     sessionId: string,
     input?: PageRequest & { role?: AppMessageRole },
-  ): Promise<Page<AppMessage>> {
+  ): Promise<MessagesPage> {
     const query: Record<string, string | number | boolean | undefined> = {
       before_id: input?.beforeId,
       after_id: input?.afterId,
       page_size: input?.pageSize,
       role: input?.role,
     };
-    const data = await this.http.get<WirePage<WireMessage>>(
+    const data = await this.http.get<WireMessagesPage>(
       `/sessions/${encodeURIComponent(sessionId)}/messages`,
       query,
     );
     return {
       items: data.items.map(toAppMessage),
       hasMore: data.has_more,
+      approvalResults: data.approval_results
+        ? toAppApprovalResults(data.approval_results)
+        : undefined,
     };
   }
 
@@ -490,6 +494,7 @@ export class DaemonKimiWebApi implements KimiWebApi {
       session: toAppSession(data.session),
       // Snapshot messages are already chronological ascending.
       messages: data.messages.items.map(toAppMessage),
+      approvalResults: toAppApprovalResults(data.approval_results),
       hasMoreMessages: data.messages.has_more,
       inFlightTurn:
         data.in_flight_turn === null
@@ -503,6 +508,7 @@ export class DaemonKimiWebApi implements KimiWebApi {
                 name: t.name,
                 args: t.args,
                 description: t.description,
+                toolData: t.toolData,
                 lastProgress: t.last_progress,
               })),
               promptId: data.in_flight_turn.current_prompt_id,

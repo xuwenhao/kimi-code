@@ -49,6 +49,43 @@ describe('messageContentSchema variants', () => {
     expect(parsed.is_error).toBe(true);
   });
 
+  it('parses tool_result content with an outcome', () => {
+    const parsed = toolResultContentSchema.parse({
+      type: 'tool_result',
+      tool_call_id: 'call_1',
+      output: 'Plan rejected by user. Plan mode remains active.',
+      is_error: true,
+      outcome: 'not_run',
+    });
+    expect(parsed.outcome).toBe('not_run');
+  });
+
+  it('rejects a tool_result with an unknown outcome', () => {
+    expect(() =>
+      toolResultContentSchema.parse({
+        type: 'tool_result',
+        tool_call_id: 'call_1',
+        output: '',
+        outcome: 'maybe',
+      }),
+    ).toThrow();
+  });
+
+  it('parses tool_use content with tool_data', () => {
+    const parsed = toolUseContentSchema.parse({
+      type: 'tool_use',
+      tool_call_id: 'call_1',
+      tool_name: 'ExitPlanMode',
+      input: {},
+      tool_data: { kind: 'plan_review', plan: '# Draft Plan', path: '/tmp/plan.md' },
+    });
+    expect(parsed.tool_data).toMatchObject({
+      kind: 'plan_review',
+      plan: '# Draft Plan',
+      path: '/tmp/plan.md',
+    });
+  });
+
   it('parses image url source', () => {
     const parsed = imageContentSchema.parse({
       type: 'image',

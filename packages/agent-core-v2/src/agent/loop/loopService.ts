@@ -40,6 +40,7 @@ import type {
   AssistantDeltaEvent,
   ThinkingDeltaEvent,
   ToolCallDeltaEvent,
+  ToolInputDisplay,
   TurnEndedEvent,
   TurnStartedEvent,
   TurnStepCompletedEvent,
@@ -757,7 +758,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     for await (const toolResult of this.toolExecutor.execute(response.message.toolCalls, {
       signal,
       turnId,
-      onToolCall: ({ toolCallId, name, args }) => {
+      onToolCall: ({ toolCallId, name, args, toolData }) => {
         const callUuid = randomUUID();
         toolCallUuids.set(toolCallId, callUuid);
         this.context.appendLoopEvent({
@@ -769,6 +770,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
           toolCallId,
           name,
           args,
+          toolData: shouldPersistToolData(toolData) ? toolData : undefined,
         });
       },
     })) {
@@ -777,7 +779,12 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         type: 'tool.result',
         parentUuid: toolCallUuids.get(toolResult.toolCallId) ?? randomUUID(),
         toolCallId: toolResult.toolCallId,
-        result: { output: result.output, isError: result.isError, note: result.note },
+        result: {
+          output: result.output,
+          isError: result.isError,
+          note: result.note,
+          outcome: result.resultOutcome,
+        },
       });
       if (result.stopTurn === true) stopTurn = true;
     }
@@ -950,6 +957,23 @@ function normalizeFinishReason(reason: FinishReason): string {
   if (reason === 'completed') return 'end_turn';
   if (reason === 'truncated') return 'max_tokens';
   return reason;
+}
+
+/**
+ * Whitelist gate for persisting input-side tool data with the `tool.call`
+ * wire record. Only these kinds carry information the persisted `args`
+ * cannot rebuild (the plan body for `plan_review`, the permission mode for
+ * `goal_start`, the system-assigned task id for `task`); every other kind is
+ * re-derivable and stays live-only on the `tool.call.started` event.
+ */
+function shouldPersistToolData(
+  toolData: ToolInputDisplay | undefined,
+): toolData is ToolInputDisplay {
+  return (
+    toolData?.kind === 'plan_review' ||
+    toolData?.kind === 'goal_start' ||
+    toolData?.kind === 'task'
+  );
 }
 
 type MutableTurn = {

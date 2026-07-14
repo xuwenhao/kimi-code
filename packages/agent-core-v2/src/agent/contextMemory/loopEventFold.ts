@@ -7,8 +7,12 @@
  * and never write a folded assistant message: the v1 loop
  * (`packages/agent-core`) always has, and since the v1.4 wire-parity alignment
  * the v2 live loop emits the same records (`LoopService` →
- * `ContextMemory.appendLoopEvent`), keeping the on-disk shape byte-compatible.
- * This fold turns them into assistant / tool messages — at live dispatch time
+ * `ContextMemory.appendLoopEvent`). Two v2 extensions ride on top of the
+ * v1-compatible record shape: `tool.call` records may carry a persisted
+ * `toolData` for whitelisted input-display kinds (`shouldPersistToolData` in
+ * `loopService`), and `tool.result` records carry the structured `outcome`
+ * (v1 records carry neither; both default to absent on replay). This fold
+ * turns them into assistant / tool messages — at live dispatch time
  * and again when `WireService.replay` restores a session. Without it, replay
  * would skip those records (no Op is registered for the type) and the restored
  * `ContextModel` — and every consumer built on it (`/messages`, `/snapshot`,
@@ -45,6 +49,7 @@
 import type { FinishReason } from '#/app/llmProtocol/finishReason';
 import { createToolMessage, type ContentPart, type ToolCall } from '#/app/llmProtocol/message';
 import type { TokenUsage } from '#/app/llmProtocol/usage';
+import type { ToolInputDisplay, ToolOutcome } from '@moonshot-ai/protocol';
 
 import type { ContextMessage } from './types';
 
@@ -90,6 +95,10 @@ export type LoopRecordedEvent =
       readonly name: string;
       readonly args?: unknown;
       readonly extras?: Record<string, unknown>;
+      /** Persisted input-side tool data — present only for whitelisted kinds
+       *  (`plan_review` / `goal_start` / `task`); folded onto the assistant
+       *  `ToolCall.toolData`. */
+      readonly toolData?: ToolInputDisplay;
       readonly uuid?: string;
       readonly turnId?: string;
       readonly step?: number;
@@ -101,6 +110,7 @@ export type LoopRecordedEvent =
         readonly output: string | readonly ContentPart[];
         readonly isError?: boolean;
         readonly note?: string;
+        readonly outcome?: ToolOutcome;
       };
       readonly parentUuid?: string;
     };
@@ -168,6 +178,7 @@ export function foldLoopEvent(
         name: event.name,
         arguments: event.args === undefined ? null : JSON.stringify(event.args),
         ...(event.extras !== undefined ? { extras: event.extras } : {}),
+        ...(event.toolData !== undefined ? { toolData: event.toolData } : {}),
       };
       ctx.pending.add(event.toolCallId);
       return bind(appendToOpenAssistant(state, (message) => ({
@@ -182,6 +193,7 @@ export function foldLoopEvent(
         ...createToolMessage(event.toolCallId, typeof output === 'string' ? output : [...output]),
         isError: event.result.isError,
         note: event.result.note,
+        outcome: event.result.outcome,
       };
       ctx.pending.delete(event.toolCallId);
       return bind(flushDeferred([...state, toolMessage], ctx), ctx);
@@ -251,5 +263,6 @@ function interruptedToolMessage(toolCallId: string): ContextMessage {
   return {
     ...createToolMessage(toolCallId, TOOL_INTERRUPTED_ON_RESUME_OUTPUT),
     isError: true,
+    outcome: 'interrupted',
   };
 }

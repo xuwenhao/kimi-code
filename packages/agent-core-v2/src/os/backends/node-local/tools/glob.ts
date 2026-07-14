@@ -179,7 +179,7 @@ export class GlobTool implements BuiltinTool<GlobInput> {
     return {
       accesses: ToolAccesses.searchTree(searchRoots[0]!),
       description: `Searching ${args.pattern}`,
-      display: {
+      toolData: {
         kind: 'file_io',
         operation: 'glob',
         path: searchRoots[0]!,

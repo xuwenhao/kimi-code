@@ -46,7 +46,7 @@ import { stubToolExecutor } from '../loop/stubs';
 function makeContext(
   toolName: string,
   args: Record<string, unknown> = {},
-  display?: ToolInputDisplay,
+  toolData?: ToolInputDisplay,
 ): ResolvedToolExecutionHookContext {
   const toolCall: ToolCall = {
     type: 'function',
@@ -63,7 +63,7 @@ function makeContext(
     execution: {
       description: `Approve ${toolName}`,
       approvalRule: toolName,
-      display,
+      toolData,
       execute: () => Promise.resolve({ output: '' }),
     },
   };
@@ -420,7 +420,7 @@ describe('AgentPermissionGate', () => {
       toolName: 'Bash',
       action: 'Approve Bash',
       toolInput: { command: 'printf first' },
-      display: {
+      approvalData: {
         kind: 'generic',
         summary: 'Approve Bash',
         detail: { command: 'printf first' },
@@ -435,14 +435,95 @@ describe('AgentPermissionGate', () => {
       toolName: 'Bash',
       action: 'Approve Bash',
       toolInput: { command: 'printf first' },
-      display: {
+      approvalData: {
         kind: 'generic',
         summary: 'Approve Bash',
         detail: { command: 'printf first' },
       },
       decision: 'approved',
       selectedLabel: 'Approve once',
+      source: 'user',
     });
+  });
+
+  it('records a policy denial with source policy and publishes the resolved event', async () => {
+    policyResult = { policyName: 'user-configured-deny', result: { kind: 'deny', message: 'nope' } };
+    const recorded: PermissionApprovalResultRecord[] = [];
+    ix.set(IAgentPermissionRulesService, mutablePermissionRulesService({
+      rules: () => [],
+      sessionApprovalRulePatterns: () => [],
+      record: (record) => recorded.push(record),
+    }));
+    const permissionResult = vi.fn();
+    const svc = make();
+    disposables.add(
+      ix.get(IEventBus).subscribe('permission.approval.resolved', permissionResult),
+    );
+
+    await expect(svc.authorize(makeContext('Bash'))).resolves.toEqual({
+      block: true,
+      reason: 'nope',
+    });
+
+    expect(recorded).toEqual([
+      {
+        turnId: 1,
+        toolCallId: 'call-Bash',
+        toolName: 'Bash',
+        action: 'Approve Bash',
+        source: 'policy',
+        result: { decision: 'denied' },
+      },
+    ]);
+    expect(permissionResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'permission.approval.resolved',
+        toolCallId: 'call-Bash',
+        toolName: 'Bash',
+        decision: 'denied',
+        source: 'policy',
+      }),
+    );
+  });
+
+  it('records an auto-mode approval with source auto and publishes the resolved event', async () => {
+    mode = 'auto';
+    const recorded: PermissionApprovalResultRecord[] = [];
+    ix.set(IAgentPermissionRulesService, mutablePermissionRulesService({
+      rules: () => [],
+      sessionApprovalRulePatterns: () => [],
+      record: (record) => recorded.push(record),
+    }));
+    useRealPolicyService();
+    const request = setApprovalRequest(async () => ({ decision: 'approved' }));
+    const permissionResult = vi.fn();
+    const svc = make();
+    disposables.add(
+      ix.get(IEventBus).subscribe('permission.approval.resolved', permissionResult),
+    );
+
+    await expect(svc.authorize(makeContext('Bash', { command: 'pwd' }))).resolves.toBeUndefined();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(recorded).toEqual([
+      {
+        turnId: 1,
+        toolCallId: 'call-Bash',
+        toolName: 'Bash',
+        action: 'Approve Bash',
+        source: 'auto',
+        result: { decision: 'approved' },
+      },
+    ]);
+    expect(permissionResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'permission.approval.resolved',
+        toolCallId: 'call-Bash',
+        toolName: 'Bash',
+        decision: 'approved',
+        source: 'auto',
+      }),
+    );
   });
 
   it('tracks cancelled approval requests', async () => {

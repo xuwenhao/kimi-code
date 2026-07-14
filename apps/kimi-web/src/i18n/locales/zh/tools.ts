@@ -53,6 +53,17 @@ export default {
     error: '有失败',
     done: '已完成',
   },
+  status: {
+    rejected: '已拒绝',
+    revise: '已退回修改',
+    cancelled: '已取消',
+    denied: '策略拒绝',
+    notRun: '未执行',
+    invalid: '调用无效',
+    skipped: '已跳过',
+    interrupted: '已中断',
+    failed: '执行失败',
+  },
   ask: {
     dismissed: '已忽略',
     answer: '{count} 个回答',

@@ -124,7 +124,7 @@ describe('EditTool', () => {
     if (execution.isError === true) {
       throw new TypeError('expected runnable execution');
     }
-    expect(execution.display).toEqual({
+    expect(execution.toolData).toEqual({
       kind: 'file_io',
       operation: 'edit',
       path: '/tmp/foo.ts',

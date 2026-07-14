@@ -234,6 +234,57 @@ describe('MessageLegacyService', () => {
     });
   });
 
+  it('collects approval_results from permission.record_approval_result records, keyed by toolCallId', async () => {
+    const svc = buildService({
+      summary,
+      records: [
+        { type: 'context.append_message', message: textMessage('user', 'hi') },
+        {
+          type: 'permission.record_approval_result',
+          turnId: 1,
+          toolCallId: 'call_user',
+          toolName: 'Bash',
+          action: 'run command',
+          source: 'user',
+          // Persisted response is camelCase (selectedLabel); REST is snake_case.
+          result: { decision: 'rejected', feedback: 'Add verification steps.', selectedLabel: 'Revise' },
+        },
+        {
+          type: 'permission.record_approval_result',
+          turnId: 1,
+          toolCallId: 'call_deny',
+          toolName: 'Bash',
+          action: 'run command',
+          source: 'policy',
+          result: { decision: 'denied' },
+        },
+        {
+          type: 'permission.record_approval_result',
+          turnId: 1,
+          toolCallId: 'call_auto',
+          toolName: 'Read',
+          action: 'read file',
+          source: 'auto',
+          result: { decision: 'approved' },
+        },
+      ],
+      contextMessages: [textMessage('user', 'hi')],
+    });
+
+    const page = await svc.list('s1', {});
+
+    expect(page.approval_results).toEqual({
+      call_user: {
+        decision: 'rejected',
+        source: 'user',
+        feedback: 'Add verification steps.',
+        selected_label: 'Revise',
+      },
+      call_deny: { decision: 'denied', source: 'policy' },
+      call_auto: { decision: 'approved', source: 'auto' },
+    });
+  });
+
   it('uses wire record times for created_at, nudged to stay strictly increasing', async () => {
     const svc = buildService({
       summary, // createdAt: 1000

@@ -9,9 +9,9 @@
 // TOOL-role messages fold their toolResult content into the preceding assistant
 // group rather than becoming separate turns.
 
-import type { AppMessage, AppApprovalRequest, AppTask, CompactionMarkerMetadata } from '../api/types';
+import type { AppMessage, AppApprovalRequest, AppApprovalResult, AppTask, CompactionMarkerMetadata, ToolOutcome } from '../api/types';
 import { COMPACTION_MARKER_METADATA_KEY } from '../api/types';
-import type { AgentMember, ApprovalBlock, ChatTurn, CronTurnData, DiffLine, ToolCall, ToolMedia, TurnBlock } from '../types';
+import type { AgentMember, ApprovalBlock, ChatTurn, CronTurnData, DiffLine, ToolCall, ToolMedia, ToolPlan, ToolStatusBadge, TurnBlock } from '../types';
 
 const READ_MEDIA_TOOL_RE = /^read[_-]?media(?:file)?$/i;
 const DATA_URL_RE = /^data:([^;]+);base64,(.*)$/s;
@@ -473,17 +473,102 @@ function continuesAssistantGroup(group: Group | null, promptId: string | undefin
 }
 
 
-/** Extract the plan file path from an ExitPlanMode tool result. The approved
- *  output contains `Plan saved to: <path>`; this survives a page reload (unlike
- *  the ephemeral plan_review approval display), so the tool card can still link
- *  to the plan file. */
-function parsePlanSavedPath(output: string[] | undefined): string | undefined {
-  if (!output || output.length === 0) return undefined;
-  const marker = 'Plan saved to: ';
-  for (const line of output) {
-    if (line.startsWith(marker)) return line.slice(marker.length).trim();
+/**
+ * The label the ExitPlanMode review carries for "send the plan back for
+ * changes" (agent-core's review options). A rejection with this label is a
+ * revise, not a plain rejection.
+ */
+const REVISE_LABEL = 'Revise';
+
+/**
+ * The not_run 判定链: join the tool result's structured `outcome` with the
+ * persisted approval record to pick the row's text badge. `not_run` alone is
+ * ambiguous — it covers user rejection, policy deny, and hook blocks; the
+ * record's ABSENCE is the hook signal (hook block reasons are written to the
+ * tool output by the executor, not to the approval log). Returns undefined
+ * for outcomes that render as a plain ✓/✗ icon instead of a badge.
+ */
+function outcomeBadge(
+  outcome: ToolOutcome,
+  record: AppApprovalResult | undefined,
+): ToolStatusBadge | undefined {
+  switch (outcome) {
+    case 'completed':
+    case 'failed':
+      return undefined;
+    case 'invalid':
+      return 'invalid';
+    case 'skipped':
+      return 'skipped';
+    case 'cancelled':
+      return 'cancelled';
+    case 'interrupted':
+      return 'interrupted';
+    case 'not_run':
+      if (record === undefined) return 'notRun';
+      if (record.decision === 'rejected') {
+        return record.selectedLabel === REVISE_LABEL ? 'revise' : 'rejected';
+      }
+      if (record.decision === 'cancelled') return 'cancelled';
+      if (record.decision === 'denied') return 'denied';
+      return 'notRun';
+  }
+}
+
+/** Extract the plan card seed (body + path) from a tool_use part's `toolData`
+ *  when it is a plan_review display. The daemon persists exactly this kind on
+ *  the tool_use part, so a rejected plan's body survives a page reload. */
+function planSeedFromToolData(toolData: unknown): { plan: string; path?: string } | undefined {
+  const d = toolData as { kind?: unknown; plan?: unknown; path?: unknown } | null | undefined;
+  if (d?.kind === 'plan_review' && typeof d.plan === 'string' && d.plan.length > 0) {
+    return { plan: d.plan, path: typeof d.path === 'string' ? d.path : undefined };
   }
   return undefined;
+}
+
+/**
+ * Resolve the ExitPlanMode plan card from the tool result's `outcome` joined
+ * with the approval record (the 判定链). The plan BODY comes from the paired
+ * tool_use part's persisted plan_review `toolData` (or the pending approval
+ * seed), so approved AND rejected plans render in history — including after a
+ * reload. Other outcomes (failed / invalid / skipped / …) leave the seeded
+ * card untouched; the generic statusBadge covers the row. A legacy result
+ * (no outcome) keeps the seeded pending card as-is — text-marker parsing of
+ * `## Rejected Plan:` is deliberately NOT a fallback.
+ */
+function exitPlanModePlanFromOutcome(
+  outcome: ToolOutcome | undefined,
+  record: AppApprovalResult | undefined,
+  existing: ToolPlan | undefined,
+): ToolPlan | undefined {
+  if (outcome === 'completed') {
+    return {
+      status: record?.source === 'auto' ? 'auto_approved' : 'approved',
+      content: existing?.content,
+      path: existing?.path,
+      chosenOption: record?.selectedLabel,
+    };
+  }
+  if (outcome === 'not_run') {
+    const badge = outcomeBadge(outcome, record);
+    const status: ToolPlan['status'] =
+      badge === 'revise'
+        ? 'revise'
+        : badge === 'rejected'
+          ? 'rejected'
+          : badge === 'cancelled'
+            ? 'cancelled'
+            : badge === 'denied'
+              ? 'denied'
+              : 'not_run';
+    return {
+      status,
+      content: existing?.content,
+      path: existing?.path,
+      feedback: record?.feedback,
+    };
+  }
+  return existing;
 }
 
 /**
@@ -549,9 +634,14 @@ export function messagesToTurns(
    * spinning forever after the turn already finished.
    */
   sessionActive = true,
-  /** Preserved `plan_review` displays keyed by toolCallId — used to link the
-   *  ExitPlanMode tool card back to the plan file after the approval resolves. */
+  /** Preserved `plan_review` displays keyed by toolCallId — seeds the pending
+   *  ExitPlanMode plan card (body + path) so the plan keeps rendering after
+   *  the approval resolves; the settled result output then takes over. */
   planReviewByToolCallId: Record<string, { plan: string; path?: string }> = {},
+  /** Approval decisions keyed by toolCallId — joined with a tool result's
+   *  `not_run` outcome to resolve the status badge (rejected / revise /
+   *  cancelled / denied / hook-blocked). Empty on legacy backends. */
+  approvalResultsByToolCallId: Record<string, AppApprovalResult> = {},
 ): ChatTurn[] {
   const turns: ChatTurn[] = [];
   let no = 1;
@@ -624,6 +714,13 @@ export function messagesToTurns(
         // the final result when expanded, while a subagent's live progress
         // streams in the right-side detail panel (sourced from the task).
         const pendingApproval = approvalByTool.get(c.toolCallId);
+        // ExitPlanMode plan card seed: prefer the tool_use part's OWN persisted
+        // plan_review toolData (survives a reload for approved AND rejected
+        // plans), fall back to the preserved approval display while pending.
+        const planSeed =
+          c.toolName === 'ExitPlanMode'
+            ? planSeedFromToolData(c.toolData) ?? planReviewByToolCallId[c.toolCallId]
+            : undefined;
         const toolCall: ToolCall = {
           id: c.toolCallId,
           name: c.toolName,
@@ -632,7 +729,9 @@ export function messagesToTurns(
           // flushGroup settles dangling tools of finished turns back to 'ok'.
           status: 'running',
           output: c.outputLines,
-          planPath: c.toolName === 'ExitPlanMode' ? planReviewByToolCallId[c.toolCallId]?.path : undefined,
+          plan: planSeed
+            ? { status: 'pending', content: planSeed.plan, path: planSeed.path }
+            : undefined,
         };
         g.tools.push(toolCall);
         g.blocks.push({ kind: 'tool', tool: toolCall });
@@ -646,17 +745,25 @@ export function messagesToTurns(
         const idx = g.tools.findIndex((t) => t.id === c.toolCallId);
         if (idx !== -1) {
           const tool = g.tools[idx]!;
+          const record = approvalResultsByToolCallId[c.toolCallId];
+          // Status: drive from the structured `outcome` when present — control-
+          // flow outcomes (not_run / invalid / skipped / …) become a TEXT badge
+          // and suppress the ✓/✗ icon. No outcome (legacy backend / old data)
+          // keeps the isError-based rendering unchanged.
+          const badge = c.outcome !== undefined ? outcomeBadge(c.outcome, record) : undefined;
           const updated: ToolCall = {
             ...tool,
-            status: c.isError ? 'error' : 'ok',
+            status: c.outcome !== undefined ? (c.outcome === 'failed' ? 'error' : 'ok') : c.isError ? 'error' : 'ok',
+            outcome: c.outcome,
+            statusBadge: badge,
             output: normalizeToolOutput(c.output),
             media: c.isError ? undefined : normalizeToolMedia(tool.name, c.output),
           };
-          // ExitPlanMode: if the plan path wasn't captured from the (ephemeral)
-          // approval display, recover it from the result output so the file link
-          // survives a reload for approved plans.
-          if (updated.name === 'ExitPlanMode' && !updated.planPath) {
-            updated.planPath = parsePlanSavedPath(updated.output);
+          // ExitPlanMode: resolve the plan card from the outcome × approval
+          // record join; the body stays on the card seeded from the paired
+          // tool_use part's persisted plan_review toolData.
+          if (updated.name === 'ExitPlanMode') {
+            updated.plan = exitPlanModePlanFromOutcome(c.outcome, record, tool.plan);
           }
           g.tools[idx] = updated;
           const blk = g.blocks.find((b) => b.kind === 'tool' && b.tool.id === c.toolCallId);

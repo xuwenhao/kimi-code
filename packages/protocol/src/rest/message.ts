@@ -11,6 +11,7 @@
 
 import { z } from 'zod';
 
+import { approvalResultSchema } from '../approval';
 import { messageRoleSchema, messageSchema } from '../message';
 import { cursorQuerySchema } from '../pagination';
 
@@ -24,6 +25,10 @@ export type ListMessagesQuery = z.infer<typeof listMessagesQuerySchema>;
 export const listMessagesResponseSchema = z.object({
   items: z.array(messageSchema),
   has_more: z.boolean(),
+  // Approval decisions keyed by tool_call_id, collected from persisted
+  // `permission.record_approval_result` records covering the returned page.
+  // Optional for cross-version tolerance: older servers do not send it.
+  approval_results: z.record(z.string(), approvalResultSchema).optional(),
 });
 export type ListMessagesResponse = z.infer<typeof listMessagesResponseSchema>;
 

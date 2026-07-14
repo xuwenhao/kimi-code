@@ -179,6 +179,7 @@ describe('ExitPlanMode option output', () => {
     expect(result.output).not.toContain('## Approved Plan:');
     expect(result.output).toContain('the user has NOT explicitly approved it');
     expect(result.output).toContain('# Plan');
+    expect(result.resultOutcome).toBe('completed');
   });
 
   it('keeps the user-approved output when a rule lets the call through outside auto mode', async () => {
@@ -200,6 +201,7 @@ describe('ExitPlanMode option output', () => {
     // so the output keeps the user-approved wording.
     expect(result.output).toContain('## Approved Plan:');
     expect(result.output).not.toContain('auto-approved');
+    expect(result.resultOutcome).toBe('completed');
     expect(telemetry.track2).toHaveBeenCalledWith('plan_resolved', { outcome: 'approved' });
   });
 

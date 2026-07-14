@@ -1,13 +1,23 @@
 <!-- apps/kimi-web/src/components/chat/ToolRow.vue -->
 <script setup lang="ts">
-import { inject, nextTick, ref } from 'vue';
+import { computed, inject, nextTick, ref } from 'vue';
+import { useI18n } from 'vue-i18n';
+import type { ToolStatusBadge } from '../../types';
+import { statusBadgeView } from '../../lib/toolStatus';
 import Icon from '../ui/Icon.vue';
 import Tooltip from '../ui/Tooltip.vue';
 import StatusDot from '../ui/StatusDot.vue';
+import Badge from '../ui/Badge.vue';
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
-    status: 'running' | 'ok' | 'error' | 'suspended';
+    /** Row status icon (✓ / ✗ / spinner). Omit to hide the icon entirely —
+     *  e.g. plan-review cards carry their state as a text badge instead. */
+    status?: 'running' | 'ok' | 'error' | 'suspended';
+    /** Control-flow outcome badge (rejected / not run / skipped / …). When
+     *  present it REPLACES the status icon — a rejected call never shows a ✓
+     *  next to its 已拒绝 badge. */
+    statusBadge?: ToolStatusBadge;
     /** Inline-SVG glyph string (toolGlyph), or empty for none. */
     icon?: string;
     name: string;
@@ -30,6 +40,9 @@ withDefaults(
 );
 
 const emit = defineEmits<{ toggle: [] }>();
+
+const { t } = useI18n();
+const badge = computed(() => statusBadgeView(props.statusBadge));
 
 const pinScroll = inject<(el: HTMLElement, ms?: number) => void>('pinScroll', () => {});
 const bhEl = ref<HTMLElement | null>(null);
@@ -62,12 +75,13 @@ function onHeadClick(): void {
         </Tooltip>
       </span>
       <span class="rt">
-        <span class="status" :class="status" role="status" :aria-label="status">
+        <span v-if="status && !badge" class="status" :class="status" role="status" :aria-label="status">
           <Icon v-if="status === 'ok'" name="check" size="sm" />
           <Icon v-else-if="status === 'error'" name="close" size="sm" />
           <StatusDot v-else-if="status === 'suspended'" status="suspended" />
           <StatusDot v-else status="running" />
         </span>
+        <Badge v-if="badge" :variant="badge.variant" size="sm">{{ t(badge.key) }}</Badge>
         <slot name="trailing" />
         <span v-if="time" class="tm">{{ time }}</span>
       </span>

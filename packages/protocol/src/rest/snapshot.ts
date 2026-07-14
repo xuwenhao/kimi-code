@@ -23,7 +23,7 @@
 
 import { z } from 'zod';
 
-import { approvalRequestSchema } from '../approval';
+import { approvalRequestSchema, approvalResultSchema } from '../approval';
 import { messageSchema } from '../message';
 import { questionRequestSchema } from '../question';
 import { sessionSchema } from '../session';
@@ -34,8 +34,8 @@ export const inFlightToolCallSchema = z.object({
   name: z.string().min(1),
   args: z.unknown().optional(),
   description: z.string().optional(),
-  /** Display payload from `tool.call.started` (ToolInputDisplay). */
-  display: z.unknown().optional(),
+  /** ToolData payload from `tool.call.started` (ToolInputDisplay). */
+  tool_data: z.unknown().optional(),
   /** Most recent `tool.progress` update, if any. */
   last_progress: z
     .object({
@@ -93,6 +93,12 @@ export const sessionSnapshotResponseSchema = z.object({
    * for cross-version tolerance: older servers do not send it.
    */
   subagents: z.array(snapshotSubagentSchema).optional(),
+  /**
+   * Approval decisions keyed by tool_call_id (see
+   * `listMessagesResponseSchema.approval_results`). Optional for cross-version
+   * tolerance: older servers do not send it.
+   */
+  approval_results: z.record(z.string(), approvalResultSchema).optional(),
   pending_approvals: z.array(approvalRequestSchema),
   pending_questions: z.array(questionRequestSchema),
 });

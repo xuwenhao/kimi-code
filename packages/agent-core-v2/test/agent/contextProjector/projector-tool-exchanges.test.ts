@@ -316,6 +316,57 @@ describe('projector tool-exchange normalization', () => {
     ]);
   });
 
+  it('projects a tool-result outcome to the wire part but never to the model', () => {
+    const result: ContextMessage = {
+      role: 'tool',
+      content: [{ type: 'text', text: 'Exited plan mode.' }],
+      toolCalls: [],
+      toolCallId: 'call_plan',
+      outcome: 'completed',
+    };
+    const history = [assistant('', ['call_plan']), result];
+
+    // Model-facing projection: text only, no structured outcome leak.
+    expect(project(history)[1]?.content).toEqual([{ type: 'text', text: 'Exited plan mode.' }]);
+
+    // Wire projection: the part carries the outcome for clients.
+    const protocol = toProtocolMessage('session_1', 0, result, 0);
+    expect(protocol.content).toEqual([
+      {
+        type: 'tool_result',
+        tool_call_id: 'call_plan',
+        output: 'Exited plan mode.',
+        outcome: 'completed',
+      },
+    ]);
+  });
+
+  it('projects a folded tool-call toolData as tool_data on the tool_use part', () => {
+    const toolData = {
+      kind: 'plan_review',
+      plan: '# Final Plan',
+      path: '/tmp/plan.md',
+    } as const;
+    const call: ContextMessage = {
+      role: 'assistant',
+      content: [],
+      toolCalls: [
+        { type: 'function', id: 'call_plan', name: 'ExitPlanMode', arguments: '{}', toolData },
+      ],
+    };
+
+    const protocol = toProtocolMessage('session_1', 0, call, 0);
+    expect(protocol.content).toEqual([
+      {
+        type: 'tool_use',
+        tool_call_id: 'call_plan',
+        tool_name: 'ExitPlanMode',
+        input: {},
+        tool_data: toolData,
+      },
+    ]);
+  });
+
   it('passes raw media parts through as the tool_result output', () => {
     const result: ContextMessage = {
       role: 'tool',

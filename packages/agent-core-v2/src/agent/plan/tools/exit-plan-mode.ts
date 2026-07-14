@@ -96,7 +96,7 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
   async resolveExecution(args: ExitPlanModeInput): Promise<ToolExecution> {
     return {
       description: 'Presenting plan and exiting plan mode',
-      display: await this.resolvePlanReviewDisplay(args),
+      toolData: await this.resolvePlanReviewDisplay(args),
       approvalRule: this.name,
       execute: () => this.execution(args),
     };
@@ -112,15 +112,15 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
       return undefined;
     }
     if (data === null || data.content.trim().length === 0) return undefined;
-    const display: ToolInputDisplay = {
+    const toolData: ToolInputDisplay = {
       kind: 'plan_review',
       plan: data.content,
       path: data.path,
     };
     if (args.options !== undefined && args.options.length >= 2) {
-      display.options = args.options;
+      toolData.options = args.options;
     }
-    return display;
+    return toolData;
   }
 
   private async execution(args: ExitPlanModeInput): Promise<ExecutableToolResult> {
@@ -148,6 +148,7 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
       return {
         isError: false,
         output: `Exited plan mode. ${formatAutoApprovedPlanForOutput(resolvedPlan.plan, resolvedPlan.path)}`,
+        resultOutcome: 'completed',
       };
     }
 
@@ -155,6 +156,7 @@ export class ExitPlanModeTool implements BuiltinTool<ExitPlanModeInput> {
     return {
       isError: false,
       output: `Exited plan mode. ${formatPlanForOutput(resolvedPlan.plan, resolvedPlan.path)}`,
+      resultOutcome: 'completed',
     };
   }
 

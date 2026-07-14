@@ -69,7 +69,7 @@ const approval = {
   toolCallId: 'c1',
   toolName: 'Read',
   action: 'read',
-  display: {},
+  approvalData: {},
   turnId: 1,
   toolInput: { path: '/tmp/x' },
 } as unknown as PermissionApprovalRequestContext;
@@ -188,7 +188,12 @@ describe('AgentRuntimeService', () => {
     eventBus.publish({ type: 'permission.approval.requested', ...approval });
     expect(svc.phase().kind).toBe('awaiting_approval');
 
-    eventBus.publish({ type: 'permission.approval.resolved', ...approval, decision: 'approved' });
+    eventBus.publish({
+      type: 'permission.approval.resolved',
+      ...approval,
+      decision: 'approved',
+      source: 'user',
+    });
     expect(svc.phase()).toMatchObject({ kind: 'streaming', stream: 'assistant' });
   });
 

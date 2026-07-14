@@ -467,10 +467,10 @@ describe('AgentToolExecutorService', () => {
     expect(yielded).toEqual(['fast', 'slow']);
   });
 
-  it('writes resolveExecution description and display onto tool.call.started events', async () => {
+  it('writes resolveExecution description and toolData onto tool.call.started events', async () => {
     const tool = new TestTool('display', {
       description: 'Prepared display description',
-      display: {
+      toolData: {
         kind: 'generic',
         summary: 'Display summary',
         detail: { value: 1 },
@@ -483,12 +483,90 @@ describe('AgentToolExecutorService', () => {
     expect(protocolEvents.find((event) => event.type === 'tool.call.started')).toMatchObject({
       type: 'tool.call.started',
       description: 'Prepared display description',
-      display: {
+      toolData: {
         kind: 'generic',
         summary: 'Display summary',
         detail: { value: 1 },
       },
     });
+  });
+
+  it('assigns the completed outcome to a normal settle', async () => {
+    registry.register(new TestTool('echo'));
+
+    const results = await execute([toolCall('call_ok', 'echo', { text: 'hi' })]);
+
+    expect(results[0]).toMatchObject({ output: 'hi', resultOutcome: 'completed' });
+    expect(protocolEvents.find((event) => event.type === 'tool.result')).toMatchObject({
+      type: 'tool.result',
+      outcome: 'completed',
+    });
+  });
+
+  it('assigns the failed outcome to a tool execution failure', async () => {
+    const tool = new TestTool('fail', {
+      execute: async () => {
+        throw new Error('tool blew up');
+      },
+    });
+    registry.register(tool);
+
+    const results = await execute([toolCall('call_fail', 'fail', {})]);
+
+    expect(results[0]).toMatchObject({ isError: true, resultOutcome: 'failed' });
+  });
+
+  it('assigns the invalid outcome to a preflight rejection', async () => {
+    const results = await execute([toolCall('call_missing', 'missing', {})]);
+
+    expect(results[0]).toMatchObject({ isError: true, resultOutcome: 'invalid' });
+    expect(protocolEvents.find((event) => event.type === 'tool.result')).toMatchObject({
+      type: 'tool.result',
+      outcome: 'invalid',
+    });
+  });
+
+  it('assigns the not_run outcome to a hook gate block', async () => {
+    registry.register(new TestTool('echo'));
+    executor.hooks.onBeforeExecuteTool.register('test-block', async (ctx) => {
+      ctx.decision = { block: true, reason: 'blocked by test hook' };
+    });
+
+    const results = await execute([toolCall('call_blocked', 'echo', {})]);
+
+    expect(results[0]).toMatchObject({
+      output: 'blocked by test hook',
+      isError: true,
+      resultOutcome: 'not_run',
+    });
+  });
+
+  it('assigns the cancelled outcome when the signal aborts before execution', async () => {
+    registry.register(new TestTool('echo'));
+    const controller = new AbortController();
+    controller.abort();
+
+    const results = await execute([toolCall('call_aborted', 'echo', {})], controller.signal);
+
+    expect(results[0]).toMatchObject({ isError: true, resultOutcome: 'cancelled' });
+  });
+
+  it('assigns the skipped outcome to batch calls after a stop-batch marker', async () => {
+    registry.register(new TestTool('first', { stopBatchAfterThis: true }));
+    registry.register(new TestTool('second'));
+
+    const results = await execute([
+      toolCall('call_first', 'first', {}),
+      toolCall('call_second', 'second', {}),
+    ]);
+
+    const skipped = results.find(
+      (result) =>
+        typeof result.output === 'string' &&
+        result.output.includes('Tool skipped because a previous tool call stopped the turn.'),
+    );
+    expect(skipped).toMatchObject({ isError: true, resultOutcome: 'skipped' });
+    expect(results.filter((result) => result !== skipped)).toHaveLength(1);
   });
 
   it('captures tool execution failures as error results', async () => {
@@ -807,7 +885,7 @@ class TestTool implements ExecutableTool<Record<string, unknown>> {
       readonly accesses?: ToolAccesses;
       readonly stopBatchAfterThis?: boolean;
       readonly description?: string;
-      readonly display?: ToolInputDisplay;
+      readonly toolData?: ToolInputDisplay;
       readonly result?: ExecutableToolResult;
       readonly execute?: (
         ctx: ExecutableToolContext,
@@ -824,7 +902,7 @@ class TestTool implements ExecutableTool<Record<string, unknown>> {
       accesses: this.options.accesses,
       stopBatchAfterThis: this.options.stopBatchAfterThis,
       description: this.options.description,
-      display: this.options.display,
+      toolData: this.options.toolData,
       execute: async (ctx) => {
         this.calls.push({ ...ctx, args });
         if (this.options.execute !== undefined) {

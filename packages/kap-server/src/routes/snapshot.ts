@@ -22,6 +22,7 @@ import {
   IAgentContextMemoryService,
   IAgentLifecycleService,
   IAgentPromptService,
+  IAgentWireRecordService,
   ILogService,
   ISessionActivity,
   ISessionInteractionService,
@@ -29,6 +30,7 @@ import {
   ISessionLifecycleService,
   ISessionMetadata,
   IWorkspaceRegistry,
+  collectApprovalResults,
   toProtocolMessage,
   type IAgentScopeHandle,
   type Scope,
@@ -36,6 +38,7 @@ import {
 import {
   ErrorCode,
   sessionSnapshotResponseSchema,
+  type ApprovalResult,
   type InFlightTurn,
   type Message,
   type SessionSnapshotResponse,
@@ -175,12 +178,16 @@ async function readViaLegacyAssembly(
   const main = handle.accessor.get(IAgentLifecycleService).getHandle('main');
   let items: Message[] = [];
   let hasMore = false;
+  let approvalResults: Record<string, ApprovalResult> = {};
   if (main !== undefined) {
     const history = main.accessor.get(IAgentContextMemoryService).get();
     hasMore = history.length > SNAPSHOT_MESSAGE_PAGE_SIZE;
     const page = history.slice(-SNAPSHOT_MESSAGE_PAGE_SIZE);
     const offset = history.length - page.length;
     items = page.map((msg, i) => toProtocolMessage(sessionId, offset + i, msg, meta.createdAt));
+    approvalResults = collectApprovalResults(
+      main.accessor.get(IAgentWireRecordService).getRecords(),
+    );
   }
   const currentPromptId =
     snapState.inFlightTurn === null ? undefined : readCurrentPromptId(main);
@@ -201,6 +208,7 @@ async function readViaLegacyAssembly(
     session,
     messages: { items, has_more: hasMore },
     in_flight_turn: inFlightTurn,
+    approval_results: approvalResults,
     pending_approvals: pendingApprovals,
     pending_questions: pendingQuestions,
   };

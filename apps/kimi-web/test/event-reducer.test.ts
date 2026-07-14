@@ -394,3 +394,98 @@ describe('reduceAppEvent messageCreated cron origin', () => {
     expect(msgs.map((m) => m.id)).toEqual(['opt_1', 'cron_1']);
   });
 });
+
+describe('reduceAppEvent approvalResolved', () => {
+  it('maintains the approval-results map incrementally from the broadcast', () => {
+    const next = reduceAppEvent(
+      createInitialState(),
+      {
+        type: 'approvalResolved',
+        sessionId: 'sess_1',
+        approvalId: 'ap_1',
+        decision: 'rejected',
+        resolvedAt: '2026-01-01T00:00:01.000Z',
+        toolCallId: 'tc_1',
+        source: 'user',
+        feedback: 'Add verification steps.',
+        selectedLabel: 'Revise',
+      },
+      { sessionId: 'sess_1', seq: 2 },
+    );
+
+    expect(next.approvalResultsByToolCallId['tc_1']).toEqual({
+      decision: 'rejected',
+      source: 'user',
+      feedback: 'Add verification steps.',
+      selectedLabel: 'Revise',
+    });
+  });
+
+  it('defaults source to user when the broadcast omits it', () => {
+    const next = reduceAppEvent(
+      createInitialState(),
+      {
+        type: 'approvalResolved',
+        sessionId: 'sess_1',
+        approvalId: 'ap_1',
+        decision: 'approved',
+        resolvedAt: '2026-01-01T00:00:01.000Z',
+        toolCallId: 'tc_2',
+      },
+      { sessionId: 'sess_1', seq: 2 },
+    );
+
+    expect(next.approvalResultsByToolCallId['tc_2']?.source).toBe('user');
+  });
+
+  it('skips the map for a legacy broadcast without a toolCallId', () => {
+    const next = reduceAppEvent(
+      createInitialState(),
+      {
+        type: 'approvalResolved',
+        sessionId: 'sess_1',
+        approvalId: 'ap_2',
+        decision: 'approved',
+        resolvedAt: '2026-01-01T00:00:01.000Z',
+      },
+      { sessionId: 'sess_1', seq: 3 },
+    );
+
+    expect(next.approvalResultsByToolCallId).toEqual({});
+  });
+
+  it('still removes the resolved approval from the pending list', () => {
+    const state = {
+      ...createInitialState(),
+      approvalsBySession: {
+        sess_1: [
+          {
+            approvalId: 'ap_1',
+            sessionId: 'sess_1',
+            toolCallId: 'tc_1',
+            toolName: 'bash',
+            action: 'shell',
+            display: null,
+            expiresAt: '2099-01-01T00:00:00.000Z',
+            createdAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+      },
+    };
+    const next = reduceAppEvent(
+      state,
+      {
+        type: 'approvalResolved',
+        sessionId: 'sess_1',
+        approvalId: 'ap_1',
+        decision: 'approved',
+        resolvedAt: '2026-01-01T00:00:01.000Z',
+        toolCallId: 'tc_1',
+      },
+      { sessionId: 'sess_1', seq: 2 },
+    );
+
+    expect(next.approvalsBySession['sess_1']).toEqual([]);
+    expect(next.approvalResultsByToolCallId['tc_1']?.decision).toBe('approved');
+  });
+});

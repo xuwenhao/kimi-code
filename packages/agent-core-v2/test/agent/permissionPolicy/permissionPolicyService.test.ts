@@ -303,7 +303,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: planReviewDisplay({ plan: '# Plan' }),
+      toolData: planReviewDisplay({ plan: '# Plan' }),
     })).resolves.toMatchObject({
       policyName: 'plan-mode-tool-approve',
       result: { kind: 'approve' },
@@ -315,7 +315,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: { kind: 'generic', summary: 'exit', detail: {} },
+      toolData: { kind: 'generic', summary: 'exit', detail: {} },
     })).resolves.toMatchObject({
       policyName: 'plan-mode-tool-approve',
       result: { kind: 'approve' },
@@ -327,7 +327,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: planReviewDisplay({ plan: '  \n\t' }),
+      toolData: planReviewDisplay({ plan: '  \n\t' }),
     })).resolves.toMatchObject({
       policyName: 'plan-mode-tool-approve',
       result: { kind: 'approve' },
@@ -339,7 +339,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: planReviewDisplay({ plan: '# Plan' }),
+      toolData: planReviewDisplay({ plan: '# Plan' }),
     })).resolves.toMatchObject({
       policyName: 'exit-plan-mode-review-ask',
       result: { kind: 'ask' },
@@ -353,7 +353,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: planReviewDisplay({ plan: '# Plan' }),
+      toolData: planReviewDisplay({ plan: '# Plan' }),
     })).resolves.toMatchObject({
       policyName: 'exit-plan-mode-review-ask',
       result: { kind: 'ask' },
@@ -367,7 +367,7 @@ describe('AgentPermissionPolicyService plan-mode policies', () => {
     await expect(evaluate({
       toolName: 'ExitPlanMode',
       args: {},
-      display: planReviewDisplay({ plan: '# Updated Plan' }),
+      toolData: planReviewDisplay({ plan: '# Updated Plan' }),
     })).resolves.toMatchObject({
       policyName: 'session-approval-history',
       result: { kind: 'approve' },
@@ -695,7 +695,7 @@ interface PolicyContextInput {
   readonly args: Record<string, unknown>;
   readonly toolCall?: ToolCall;
   readonly toolCalls?: readonly ToolCall[];
-  readonly display?: ToolInputDisplay;
+  readonly toolData?: ToolInputDisplay;
   readonly accesses?: ToolAccessList;
 }
 
@@ -712,7 +712,7 @@ function policyContext(input: PolicyContextInput): ResolvedToolExecutionHookCont
     args: input.args,
     execution: {
       description: description(input.toolName),
-      display: input.display ?? display(input.toolName, input.args),
+      toolData: input.toolData ?? display(input.toolName, input.args),
       accesses: input.accesses ?? accesses(input.toolName, input.args),
       approvalRule:
         subject === undefined ? input.toolName : literalRulePattern(input.toolName, subject),

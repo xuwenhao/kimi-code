@@ -10,7 +10,7 @@ import { SessionApprovalService } from '#/session/approval/approvalService';
 import { ISessionInteractionService } from '#/session/interaction/interaction';
 import { SessionInteractionService } from '#/session/interaction/interactionService';
 
-const display: ToolInputDisplay = { kind: 'command', command: 'bash' };
+const approvalData: ToolInputDisplay = { kind: 'command', command: 'bash' };
 
 const noopEventBus: IEventBus = {
   _serviceBrand: undefined,
@@ -19,7 +19,7 @@ const noopEventBus: IEventBus = {
 };
 
 function makeRequest(id: string): ApprovalRequest {
-  return { id, toolName: 'bash', action: 'run', display };
+  return { id, toolName: 'bash', action: 'run', approvalData };
 }
 
 describe('SessionApprovalService', () => {

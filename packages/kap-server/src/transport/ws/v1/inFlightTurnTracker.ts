@@ -27,7 +27,7 @@ interface ToolAccum {
   name: string;
   args?: unknown;
   description?: string;
-  display?: unknown;
+  tool_data?: unknown;
   last_progress?: {
     kind: 'stdout' | 'stderr' | 'progress' | 'status' | 'custom';
     text?: string;
@@ -97,7 +97,7 @@ export class InFlightTurnTracker {
           name: event.name,
           args: event.args,
           ...(event.description !== undefined ? { description: event.description } : {}),
-          ...(event.display !== undefined ? { display: event.display } : {}),
+          ...(event.toolData !== undefined ? { tool_data: event.toolData } : {}),
         });
         return {};
       }
@@ -131,7 +131,7 @@ export class InFlightTurnTracker {
       name: t.name,
       ...(t.args !== undefined ? { args: t.args } : {}),
       ...(t.description !== undefined ? { description: t.description } : {}),
-      ...(t.display !== undefined ? { display: t.display } : {}),
+      ...(t.tool_data !== undefined ? { tool_data: t.tool_data } : {}),
       ...(t.last_progress !== undefined ? { last_progress: t.last_progress } : {}),
     }));
     return {

@@ -182,7 +182,7 @@ export class AgentTool implements BuiltinTool<AgentToolInput> {
     return {
       description: `${prefix} ${profileNameForDisplay} agent: ${args.description}`,
       accesses: ToolAccesses.none(),
-      display: {
+      toolData: {
         kind: 'agent_call',
         agent_name: profileNameForDisplay,
         prompt: args.prompt,

@@ -4,6 +4,7 @@
 
 import type {
   AppApprovalRequest,
+  AppApprovalResult,
   AppConfig,
   AppEvent,
   AppGoal,
@@ -32,6 +33,7 @@ import type {
 import type {
   WireApprovalRequest,
   WireApprovalResponse,
+  WireApprovalResult,
   WireTask,
   WireFsEntry,
   WireImageSource,
@@ -157,6 +159,28 @@ function toAppImageSource(src: WireImageSource): ImageSource {
   return { kind: 'url', url: src.url };
 }
 
+/** Convert the wire (snake_case) approval-result record to the app shape. */
+export function toAppApprovalResult(wire: WireApprovalResult): AppApprovalResult {
+  return {
+    decision: wire.decision,
+    source: wire.source,
+    scope: wire.scope,
+    feedback: wire.feedback,
+    selectedLabel: wire.selected_label,
+  };
+}
+
+/** Map an `approval_results` side map ({} / absent on legacy servers). */
+export function toAppApprovalResults(
+  wire: Record<string, WireApprovalResult> | undefined,
+): Record<string, AppApprovalResult> {
+  const out: Record<string, AppApprovalResult> = {};
+  for (const [toolCallId, result] of Object.entries(wire ?? {})) {
+    out[toolCallId] = toAppApprovalResult(result);
+  }
+  return out;
+}
+
 export function toAppMessageContent(wire: WireMessageContent): AppMessageContent {
   switch (wire.type) {
     case 'text':
@@ -167,6 +191,7 @@ export function toAppMessageContent(wire: WireMessageContent): AppMessageContent
         toolCallId: wire.tool_call_id,
         toolName: wire.tool_name,
         input: wire.input,
+        toolData: wire.tool_data,
       };
     case 'tool_result':
       return {
@@ -174,6 +199,7 @@ export function toAppMessageContent(wire: WireMessageContent): AppMessageContent
         toolCallId: wire.tool_call_id,
         output: wire.output,
         isError: wire.is_error,
+        outcome: wire.outcome,
       };
     case 'image':
       return {
@@ -306,8 +332,7 @@ export function toAppApprovalRequest(wire: WireApprovalRequest): AppApprovalRequ
     toolCallId: wire.tool_call_id,
     toolName: wire.tool_name,
     action: wire.action,
-    // The real daemon sends `tool_input_display`; the stub sends `display`.
-    display: wire.tool_input_display ?? wire.display,
+    display: wire.approval_data,
     expiresAt: wire.expires_at,
     createdAt: wire.created_at,
   };
@@ -634,6 +659,13 @@ export function toAppEvent(wire: WireEvent): AppEvent {
         approvalId: w.payload.approval_id,
         decision: w.payload.decision,
         resolvedAt: w.payload.resolved_at,
+        // New servers carry the full decision so the client can maintain its
+        // approval-results map incrementally; legacy servers omit these.
+        toolCallId: w.payload.tool_call_id,
+        source: w.payload.source,
+        scope: w.payload.scope,
+        feedback: w.payload.feedback,
+        selectedLabel: w.payload.selected_label,
       };
 
     case 'event.approval.expired':

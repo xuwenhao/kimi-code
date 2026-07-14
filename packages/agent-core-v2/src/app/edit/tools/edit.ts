@@ -98,7 +98,7 @@ export class EditTool implements BuiltinTool<EditInput> {
     return {
       accesses: ToolAccesses.readWriteFile(path),
       description: `Editing ${args.path}`,
-      display: {
+      toolData: {
         kind: 'file_io',
         operation: 'edit',
         path,

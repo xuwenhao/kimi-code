@@ -92,7 +92,7 @@ export class SkillTool implements BuiltinTool<SkillToolInput> {
   resolveExecution(args: SkillToolInput): ToolExecution {
     return {
       description: `Invoke skill ${args.skill}`,
-      display: { kind: 'skill_call', skill_name: args.skill, args: args.args },
+      toolData: { kind: 'skill_call', skill_name: args.skill, args: args.args },
       approvalRule: this.name,
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.skill),
       execute: () => this.execution(args),

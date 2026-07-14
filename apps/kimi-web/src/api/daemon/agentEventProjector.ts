@@ -24,11 +24,28 @@ import type {
   AppMessageContent,
   AppSessionUsage,
   AppTask,
+  ToolOutcome,
 } from '../types';
 import { i18n } from '../../i18n';
 import { toolLabel, toolSummary } from '../../lib/toolMeta';
 import { toAppMessageContent } from './mappers';
 import type { WireMessageContent } from './wire';
+
+const TOOL_OUTCOMES: ReadonlySet<string> = new Set([
+  'completed',
+  'failed',
+  'not_run',
+  'invalid',
+  'skipped',
+  'cancelled',
+  'interrupted',
+]);
+
+/** Validate a raw `outcome` field from a tool.result event (absent on legacy
+ *  backends; unknown future values are dropped rather than trusted). */
+function toToolOutcome(raw: unknown): ToolOutcome | undefined {
+  return typeof raw === 'string' && TOOL_OUTCOMES.has(raw) ? (raw as ToolOutcome) : undefined;
+}
 
 // Subagent turns share the parent session id: their turn / step / delta / tool
 // frames stream over the SAME session channel, each tagged with the subagent's
@@ -408,10 +425,11 @@ function appendToolUse(
   toolName: string,
   input: unknown,
   outputLines?: string[],
+  toolData?: unknown,
 ): void {
   const msg = state.messages.find((m) => m.id === messageId);
   if (!msg) return;
-  msg.content.push({ type: 'toolUse', toolCallId, toolName, input, outputLines });
+  msg.content.push({ type: 'toolUse', toolCallId, toolName, input, outputLines, toolData });
 }
 
 function toolProgressOutput(payload: Record<string, unknown>): { outputChunk: string; stream: 'stdout' | 'stderr' } | null {
@@ -442,12 +460,13 @@ function appendToolResultMessage(
   output: unknown,
   isError: boolean,
   promptId: string,
+  outcome?: ToolOutcome,
 ): AppMessage {
   const msg: AppMessage = {
     id: ulid('msg_'),
     sessionId,
     role: 'tool',
-    content: [{ type: 'toolResult', toolCallId, output, isError }],
+    content: [{ type: 'toolResult', toolCallId, output, isError, outcome }],
     createdAt: new Date().toISOString(),
     promptId,
   };
@@ -570,6 +589,7 @@ export function createAgentProjector(): AgentProjector {
         toolName: tool.name,
         input: tool.args ?? {},
         outputLines,
+        toolData: tool.toolData,
       });
       s.toolStartTimes.set(tool.toolCallId, Date.now());
     }
@@ -826,8 +846,9 @@ export function createAgentProjector(): AgentProjector {
         // Real daemon field name is 'name' per event-projector.ts
         const toolName: string = p?.name ?? p?.toolName ?? '';
         const args = p?.args ?? p?.input ?? {};
+        const toolData: unknown = p?.toolData;
 
-        appendToolUse(s, msgId, toolCallId, toolName, args);
+        appendToolUse(s, msgId, toolCallId, toolName, args, undefined, toolData);
 
         const msg = getMsgById(s, msgId);
         const contentIndex = msg ? msg.content.length - 1 : 0;
@@ -885,12 +906,13 @@ export function createAgentProjector(): AgentProjector {
         const toolCallId: string = p?.toolCallId;
         const output = p?.output;
         const isError: boolean = p?.isError ?? false;
+        const outcome = toToolOutcome(p?.outcome);
 
         const startTime = s.toolStartTimes.get(toolCallId) ?? Date.now();
         s.toolStartTimes.delete(toolCallId);
         void (Date.now() - startTime); // duration — unused at client level
 
-        const resultMsg = appendToolResultMessage(s, sessionId, toolCallId, output, isError, promptId);
+        const resultMsg = appendToolResultMessage(s, sessionId, toolCallId, output, isError, promptId, outcome);
         out.push({ type: 'messageCreated', message: cloneMessage(resultMsg) });
 
         // Reset assistant message tracking — next step.started will create a fresh one

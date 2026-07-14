@@ -30,8 +30,8 @@ export class PlanModeToolApprovePermissionPolicyService implements PermissionPol
 
     if (toolName === 'ExitPlanMode') {
       if (plan === null) return { kind: 'approve' };
-      if (context.execution.display?.kind !== 'plan_review') return { kind: 'approve' };
-      if (context.execution.display.plan.trim().length === 0) return { kind: 'approve' };
+      if (context.execution.toolData?.kind !== 'plan_review') return { kind: 'approve' };
+      if (context.execution.toolData.plan.trim().length === 0) return { kind: 'approve' };
     }
 
     return undefined;

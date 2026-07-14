@@ -76,6 +76,18 @@ describe('events / display re-exports', () => {
         toolCallId: 'call_1',
         name: 'bash',
         args: { command: 'pwd' },
+        toolData: { kind: 'command', command: 'pwd', language: 'bash' },
+      }).success,
+    ).toBe(true);
+
+    // Legacy `display` field is still accepted (v1 engine / TUI compat).
+    expect(
+      toolCallStartedEventSchema.safeParse({
+        type: 'tool.call.started',
+        turnId: 1,
+        toolCallId: 'call_1',
+        name: 'bash',
+        args: { command: 'pwd' },
         display: { kind: 'command', command: 'pwd', language: 'bash' },
       }).success,
     ).toBe(true);

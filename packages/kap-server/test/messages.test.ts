@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   IAgentContextMemoryService,
   IAgentLifecycleService,
+  IAgentPermissionRulesService,
   IAgentWireRecordService,
   ISessionLifecycleService,
   IModelResolver,
@@ -36,6 +37,10 @@ interface MessageWire {
 interface PageWire {
   items: MessageWire[];
   has_more: boolean;
+  approval_results?: Record<
+    string,
+    { decision: string; source: string; feedback?: string; selected_label?: string }
+  >;
 }
 
 const MSG_ID = /^msg_.+/;
@@ -136,6 +141,43 @@ describe('server-v2 /api/v1/sessions/{sid}/messages', () => {
     const { body } = await getJson<PageWire>(`/api/v1/sessions/${id}/messages`);
     expect(body.code).toBe(0);
     expect(body.data.items).toEqual([]);
+  });
+
+  it('includes approval_results keyed by tool_call_id with source (envelope does not strip it)', async () => {
+    const id = await createSession();
+    const session = server!.core.accessor.get(ISessionLifecycleService).get(id);
+    if (session === undefined) throw new Error(`session ${id} not found`);
+    const agent = await session.accessor.get(IAgentLifecycleService).create({ agentId: 'main' });
+    agent.accessor.get(IAgentContextMemoryService).append({
+      role: 'user',
+      content: [{ type: 'text', text: 'hi' }],
+      toolCalls: [],
+    });
+    const rules = agent.accessor.get(IAgentPermissionRulesService);
+    rules.recordApprovalResult({
+      turnId: 1,
+      toolCallId: 'call_user',
+      toolName: 'Bash',
+      action: 'run command',
+      source: 'user',
+      result: { decision: 'rejected', feedback: 'Add verification steps.' },
+    });
+    rules.recordApprovalResult({
+      turnId: 1,
+      toolCallId: 'call_deny',
+      toolName: 'Bash',
+      action: 'run command',
+      source: 'policy',
+      result: { decision: 'denied' },
+    });
+    await agent.accessor.get(IAgentWireRecordService).flush();
+
+    const { body } = await getJson<PageWire>(`/api/v1/sessions/${id}/messages`);
+    expect(body.code).toBe(0);
+    expect(body.data.approval_results).toMatchObject({
+      call_user: { decision: 'rejected', source: 'user', feedback: 'Add verification steps.' },
+      call_deny: { decision: 'denied', source: 'policy' },
+    });
   });
 
   it('lists spliced messages newest-first with stable ids and mapped content', async () => {

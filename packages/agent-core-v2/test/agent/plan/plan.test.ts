@@ -311,6 +311,18 @@ describe('Plan service', () => {
       const llmInput = ctx.llmCalls[1]!;
       expect(toolResultText(llmInput.history)).toContain('Plan mode deactivated');
       expect(toolResultText(llmInput.history)).toContain('# Plan');
+      const toolMessage = context.get().find((m) => m.role === 'tool');
+      expect(toolMessage?.outcome).toBe('completed');
+      // The plan body survives on the persisted tool.call record's
+      // whitelisted `plan_review` toolData, folded onto the assistant ToolCall.
+      const planCall = context
+        .get()
+        .find((m) => m.role === 'assistant')
+        ?.toolCalls.find((call) => call.id === 'call_exit_plan');
+      expect(planCall?.toolData).toMatchObject({
+        kind: 'plan_review',
+        plan: '# Plan\n\n- Inspect\n- Change\n- Verify',
+      });
     });
 
     it('stops the turn and stays in plan mode when the user rejects the plan', async () => {
@@ -342,6 +354,16 @@ describe('Plan service', () => {
       await expectPlanActive(true);
       expect(ctx.llmCalls).toHaveLength(1);
       expect(toolResultText(context.get())).toContain('Plan rejected by user');
+      const toolMessage = context.get().find((m) => m.role === 'tool');
+      expect(toolMessage?.outcome).toBe('not_run');
+      const planCall = context
+        .get()
+        .find((m) => m.role === 'assistant')
+        ?.toolCalls.find((call) => call.id === 'call_exit_reject');
+      expect(planCall?.toolData).toMatchObject({
+        kind: 'plan_review',
+        plan: '# Plan\n\n- Inspect\n- Change\n- Verify',
+      });
     });
 
     it('does not execute later tool calls in the same batch after plan rejection', async () => {
@@ -458,11 +480,11 @@ describe('Plan service', () => {
       const rpcArgs = (
         ctx.allEvents.find(
           (event) => event.type === '[rpc]' && event.event === 'requestApproval',
-        ) as { args: { action?: string; display?: { options?: readonly unknown[] } } } | undefined
+        ) as { args: { action?: string; approvalData?: { options?: readonly unknown[] } } } | undefined
       )?.args;
 
       expect(rpcArgs?.action).toBe('Presenting plan and exiting plan mode');
-      expect(rpcArgs?.display?.options).toHaveLength(2);
+      expect(rpcArgs?.approvalData?.options).toHaveLength(2);
 
       approval.respond({ decision: 'approved', selectedLabel: 'Approach A' });
       await ctx.untilTurnEnd();
@@ -594,11 +616,11 @@ describe('Plan service', () => {
         [emit] agent.status.updated        { "usage": { "byModel": { "mock-model": { "inputOther": 565, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 565, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 565, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
         [emit] agent.status.updated        { "contextTokens": 588 }
         [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will inspect safely." } }, "time": "<time>" }
-        [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf plan-safe", "timeout": 60 }, "description": "Running: printf plan-safe", "display": { "kind": "command", "command": "printf plan-safe", "cwd": "<cwd>", "language": "bash" } }
+        [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf plan-safe", "timeout": 60 }, "description": "Running: printf plan-safe", "toolData": { "kind": "command", "command": "printf plan-safe", "cwd": "<cwd>", "language": "bash" } }
         [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf plan-safe", "timeout": 60 } }, "time": "<time>" }
         [emit] tool.progress               { "turnId": 0, "toolCallId": "call_bash", "update": { "kind": "stdout", "text": "plan-safe" } }
-        [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "plan-safe" }
-        [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_bash", "result": { "output": "plan-safe" } }, "time": "<time>" }
+        [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "plan-safe", "outcome": "completed" }
+        [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_bash", "result": { "output": "plan-safe", "outcome": "completed" } }, "time": "<time>" }
         [wire] context.append_loop_event   { "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "tool_use", "usage": { "inputOther": 565, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "time": "<time>" }
         [emit] turn.step.completed         { "turnId": 0, "step": 1, "stepId": "<uuid-1>", "usage": { "inputOther": 565, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }
         [emit] turn.step.started           { "turnId": 0, "step": 2, "stepId": "<uuid-4>" }
@@ -660,11 +682,11 @@ describe('Plan service', () => {
         [emit] agent.status.updated        { "usage": { "byModel": { "mock-model": { "inputOther": 562, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 562, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 562, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
         [emit] agent.status.updated        { "contextTokens": 585 }
         [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will mutate a file." } }, "time": "<time>" }
-        [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "rm forbidden.txt", "timeout": 60 }, "description": "Running: rm forbidden.txt", "display": { "kind": "command", "command": "rm forbidden.txt", "cwd": "<cwd>", "language": "bash" } }
+        [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "rm forbidden.txt", "timeout": 60 }, "description": "Running: rm forbidden.txt", "toolData": { "kind": "command", "command": "rm forbidden.txt", "cwd": "<cwd>", "language": "bash" } }
         [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "rm forbidden.txt", "timeout": 60 } }, "time": "<time>" }
         [emit] tool.progress               { "turnId": 0, "toolCallId": "call_bash", "update": { "kind": "stdout", "text": "removed" } }
-        [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "removed" }
-        [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_bash", "result": { "output": "removed" } }, "time": "<time>" }
+        [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "removed", "outcome": "completed" }
+        [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_bash", "result": { "output": "removed", "outcome": "completed" } }, "time": "<time>" }
         [wire] context.append_loop_event   { "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "tool_use", "usage": { "inputOther": 562, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "time": "<time>" }
         [emit] turn.step.completed         { "turnId": 0, "step": 1, "stepId": "<uuid-1>", "usage": { "inputOther": 562, "output": 23, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }
         [emit] turn.step.started           { "turnId": 0, "step": 2, "stepId": "<uuid-4>" }
@@ -680,6 +702,13 @@ describe('Plan service', () => {
         [emit] turn.ended                  { "turnId": 0, "reason": "completed" }
       `);
       expect(toolResultText(context.get())).toContain('removed');
+      // The command-kind toolData stays live-only: the whitelist gate keeps it
+      // out of the persisted tool.call record, so the folded ToolCall has none.
+      const bashToolCall = context
+        .get()
+        .find((m) => m.role === 'assistant')
+        ?.toolCalls.find((call) => call.id === 'call_bash');
+      expect(bashToolCall?.toolData).toBeUndefined();
     });
   });
 

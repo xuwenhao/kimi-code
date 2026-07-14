@@ -18,7 +18,7 @@ export interface ApprovalRequest {
   readonly toolCallId?: string;
   readonly toolName: string;
   readonly action: string;
-  readonly display: ToolInputDisplay;
+  readonly approvalData: ToolInputDisplay;
 }
 
 export type ApprovalDecision = 'approved' | 'rejected' | 'cancelled';

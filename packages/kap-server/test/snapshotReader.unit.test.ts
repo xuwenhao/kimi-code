@@ -185,6 +185,44 @@ describe('SnapshotReader.read', () => {
     ]);
   });
 
+  it('collects approval_results from permission.record_approval_result records', async () => {
+    const f = await makeFixtureAsync();
+    await seedSession(f, 'sess_approvals');
+    await writeWire(f.sessionDir('sess_approvals'), [
+      { type: 'metadata', protocol_version: '1.4', created_at: 1 },
+      { type: 'context.append_message', message: userMessage('do a thing') },
+      {
+        type: 'permission.record_approval_result',
+        turnId: 1,
+        toolCallId: 'call_user',
+        toolName: 'Bash',
+        action: 'run command',
+        source: 'user',
+        // Persisted response is camelCase (selectedLabel); REST is snake_case.
+        result: { decision: 'rejected', feedback: 'Add verification steps.', selectedLabel: 'Revise' },
+      },
+      {
+        type: 'permission.record_approval_result',
+        turnId: 1,
+        toolCallId: 'call_deny',
+        toolName: 'Bash',
+        action: 'run command',
+        source: 'policy',
+        result: { decision: 'denied' },
+      },
+    ]);
+    const snap = await f.reader.read('sess_approvals');
+    expect(snap.approval_results).toEqual({
+      call_user: {
+        decision: 'rejected',
+        source: 'user',
+        feedback: 'Add verification steps.',
+        selected_label: 'Revise',
+      },
+      call_deny: { decision: 'denied', source: 'policy' },
+    });
+  });
+
   it('folds v1 context.append_loop_event records into assistant and tool messages', async () => {
     const f = await makeFixtureAsync();
     await seedSession(f, 'sess_loop');

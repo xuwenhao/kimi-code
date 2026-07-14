@@ -9,7 +9,7 @@ export interface ApprovalRequest {
   toolCallId: string;
   toolName: string;
   action: string;
-  display: ToolInputDisplay;
+  approvalData: ToolInputDisplay;
 }
 
 export interface ApprovalResponse {

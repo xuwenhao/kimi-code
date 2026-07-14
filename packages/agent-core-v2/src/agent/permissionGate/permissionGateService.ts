@@ -35,9 +35,18 @@ export type PermissionApprovalRequestContext = ApprovalRequest & {
   readonly toolInput: unknown;
 };
 
+/**
+ * Payload of the `permission.approval.resolved` domain event. Carries the full
+ * decision — `decision` / `source` / `scope` / `feedback` / `selectedLabel` —
+ * so downstream consumers (approval-result broadcasts, external hooks) never
+ * have to re-derive who decided what. `decision: 'denied'` only occurs with
+ * `source: 'policy'`; `decision: 'error'` marks a transport failure (no
+ * decision was made, hence no `source`).
+ */
 export type PermissionApprovalResultContext = PermissionApprovalRequestContext &
   (
-    | ApprovalResponse
+    | (ApprovalResponse & { readonly source: 'user' | 'policy' | 'auto' })
+    | { readonly decision: 'denied'; readonly source: 'policy' }
     | {
         readonly decision: 'error';
         readonly error: string;
@@ -96,6 +105,12 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
       decision: evaluation.result.kind,
       ...evaluation.result.reason,
     });
+    if (
+      evaluation.result.kind === 'approve' &&
+      evaluation.policyName === 'auto-mode-approve'
+    ) {
+      this.recordAutoApproval(context);
+    }
     return this.permissionPolicyResolutionToAuthorize(
       evaluation.result,
       context,
@@ -114,6 +129,7 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
           ? undefined
           : { executionMetadata: result.executionMetadata };
       case 'deny':
+        this.recordPolicyDenial(context);
         return {
           block: true,
           reason: this.formatDenyMessage(
@@ -129,33 +145,74 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
     }
   }
 
-  private async requestToolApproval(
+  private approvalContextOf(
     context: ResolvedToolExecutionHookContext,
-    result: Extract<PermissionPolicyResult, { kind: 'ask' }>,
-    policyName: string | undefined,
-  ): Promise<AuthorizeToolExecutionResult | undefined> {
+  ): PermissionApprovalRequestContext {
     const name = context.toolCall.name;
     const action = context.execution.description ?? `Approve ${name}`;
-    const display =
-      context.execution.display ??
+    const approvalData =
+      context.execution.toolData ??
       ({
         kind: 'generic',
         summary: action,
         detail: context.args,
       } as ToolInputDisplay);
-    const approvalRequest = {
+    return {
       sessionId: this.session.sessionId,
       agentId: this.scopeContext.agentId,
       turnId: context.turnId,
       toolCallId: context.toolCall.id,
       toolName: name,
       action,
-      display,
-    };
-    const approvalContext = {
-      ...approvalRequest,
+      approvalData,
       toolInput: context.args,
-    } satisfies PermissionApprovalRequestContext;
+    };
+  }
+
+  private recordPolicyDenial(context: ResolvedToolExecutionHookContext): void {
+    const approvalContext = this.approvalContextOf(context);
+    this.eventBus.publish({
+      type: 'permission.approval.resolved',
+      ...approvalContext,
+      decision: 'denied',
+      source: 'policy',
+    });
+    this.rulesService.recordApprovalResult({
+      turnId: context.turnId,
+      toolCallId: context.toolCall.id,
+      toolName: context.toolCall.name,
+      action: approvalContext.action,
+      source: 'policy',
+      result: { decision: 'denied' },
+    });
+  }
+
+  private recordAutoApproval(context: ResolvedToolExecutionHookContext): void {
+    const approvalContext = this.approvalContextOf(context);
+    this.eventBus.publish({
+      type: 'permission.approval.resolved',
+      ...approvalContext,
+      decision: 'approved',
+      source: 'auto',
+    });
+    this.rulesService.recordApprovalResult({
+      turnId: context.turnId,
+      toolCallId: context.toolCall.id,
+      toolName: context.toolCall.name,
+      action: approvalContext.action,
+      source: 'auto',
+      result: { decision: 'approved' },
+    });
+  }
+
+  private async requestToolApproval(
+    context: ResolvedToolExecutionHookContext,
+    result: Extract<PermissionPolicyResult, { kind: 'ask' }>,
+    policyName: string | undefined,
+  ): Promise<AuthorizeToolExecutionResult | undefined> {
+    const approvalContext = this.approvalContextOf(context);
+    const { toolInput: _toolInput, ...approvalRequest } = approvalContext;
+    const { toolName: name, action, approvalData } = approvalContext;
     const startedAt = Date.now();
 
     let response: ApprovalResponse;
@@ -177,7 +234,7 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
           tool_name: name,
           permission_mode: this.modeService.mode,
           result: 'error',
-          approval_surface: display.kind,
+          approval_surface: approvalData.kind,
           duration_ms: Date.now() - startedAt,
           session_cache_written: false,
           has_feedback: false,
@@ -205,6 +262,7 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
         type: 'permission.approval.resolved',
         ...approvalContext,
         ...response,
+        source: 'user',
       });
     }
     this.rulesService.recordApprovalResult({
@@ -213,6 +271,7 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
       toolName: name,
       action,
       sessionApprovalRule,
+      source: 'user',
       result: response,
     });
     this.telemetry.track2('permission_approval_result', {
@@ -223,7 +282,7 @@ export class AgentPermissionGate extends Disposable implements IAgentPermissionG
         response.decision === 'approved' && response.scope === 'session'
           ? 'approved_for_session'
           : response.decision,
-      approval_surface: display.kind,
+      approval_surface: approvalData.kind,
       duration_ms: Date.now() - startedAt,
       session_cache_written: sessionApprovalRule !== undefined,
       has_feedback: response.feedback !== undefined && response.feedback.length > 0,

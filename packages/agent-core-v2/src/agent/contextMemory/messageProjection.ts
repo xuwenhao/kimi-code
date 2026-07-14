@@ -68,11 +68,13 @@ function buildProtocolContent(msg: ContextMessage): MessageContent[] {
             tool_call_id: msg.toolCallId,
             output,
             is_error: true,
+            outcome: msg.outcome,
           }
         : {
             type: 'tool_result',
             tool_call_id: msg.toolCallId,
             output,
+            outcome: msg.outcome,
           };
     return [part];
   }
@@ -94,6 +96,7 @@ function buildProtocolContent(msg: ContextMessage): MessageContent[] {
         tool_call_id: call.id,
         tool_name: call.name,
         input: parsedInput,
+        tool_data: call.toolData,
       };
       base.push(part);
     }

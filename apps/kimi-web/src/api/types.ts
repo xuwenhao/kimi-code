@@ -11,6 +11,12 @@ export interface Page<T> {
   hasMore: boolean;
 }
 
+/** GET /messages result: a page plus the approval-results side map keyed by
+ *  toolCallId (absent on legacy servers). */
+export interface MessagesPage extends Page<AppMessage> {
+  approvalResults?: Record<string, AppApprovalResult>;
+}
+
 export interface PageRequest {
   beforeId?: string;
   afterId?: string;
@@ -146,15 +152,59 @@ export interface FsBrowseResult {
 
 export type AppMessageRole = 'user' | 'assistant' | 'tool' | 'system';
 
+/**
+ * How a tool call ended — the only structured field on the result side. Pure
+ * execution dimension: `not_run` covers every gate block (user rejection,
+ * policy deny, hook block); which one is told by the AppApprovalResult joined
+ * client-side. Absent on legacy (v1) backends — fall back to isError.
+ */
+export type ToolOutcome =
+  | 'completed'
+  | 'failed'
+  | 'not_run'
+  | 'invalid'
+  | 'skipped'
+  | 'cancelled'
+  | 'interrupted';
+
 export type AppMessageContent =
   | { type: 'text'; text: string }
-  | { type: 'toolUse'; toolCallId: string; toolName: string; input: unknown; outputLines?: string[] }
-  | { type: 'toolResult'; toolCallId: string; output: unknown; isError?: boolean }
+  | {
+      type: 'toolUse';
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+      outputLines?: string[];
+      /** ToolInputDisplay (plan_review / goal_start / task persist; the rest is
+       *  seeded live from tool.call.started). Web renders what it knows. */
+      toolData?: unknown;
+    }
+  | {
+      type: 'toolResult';
+      toolCallId: string;
+      output: unknown;
+      isError?: boolean;
+      outcome?: ToolOutcome;
+    }
   | { type: 'image'; source: ImageSource }
   | { type: 'video'; source: ImageSource }
   | { type: 'file'; fileId: string; name: string; mediaType: string; size: number }
   | { type: 'thinking'; thinking: string; signature?: string }
   | { type: 'unknown'; raw: unknown };
+
+/**
+ * A persisted approval decision — what the gate decided for a tool call,
+ * keyed by toolCallId on /messages, the snapshot, and approval.resolved
+ * broadcasts. Joined with the tool result's `not_run` outcome to tell a
+ * rejection from a policy deny from a hook block (no record = hook).
+ */
+export interface AppApprovalResult {
+  decision: 'approved' | 'rejected' | 'cancelled' | 'denied';
+  source: 'user' | 'policy' | 'auto';
+  scope?: string;
+  feedback?: string;
+  selectedLabel?: string;
+}
 
 export type ImageSource =
   | { kind: 'url'; url: string }
@@ -427,7 +477,20 @@ export type AppEvent =
   | { type: 'agentTurnEnded'; sessionId: string; agentId: string; reason?: string }
   | { type: 'toolOutput'; sessionId: string; toolCallId: string; outputChunk: string; stream: 'stdout' | 'stderr' }
   | { type: 'approvalRequested'; sessionId: string; approval: AppApprovalRequest }
-  | { type: 'approvalResolved'; sessionId: string; approvalId: string; decision: ApprovalDecision; resolvedAt: string }
+  | {
+      type: 'approvalResolved';
+      sessionId: string;
+      approvalId: string;
+      decision: AppApprovalResult['decision'];
+      resolvedAt: string;
+      /** Present on new servers — maintains the approval-results map
+       *  incrementally (legacy servers omit it). */
+      toolCallId?: string;
+      source?: AppApprovalResult['source'];
+      scope?: string;
+      feedback?: string;
+      selectedLabel?: string;
+    }
   | { type: 'approvalExpired'; sessionId: string; approvalId: string }
   | { type: 'questionRequested'; sessionId: string; question: AppQuestionRequest }
   | { type: 'questionAnswered'; sessionId: string; questionId: string; resolvedAt: string }
@@ -473,6 +536,9 @@ export interface AppInFlightToolCall {
   name: string;
   args?: unknown;
   description?: string;
+  /** ToolInputDisplay seeded from the snapshot — keeps a running plan-review
+   *  card's body across a reconnect. */
+  toolData?: unknown;
   lastProgress?: { kind: string; text?: string; percent?: number };
 }
 
@@ -496,6 +562,8 @@ export interface AppSessionSnapshot {
   session: AppSession;
   /** Most recent messages, chronological ascending. */
   messages: AppMessage[];
+  /** Approval decisions keyed by toolCallId ({} on legacy servers). */
+  approvalResults: Record<string, AppApprovalResult>;
   hasMoreMessages: boolean;
   inFlightTurn: AppInFlightTurn | null;
   /** Live subagent roster at the watermark — rebuilds swarm cards on refresh. */
@@ -671,7 +739,7 @@ export interface KimiWebApi {
   getSessionWarnings(sessionId: string): Promise<AppSessionWarning[]>;
   archiveSession(sessionId: string): Promise<{ archived: true }>;
   restoreSession(sessionId: string): Promise<AppSession>;
-  listMessages(sessionId: string, input?: PageRequest & { role?: AppMessageRole }): Promise<Page<AppMessage>>;
+  listMessages(sessionId: string, input?: PageRequest & { role?: AppMessageRole }): Promise<MessagesPage>;
   /** v2 initial sync: atomic session state + `asOfSeq` watermark + epoch. */
   getSessionSnapshot(sessionId: string): Promise<AppSessionSnapshot>;
   submitPrompt(sessionId: string, input: PromptSubmission): Promise<PromptSubmitResult>;

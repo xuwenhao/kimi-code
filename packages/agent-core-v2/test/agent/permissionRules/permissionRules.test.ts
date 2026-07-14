@@ -27,6 +27,7 @@ function sessionApproval(pattern: string): PermissionApprovalResultRecord {
     toolName: 'Bash',
     action: 'Bash(rm -rf /tmp/x)',
     sessionApprovalRule: pattern,
+    source: 'user',
     result: { decision: 'approved', scope: 'session' },
   };
 }
@@ -86,10 +87,38 @@ describe('AgentPermissionRulesService (wire-backed)', () => {
       toolCallId: 'call-2',
       toolName: 'Write',
       action: 'Write(/tmp/x)',
+      source: 'user',
       result: { decision: 'approved' },
     };
     svc.recordApprovalResult(oneTime);
     expect(svc.sessionApprovalRulePatterns).toEqual([]);
+  });
+
+  it('persists a policy denial without touching the pattern set', async () => {
+    const denial: PermissionApprovalResultRecord = {
+      turnId: 3,
+      toolCallId: 'call-3',
+      toolName: 'Bash',
+      action: 'Bash(rm -rf /)',
+      source: 'policy',
+      result: { decision: 'denied' },
+    };
+    svc.recordApprovalResult(denial);
+
+    expect(svc.sessionApprovalRulePatterns).toEqual([]);
+    const records = await readRecords();
+    expect(records).toEqual([
+      {
+        type: 'permission.record_approval_result',
+        turnId: 3,
+        toolCallId: 'call-3',
+        toolName: 'Bash',
+        action: 'Bash(rm -rf /)',
+        source: 'policy',
+        result: { decision: 'denied' },
+        time: expect.any(Number),
+      },
+    ]);
   });
 
   it('only persists approval records (permission.rules.add is live-only)', async () => {
@@ -105,6 +134,7 @@ describe('AgentPermissionRulesService (wire-backed)', () => {
         toolName: 'Bash',
         action: 'Bash(rm -rf /tmp/x)',
         sessionApprovalRule: 'Bash(rm *)',
+        source: 'user',
         result: { decision: 'approved', scope: 'session' },
         time: expect.any(Number),
       },

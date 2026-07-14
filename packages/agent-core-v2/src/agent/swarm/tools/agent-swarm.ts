@@ -116,7 +116,7 @@ export class AgentSwarmTool implements BuiltinTool<AgentSwarmToolInput> {
     return {
       accesses: ToolAccesses.all(),
       description: `Launching agent swarm: ${args.description}`,
-      display: {
+      toolData: {
         kind: 'agent_call',
         agent_name: `swarm (${agentCount} subagents)`,
         prompt: args.description,

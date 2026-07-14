@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { AppMessage, AppMessageContent } from '../src/api/types';
+import type { AppApprovalResult, AppMessage, AppMessageContent, ToolOutcome } from '../src/api/types';
 import { latestTodos } from '../src/composables/latestTodos';
 import { messagesToTurns } from '../src/composables/messagesToTurns';
 
@@ -333,6 +333,296 @@ describe('messagesToTurns', () => {
     );
 
     expect(turns[0]).toMatchObject({ role: 'user', text: 'a < b and c > d, no system tag here' });
+  });
+});
+
+describe('messagesToTurns ExitPlanMode plan cards', () => {
+  const PLAN_REVIEW_TOOL_DATA = {
+    kind: 'plan_review',
+    plan: '# Draft Plan\n- step one',
+    path: '/tmp/plan.md',
+  };
+
+  function exitPlanTurn(opts: {
+    toolData?: unknown;
+    outcome?: ToolOutcome;
+    isError?: boolean;
+    output?: string;
+    planReview?: { plan: string; path?: string };
+    approvalResult?: AppApprovalResult;
+  }) {
+    const turns = messagesToTurns(
+      [
+        message('a1', 'assistant', [
+          { type: 'toolUse', toolCallId: 'tool-p', toolName: 'ExitPlanMode', input: {}, toolData: opts.toolData },
+        ]),
+        message('t1', 'tool', [
+          {
+            type: 'toolResult',
+            toolCallId: 'tool-p',
+            output: opts.output ?? 'Plan rejected by user. Plan mode remains active.',
+            isError: opts.isError,
+            outcome: opts.outcome,
+          },
+        ]),
+      ],
+      [],
+      undefined,
+      false,
+      opts.planReview ? { 'tool-p': opts.planReview } : {},
+      opts.approvalResult ? { 'tool-p': opts.approvalResult } : {},
+    );
+    return turns[0]?.tools?.[0];
+  }
+
+  it('keeps a rejected plan visible from the persisted toolData after a reload-style pass', () => {
+    // No planReview seed — the body comes from the tool_use part's own
+    // plan_review toolData, which is what the daemon persists (the original
+    // bug: rejected plans vanished from history).
+    const tool = exitPlanTurn({
+      toolData: PLAN_REVIEW_TOOL_DATA,
+      outcome: 'not_run',
+      isError: true,
+      approvalResult: { decision: 'rejected', source: 'user' },
+    });
+
+    expect(tool).toMatchObject({
+      // Control-flow outcome: text badge, NO error icon (never ✓/✗ + 已拒绝).
+      status: 'ok',
+      statusBadge: 'rejected',
+      plan: {
+        status: 'rejected',
+        content: '# Draft Plan\n- step one',
+        path: '/tmp/plan.md',
+      },
+    });
+  });
+
+  it('shows 退回修改 (revise), not 已拒绝, when the rejection carries the Revise label', () => {
+    const tool = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Draft Plan' },
+      outcome: 'not_run',
+      approvalResult: {
+        decision: 'rejected',
+        source: 'user',
+        feedback: 'Add verification steps.',
+        selectedLabel: 'Revise',
+      },
+    });
+
+    expect(tool?.statusBadge).toBe('revise');
+    expect(tool?.plan).toMatchObject({
+      status: 'revise',
+      content: '# Draft Plan',
+      feedback: 'Add verification steps.',
+    });
+
+    // A rejection with feedback but WITHOUT the Revise label stays 已拒绝.
+    const plain = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Draft Plan' },
+      outcome: 'not_run',
+      approvalResult: { decision: 'rejected', source: 'user', feedback: 'No.' },
+    });
+    expect(plain?.plan).toMatchObject({ status: 'rejected', feedback: 'No.' });
+  });
+
+  it('shows the generic 未执行 badge for not_run without an approval record (hook blocked)', () => {
+    const tool = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Draft Plan' },
+      outcome: 'not_run',
+      isError: true,
+      output: 'ExitPlanMode was not run because a hook blocked it.',
+    });
+
+    expect(tool?.statusBadge).toBe('notRun');
+    expect(tool?.plan).toMatchObject({ status: 'not_run', content: '# Draft Plan' });
+    // The hook's block reason rides in the tool output, shown in the body.
+    expect(tool?.output).toEqual(['ExitPlanMode was not run because a hook blocked it.']);
+  });
+
+  it('maps a dismissed review (cancelled) and a policy deny to their badges', () => {
+    const cancelled = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Draft Plan' },
+      outcome: 'not_run',
+      approvalResult: { decision: 'cancelled', source: 'user' },
+    });
+    expect(cancelled?.plan).toMatchObject({ status: 'cancelled' });
+
+    const denied = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Draft Plan' },
+      outcome: 'not_run',
+      approvalResult: { decision: 'denied', source: 'policy' },
+    });
+    expect(denied?.plan).toMatchObject({ status: 'denied' });
+  });
+
+  it('renders an approved plan with the chosen option', () => {
+    const tool = exitPlanTurn({
+      toolData: PLAN_REVIEW_TOOL_DATA,
+      outcome: 'completed',
+      approvalResult: { decision: 'approved', source: 'user', selectedLabel: 'Approach B' },
+    });
+
+    expect(tool?.statusBadge).toBeUndefined();
+    expect(tool?.plan).toMatchObject({
+      status: 'approved',
+      content: '# Draft Plan\n- step one',
+      path: '/tmp/plan.md',
+      chosenOption: 'Approach B',
+    });
+  });
+
+  it('renders an auto-approved plan from the record source, and approved when there is no record', () => {
+    const auto = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Auto Plan' },
+      outcome: 'completed',
+      approvalResult: { decision: 'approved', source: 'auto' },
+    });
+    expect(auto?.plan).toMatchObject({ status: 'auto_approved', content: '# Auto Plan' });
+
+    const noRecord = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Yolo Plan' },
+      outcome: 'completed',
+    });
+    expect(noRecord?.plan).toMatchObject({ status: 'approved', content: '# Yolo Plan' });
+  });
+
+  it('renders a status-only card when toolData is missing (old sessions)', () => {
+    const tool = exitPlanTurn({
+      outcome: 'not_run',
+      isError: true,
+      approvalResult: { decision: 'rejected', source: 'user' },
+    });
+
+    expect(tool?.plan?.status).toBe('rejected');
+    expect(tool?.plan?.content).toBeUndefined();
+  });
+
+  it('prefers the persisted toolData over the stale approval seed', () => {
+    const tool = exitPlanTurn({
+      toolData: { kind: 'plan_review', plan: '# Persisted Plan' },
+      outcome: 'completed',
+      planReview: { plan: '# Stale Seed' },
+    });
+
+    expect(tool?.plan).toMatchObject({ status: 'approved', content: '# Persisted Plan' });
+  });
+
+  it('ignores non-plan_review toolData kinds', () => {
+    const tool = exitPlanTurn({
+      toolData: { kind: 'command', command: 'ls' },
+      outcome: 'completed',
+    });
+
+    expect(tool?.plan?.status).toBe('approved');
+    expect(tool?.plan?.content).toBeUndefined();
+  });
+
+  it('seeds a pending plan card from the preserved plan_review display', () => {
+    const turns = messagesToTurns(
+      [
+        message('a1', 'assistant', [
+          { type: 'toolUse', toolCallId: 'tool-p', toolName: 'ExitPlanMode', input: {} },
+        ]),
+      ],
+      [],
+      undefined,
+      true,
+      { 'tool-p': { plan: '# Pending Plan', path: '/tmp/plan.md' } },
+    );
+
+    expect(turns[0]?.tools?.[0]?.plan).toMatchObject({
+      status: 'pending',
+      content: '# Pending Plan',
+      path: '/tmp/plan.md',
+    });
+  });
+
+  it('keeps the seeded pending plan on a legacy result (no outcome) and falls back to isError', () => {
+    const tool = exitPlanTurn({
+      isError: true,
+      planReview: { plan: '# Preserved Plan', path: '/tmp/plan.md' },
+    });
+
+    // Legacy backend / old data: no outcome ⇒ current isError-based behavior,
+    // no badge, pending card kept. No `## Rejected Plan:` text parsing.
+    expect(tool).toMatchObject({
+      status: 'error',
+      plan: { status: 'pending', content: '# Preserved Plan', path: '/tmp/plan.md' },
+    });
+    expect(tool?.statusBadge).toBeUndefined();
+  });
+});
+
+describe('messagesToTurns tool outcome status', () => {
+  function bashTurn(outcome?: ToolOutcome, isError?: boolean, approvalResult?: AppApprovalResult) {
+    const turns = messagesToTurns(
+      [
+        message('a1', 'assistant', [
+          { type: 'toolUse', toolCallId: 'tool-1', toolName: 'bash', input: { command: 'ls' } },
+        ]),
+        message('t1', 'tool', [
+          { type: 'toolResult', toolCallId: 'tool-1', output: '…', isError, outcome },
+        ]),
+      ],
+      [],
+      undefined,
+      false,
+      {},
+      approvalResult ? { 'tool-1': approvalResult } : {},
+    );
+    return turns[0]?.tools?.[0];
+  }
+
+  it('maps completed to ok and failed to error, without a badge', () => {
+    expect(bashTurn('completed', false)).toMatchObject({ status: 'ok', outcome: 'completed' });
+    expect(bashTurn('completed', false)?.statusBadge).toBeUndefined();
+    expect(bashTurn('failed', true)).toMatchObject({ status: 'error', outcome: 'failed' });
+    expect(bashTurn('failed', true)?.statusBadge).toBeUndefined();
+  });
+
+  it('maps not_run + rejected record to a rejected badge and NO ✓/✗ icon', () => {
+    const tool = bashTurn('not_run', true, { decision: 'rejected', source: 'user' });
+    expect(tool?.status).toBe('ok');
+    expect(tool?.statusBadge).toBe('rejected');
+  });
+
+  it('joins the revise label and the policy deny from the approval record', () => {
+    const revise = bashTurn('not_run', false, {
+      decision: 'rejected',
+      source: 'user',
+      selectedLabel: 'Revise',
+    });
+    expect(revise?.statusBadge).toBe('revise');
+
+    const denied = bashTurn('not_run', true, { decision: 'denied', source: 'policy' });
+    expect(denied?.statusBadge).toBe('denied');
+
+    const cancelled = bashTurn('not_run', false, { decision: 'cancelled', source: 'user' });
+    expect(cancelled?.statusBadge).toBe('cancelled');
+  });
+
+  it('maps not_run without a record to the generic not-run badge (hook blocked)', () => {
+    const tool = bashTurn('not_run', true);
+    expect(tool?.status).toBe('ok');
+    expect(tool?.statusBadge).toBe('notRun');
+  });
+
+  it('maps invalid / skipped / cancelled / interrupted to their badges', () => {
+    expect(bashTurn('invalid', true)?.statusBadge).toBe('invalid');
+    expect(bashTurn('skipped', false)?.statusBadge).toBe('skipped');
+    expect(bashTurn('cancelled', true)?.statusBadge).toBe('cancelled');
+    expect(bashTurn('interrupted', false)?.statusBadge).toBe('interrupted');
+    // None of them are execution failures — no error icon.
+    expect(bashTurn('invalid', true)?.status).toBe('ok');
+    expect(bashTurn('interrupted', false)?.status).toBe('ok');
+  });
+
+  it('falls back to isError when the result has no outcome (legacy backend)', () => {
+    const legacy = bashTurn(undefined, true);
+    expect(legacy?.status).toBe('error');
+    expect(legacy?.statusBadge).toBeUndefined();
+    expect(bashTurn(undefined, false)?.status).toBe('ok');
   });
 });
 

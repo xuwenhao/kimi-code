@@ -16,7 +16,7 @@ export class GoalStartReviewAskPermissionPolicyService implements PermissionPoli
   evaluate(context: ResolvedToolExecutionHookContext): PermissionPolicyResult | undefined {
     if (context.toolCall.name !== 'CreateGoal') return undefined;
     if (this.modeService.mode === 'auto') return undefined;
-    if (context.execution.display?.kind !== 'goal_start') return undefined;
+    if (context.execution.toolData?.kind !== 'goal_start') return undefined;
     return {
       kind: 'ask',
       resolveApproval: (result) => {

@@ -228,7 +228,7 @@ export class ReadMediaFileTool implements BuiltinTool<ReadMediaFileInput> {
     return {
       accesses: ToolAccesses.readFile(path),
       description: `Reading media: ${args.path}`,
-      display: { kind: 'file_io', operation: 'read', path },
+      toolData: { kind: 'file_io', operation: 'read', path },
       approvalRule: literalRulePattern(this.name, path),
       matchesRule: (ruleArgs) =>
         matchesPathRuleSubject(ruleArgs, path, {

@@ -1,5 +1,5 @@
 // apps/kimi-web/src/types.ts
-import type { AppSessionStatus } from './api/types';
+import type { AppSessionStatus, ToolOutcome } from './api/types';
 
 /** Real session lifecycle status (5 states), surfaced verbatim to the UI so the
     list can distinguish awaiting / aborted instead of collapsing to running|idle. */
@@ -89,18 +89,70 @@ export type WorkspaceScope = 'current' | 'all';
 
 export type ToolStatus = 'ok' | 'running' | 'error';
 
+/**
+ * Control-flow status badge derived in messagesToTurns from the tool result's
+ * `outcome` joined with the approval record (the 判定链). When present, the
+ * tool row renders this TEXT badge INSTEAD of the ✓/✗ icon — a rejected call
+ * never shows a checkmark next to its 已拒绝 badge.
+ */
+export type ToolStatusBadge =
+  | 'rejected' // user rejected (approval record: rejected, no Revise label)
+  | 'revise' // user sent the plan back for changes (rejected + label "Revise")
+  | 'cancelled' // approval dismissed / execution aborted
+  | 'denied' // policy denied (approval record: denied / source policy)
+  | 'notRun' // gate blocked with NO approval record — a hook; reason in output
+  | 'invalid' // the call itself was illegal (unknown tool / bad args)
+  | 'skipped' // batch skipped after an earlier call stopped the turn
+  | 'interrupted'; // result was never recorded (resume)
+
 export interface ToolCall {
   id: string;
   name: string; // e.g. 'read' | 'bash'
   arg: string; // e.g. '· src/api/client.ts'
   status: ToolStatus;
+  /** Structured execution outcome from the tool result (absent on legacy
+   *  backends — `status` then falls back to isError-based rendering). */
+  outcome?: ToolOutcome;
+  /** Text badge replacing the status icon for control-flow outcomes (see
+   *  ToolStatusBadge). Undefined ⇒ render the icon from `status` as before. */
+  statusBadge?: ToolStatusBadge;
   timing?: string; // e.g. '12ms'
   output?: string[]; // shown line by line when expanded
   media?: ToolMedia;
   defaultExpanded?: boolean;
-  /** Absolute path of the plan file (ExitPlanMode only) — rendered as a
-   *  clickable link that opens the plan in the file preview. */
-  planPath?: string;
+  /** ExitPlanMode only: the plan under review and how it resolved. The body +
+   *  path come from the PAIRED tool_use part's persisted `toolData`
+   *  (plan_review), so approved AND rejected plans survive a page reload;
+   *  while the review is pending the card is seeded from the preserved
+   *  plan_review approval display. */
+  plan?: ToolPlan;
+}
+
+export interface ToolPlan {
+  /** 'pending' = review in flight (or unknown / legacy); the rest come from
+   *  the tool result's `outcome` joined with the approval record:
+   *  completed ⇒ approved / auto_approved (record source 'auto');
+   *  not_run ⇒ rejected / revise (label "Revise") / cancelled / denied, or
+   *  'not_run' when there is no approval record (hook blocked). */
+  status:
+    | 'pending'
+    | 'approved'
+    | 'auto_approved'
+    | 'rejected'
+    | 'revise'
+    | 'cancelled'
+    | 'denied'
+    | 'not_run';
+  /** Plan body — from the persisted plan_review `toolData` on the paired
+   *  tool_use part, or the preserved plan_review approval display while the
+   *  review is pending. */
+  content?: string;
+  /** Absolute path of the plan file — rendered as a clickable link. */
+  path?: string;
+  /** User feedback attached to a rejection / revise. */
+  feedback?: string;
+  /** The option label the user picked when approving a multi-option plan. */
+  chosenOption?: string;
 }
 
 export interface ToolMedia {

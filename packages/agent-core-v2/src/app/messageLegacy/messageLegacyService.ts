@@ -21,7 +21,7 @@
  * (`packages/agent-core/src/services/message/messageService.ts`).
  */
 
-import type { Message, PageResponse } from '@moonshot-ai/protocol';
+import type { ApprovalResult, Message, PageResponse } from '@moonshot-ai/protocol';
 
 import { InstantiationType } from '#/_base/di/extensions';
 import { type IAgentScopeHandle, LifecycleScope, registerScopedService } from '#/_base/di/scope';
@@ -53,8 +53,11 @@ export class MessageLegacyService implements IMessageLegacyService {
     @ISessionIndex private readonly index: ISessionIndex,
   ) {}
 
-  async list(sessionId: string, query: MessageListQuery): Promise<PageResponse<Message>> {
-    const all = await this.loadMessages(sessionId);
+  async list(
+    sessionId: string,
+    query: MessageListQuery,
+  ): Promise<PageResponse<Message> & { approval_results?: Record<string, ApprovalResult> }> {
+    const { messages: all, records } = await this.loadMessages(sessionId);
     const desc = [...all].reverse();
 
     let pivotIndex = -1;
@@ -80,11 +83,13 @@ export class MessageLegacyService implements IMessageLegacyService {
 
     const filtered = query.role !== undefined ? page.filter((m) => m.role === query.role) : page;
 
-    return { items: filtered, has_more: hasMore };
+    // The full session's approval decisions ride alongside the (paginated) page;
+    // cardinality is small and clients join them by tool_call_id (see §4).
+    return { items: filtered, has_more: hasMore, approval_results: collectApprovalResults(records) };
   }
 
   async get(sessionId: string, messageId: string): Promise<Message> {
-    const all = await this.loadMessages(sessionId);
+    const { messages: all } = await this.loadMessages(sessionId);
     const entry = all.find((m) => m.id === messageId);
     if (entry === undefined) {
       throw new Error2(
@@ -95,28 +100,34 @@ export class MessageLegacyService implements IMessageLegacyService {
     return entry;
   }
 
-  private async loadMessages(sessionId: string): Promise<Message[]> {
+  private async loadMessages(
+    sessionId: string,
+  ): Promise<{ messages: Message[]; records: readonly PersistedRecord[] }> {
     const summary = await this.index.get(sessionId);
     if (summary === undefined) {
       throw new Error2(ErrorCodes.SESSION_NOT_FOUND, `session ${sessionId} does not exist`);
     }
 
     const session = await this.lifecycle.resume(sessionId);
-    if (session === undefined) return [];
+    if (session === undefined) return { messages: [], records: [] };
     const agent = await ensureMainAgent(session);
 
-    const transcript = this.readTranscript(agent);
+    const records = agent
+      .accessor.get(IAgentWireRecordService)
+      .getRecords() as readonly PersistedRecord[];
+    const transcript = reduceContextTranscript(records);
     const contextMessages = agent.accessor.get(IAgentContextMemoryService).get();
     const merged = mergeLiveTail(transcript, contextMessages);
     const entries = await this.rehydrate(agent, merged.messages);
 
     let previousMs = Number.NEGATIVE_INFINITY;
-    return entries.map((msg, index) => {
+    const messages = entries.map((msg, index) => {
       const baseMs = merged.times[index] ?? summary.createdAt + index;
       const createdAtMs = Math.max(previousMs + 1, baseMs);
       previousMs = createdAtMs;
       return toProtocolMessage(sessionId, index, msg, summary.createdAt, createdAtMs);
     });
+    return { messages, records };
   }
 
   /**
@@ -142,13 +153,46 @@ export class MessageLegacyService implements IMessageLegacyService {
     }
     return changed ? out : messages;
   }
+}
 
-  private readTranscript(agent: IAgentScopeHandle): ContextTranscript {
-    const records = agent
-      .accessor.get(IAgentWireRecordService)
-      .getRecords() as readonly PersistedRecord[];
-    return reduceContextTranscript(records);
+/**
+ * Project persisted `permission.record_approval_result` records into the REST
+ * `approval_results` side map, keyed by `toolCallId`. The persisted record
+ * stores the response camelCase (`selectedLabel`); the REST shape is snake_case
+ * (`selected_label`). Later records for the same call win (a re-prompted tool
+ * call records a fresh decision). Shared by `MessageLegacyService.list` and the
+ * server snapshot paths so both read the same projection off the record journal.
+ * Accepts any wire-record shape (the live journal's `PersistedRecord`, the
+ * restored `PersistedWireRecord`, or the snapshot reader's parsed lines).
+ */
+export function collectApprovalResults(
+  records: readonly { readonly type: string }[],
+): Record<string, ApprovalResult> {
+  const out: Record<string, ApprovalResult> = {};
+  for (const record of records) {
+    if (record.type !== 'permission.record_approval_result') continue;
+    // Read loosely: the declared record type aliases the wire `ApprovalResponse`
+    // (snake_case `selected_label`), but the persisted response is the engine's
+    // camelCase shape (`selectedLabel`) — see the docstring.
+    const { toolCallId, source, result } = record as unknown as {
+      toolCallId: string;
+      source: ApprovalResult['source'];
+      result: {
+        decision: ApprovalResult['decision'];
+        scope?: ApprovalResult['scope'];
+        feedback?: string;
+        selectedLabel?: string;
+      };
+    };
+    out[toolCallId] = {
+      decision: result.decision,
+      source,
+      scope: result.scope,
+      feedback: result.feedback,
+      selected_label: result.selectedLabel,
+    };
   }
+  return out;
 }
 
 function mergeLiveTail(

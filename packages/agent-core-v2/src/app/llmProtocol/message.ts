@@ -1,3 +1,5 @@
+import type { ToolInputDisplay } from '@moonshot-ai/protocol';
+
 import type { Tool } from './tool';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
@@ -36,6 +38,10 @@ export interface ToolCall {
   name: string;
   arguments: string | null;
   extras?: Record<string, unknown>;
+  /** Client-only structured rendering payload folded from the persisted
+   *  `tool.call` record (whitelisted kinds only, e.g. `plan_review`). Never
+   *  serialized into provider payloads — unlike `extras`, which is. */
+  toolData?: ToolInputDisplay;
   _streamIndex?: number | string;
 }
 

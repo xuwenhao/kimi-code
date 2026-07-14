@@ -13,6 +13,7 @@ import {
   IEventBus,
   IAgentLifecycleService,
   IAgentPromptService,
+  IAgentWireRecordService,
   ILogService,
   ISessionActivity,
   ISessionInteractionService,
@@ -50,6 +51,7 @@ describe('server-v2 snapshot route enrichment', () => {
     const main = {
       accessor: fakeAccessor([
         [IAgentContextMemoryService, { get: () => [] }],
+        [IAgentWireRecordService, { getRecords: () => [] }],
         [
           IAgentPromptService,
           { list: () => ({ active: { id: promptId }, pending: [] }) },

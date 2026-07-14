@@ -53,6 +53,17 @@ export default {
     error: 'failed',
     done: 'done',
   },
+  status: {
+    rejected: 'Rejected',
+    revise: 'Changes requested',
+    cancelled: 'Cancelled',
+    denied: 'Blocked by policy',
+    notRun: 'Not run',
+    invalid: 'Invalid call',
+    skipped: 'Skipped',
+    interrupted: 'Interrupted',
+    failed: 'Failed',
+  },
   ask: {
     dismissed: 'Dismissed',
     answer: '{count} answer',

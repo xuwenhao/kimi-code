@@ -1,9 +1,28 @@
 import { z } from 'zod';
 
+import { ToolInputDisplaySchema } from './display';
 import { isoDateTimeSchema } from './time';
 
 export const messageRoleSchema = z.enum(['user', 'assistant', 'tool', 'system']);
 export type MessageRole = z.infer<typeof messageRoleSchema>;
+
+/**
+ * Execution outcome of a tool call — the only structured field on the result
+ * side. Orthogonal to `is_error` (e.g. a revised plan exit is `not_run` but
+ * `is_error: false` so the turn continues). `not_run` means a gate stopped
+ * the call before execution; pair it with the `approval_results` map to tell
+ * user rejections from policy denials and hook blocks.
+ */
+export const toolOutcomeSchema = z.enum([
+  'completed',
+  'failed',
+  'not_run',
+  'invalid',
+  'skipped',
+  'cancelled',
+  'interrupted',
+]);
+export type ToolOutcome = z.infer<typeof toolOutcomeSchema>;
 
 export const textContentSchema = z.object({
   type: z.literal('text'),
@@ -16,6 +35,10 @@ export const toolUseContentSchema = z.object({
   tool_call_id: z.string().min(1),
   tool_name: z.string().min(1),
   input: z.unknown(),
+  // Structured client-only rendering payload carried over from
+  // `tool.call.started` (`toolData`). Only whitelisted kinds that cannot be
+  // rebuilt from `input` are persisted (e.g. `plan_review` — the plan body).
+  tool_data: ToolInputDisplaySchema.optional(),
 });
 export type ToolUseContent = z.infer<typeof toolUseContentSchema>;
 
@@ -24,6 +47,7 @@ export const toolResultContentSchema = z.object({
   tool_call_id: z.string().min(1),
   output: z.unknown(),
   is_error: z.boolean().optional(),
+  outcome: toolOutcomeSchema.optional(),
 });
 export type ToolResultContent = z.infer<typeof toolResultContentSchema>;
 

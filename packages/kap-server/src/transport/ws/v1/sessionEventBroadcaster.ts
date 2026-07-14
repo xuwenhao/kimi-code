@@ -31,13 +31,13 @@
 
 import type {
   AgentActivitySnapshot,
+  ApprovalRequest,
   ApprovalResponse,
   DomainEvent,
   GlobalEvent,
   IAgentScopeHandle,
   IDisposable,
   Interaction,
-  InteractionKind,
   ISessionActivity,
   ISessionScopeHandle,
   Scope,
@@ -124,8 +124,8 @@ interface SessionState {
   /** agentId → sink subscription. */
   readonly agentDisposables: Map<string, IDisposable>;
   readonly lifecycleDisposables: IDisposable[];
-  /** Interactions already announced (or pre-existing at activation): id → kind. */
-  readonly knownInteractions: Map<string, InteractionKind>;
+  /** Interactions already announced (or pre-existing at activation): id → interaction. */
+  readonly knownInteractions: Map<string, Interaction>;
 }
 
 export const DEFAULT_MAX_BUFFER_SIZE = 1000;
@@ -534,6 +534,19 @@ export class SessionEventBroadcaster {
       return;
     }
 
+    // Map the v2 `permission.approval.resolved` domain event onto the v1
+    // `event.approval.resolved` wire shape so policy denials and auto-approvals
+    // (which never create a pending interaction) are visible live. User
+    // decisions (source 'user') are already broadcast by the interaction kernel
+    // (`interactionResolvedEvent`); the raw domain event is never forwarded.
+    if (event.type === 'permission.approval.resolved') {
+      const resolved = approvalResolvedDomainEvent(event, sessionId);
+      if (resolved !== undefined) {
+        this.enqueueDurable(state, resolved);
+      }
+      return;
+    }
+
     // The migrated agent events are AgentEvent-shaped by construction (they were
     // ported from the former `record.signal(agentEvent)` call sites); the declared
     // `DomainEventMap` payload types are deliberately wider than the protocol
@@ -586,13 +599,13 @@ export class SessionEventBroadcaster {
     // by the snapshot route (`pending_questions` / `pending_approvals`), and
     // lastStatus was initialized from the same live activity state.
     for (const i of interactions.listPending()) {
-      state.knownInteractions.set(i.id, i.kind);
+      state.knownInteractions.set(i.id, i);
     }
     state.lifecycleDisposables.push(
       interactions.onDidChangePending(() => {
         for (const i of interactions.listPending()) {
           if (state.knownInteractions.has(i.id)) continue;
-          state.knownInteractions.set(i.id, i.kind);
+          state.knownInteractions.set(i.id, i);
           const event = interactionRequestedEvent(i, sessionId);
           if (event !== undefined) {
             this.enqueueDurable(state, event);
@@ -601,10 +614,10 @@ export class SessionEventBroadcaster {
         }
       }),
       interactions.onDidResolve(({ id, response }) => {
-        const kind = state.knownInteractions.get(id);
-        if (kind === undefined) return;
+        const interaction = state.knownInteractions.get(id);
+        if (interaction === undefined) return;
         state.knownInteractions.delete(id);
-        const event = interactionResolvedEvent(kind, id, response, sessionId);
+        const event = interactionResolvedEvent(interaction, response, sessionId);
         if (event !== undefined) {
           this.enqueueDurable(state, event);
           this.enqueueStatusChanged(state, state.activity!.status());
@@ -817,13 +830,13 @@ function interactionRequestedEvent(interaction: Interaction, sessionId: string):
 }
 
 function interactionResolvedEvent(
-  kind: InteractionKind,
-  id: string,
+  interaction: Interaction,
   response: unknown,
   sessionId: string,
 ): Event | undefined {
   const resolvedAt = new Date().toISOString();
-  switch (kind) {
+  const id = interaction.id;
+  switch (interaction.kind) {
     case 'question': {
       // `null` marks a dismissal (see `ISessionQuestionService.dismiss`).
       if (response === null) {
@@ -848,12 +861,19 @@ function interactionResolvedEvent(
     }
     case 'approval': {
       const r = response as Partial<ApprovalResponse>;
+      // The interaction payload carries the real toolCallId (the permission gate
+      // always sets it). On the ask path the approval id already equals it, but
+      // read it from the payload so synthetic enqueues stay correct too.
+      const toolCallId = (interaction.payload as Partial<ApprovalRequest>).toolCallId ?? id;
       return {
         type: 'event.approval.resolved',
-        agentId: 'main',
+        agentId: interaction.origin.agentId ?? 'main',
         sessionId,
         approval_id: id,
+        tool_call_id: toolCallId,
         decision: r.decision,
+        // Interaction-kernel resolutions always come from a prompted user.
+        source: 'user',
         scope: r.scope,
         feedback: r.feedback,
         selected_label: r.selectedLabel,
@@ -863,6 +883,42 @@ function interactionResolvedEvent(
     default:
       return undefined;
   }
+}
+
+/**
+ * Project a v2 `permission.approval.resolved` domain event onto the v1
+ * `event.approval.resolved` wire shape. Only policy denials and auto-approvals
+ * produce a wire event here: user decisions are broadcast by the interaction
+ * kernel, and `decision: 'error'` marks a transport failure (no decision made,
+ * hence no `source`). The domain event carries no separate approval id — the
+ * `toolCallId` is the natural key (it is also the approval id on the ask path).
+ */
+function approvalResolvedDomainEvent(event: DomainEvent, sessionId: string): Event | undefined {
+  const p = event as {
+    source?: unknown;
+    decision?: unknown;
+    scope?: unknown;
+    feedback?: unknown;
+    selectedLabel?: unknown;
+    toolCallId?: unknown;
+    agentId?: unknown;
+  };
+  if (p.source !== 'policy' && p.source !== 'auto') return undefined;
+  const toolCallId = typeof p.toolCallId === 'string' ? p.toolCallId : undefined;
+  if (toolCallId === undefined) return undefined;
+  return {
+    type: 'event.approval.resolved',
+    agentId: typeof p.agentId === 'string' ? p.agentId : 'main',
+    sessionId,
+    approval_id: toolCallId,
+    tool_call_id: toolCallId,
+    decision: p.decision,
+    source: p.source,
+    scope: p.scope,
+    feedback: p.feedback,
+    selected_label: p.selectedLabel,
+    resolved_at: new Date().toISOString(),
+  } as unknown as Event;
 }
 
 function modelCatalogChangedPayload(

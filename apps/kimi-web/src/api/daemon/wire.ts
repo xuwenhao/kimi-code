@@ -184,14 +184,63 @@ export interface WireFsHomeResult {
 // Message
 // ---------------------------------------------------------------------------
 
+/**
+ * How a tool call ended — the only structured field on the result side
+ * (re-declared from the daemon's protocol; web does not depend on the protocol
+ * package). Pure execution dimension: `not_run` covers every gate block
+ * (user rejection, policy deny, hook block); which one is told by the approval
+ * record joined client-side. Absent on legacy (v1) backends.
+ */
+export type WireToolOutcome =
+  | 'completed'
+  | 'failed'
+  | 'not_run'
+  | 'invalid'
+  | 'skipped'
+  | 'cancelled'
+  | 'interrupted';
+
 export type WireMessageContent =
   | { type: 'text'; text: string }
-  | { type: 'tool_use'; tool_call_id: string; tool_name: string; input: unknown }
-  | { type: 'tool_result'; tool_call_id: string; output: unknown; is_error?: boolean }
+  | {
+      type: 'tool_use';
+      tool_call_id: string;
+      tool_name: string;
+      input: unknown;
+      /** ToolInputDisplay — persisted only for whitelisted kinds
+       *  (plan_review / goal_start / task); absent elsewhere and on legacy
+       *  backends. */
+      tool_data?: unknown;
+    }
+  | {
+      type: 'tool_result';
+      tool_call_id: string;
+      output: unknown;
+      is_error?: boolean;
+      outcome?: WireToolOutcome;
+    }
   | { type: 'image'; source: WireImageSource }
   | { type: 'video'; source: WireImageSource }
   | { type: 'file'; file_id: string; name: string; media_type: string; size: number }
   | { type: 'thinking'; thinking: string; signature?: string };
+
+/**
+ * A persisted approval decision, exposed as a side map keyed by tool_call_id
+ * on GET /messages and the session snapshot (always present on new servers,
+ * possibly {}; absent on legacy backends).
+ */
+export interface WireApprovalResult {
+  decision: 'approved' | 'rejected' | 'cancelled' | 'denied';
+  source: 'user' | 'policy' | 'auto';
+  scope?: string;
+  feedback?: string;
+  selected_label?: string;
+}
+
+/** GET /sessions/{id}/messages — a page plus the approval-results side map. */
+export interface WireMessagesPage extends WirePage<WireMessage> {
+  approval_results?: Record<string, WireApprovalResult>;
+}
 
 export type WireImageSource =
   | { kind: 'url'; url: string }
@@ -249,11 +298,8 @@ export interface WireApprovalRequest {
   tool_call_id: string;
   tool_name: string;
   action: string;
-  /** ToolInputDisplay — 12 discriminated kinds; client falls back to generic.
-      The daemon protocol field is `tool_input_display` (protocol/approval.ts);
-      `display` is the stub daemon's older shape, kept for compatibility. */
-  tool_input_display?: unknown;
-  display?: unknown;
+  /** ToolInputDisplay — 12 discriminated kinds; client falls back to generic. */
+  approval_data?: unknown;
   expires_at: string;
   created_at: string;
 }
@@ -565,7 +611,8 @@ export interface WireInFlightToolCall {
   name: string;
   args?: unknown;
   description?: string;
-  display?: unknown;
+  /** ToolInputDisplay for the running card (`toolData` on the wire). */
+  toolData?: unknown;
   last_progress?: {
     kind: 'stdout' | 'stderr' | 'progress' | 'status' | 'custom';
     text?: string;
@@ -587,6 +634,9 @@ export interface WireSessionSnapshot {
   epoch: string;
   session: WireSession;
   messages: { items: WireMessage[]; has_more: boolean };
+  /** Approval decisions keyed by tool_call_id — hydrates the client's
+   *  outcome × approval-record join (absent on legacy servers). */
+  approval_results?: Record<string, WireApprovalResult>;
   in_flight_turn: WireInFlightTurn | null;
   /** Live subagent roster at the watermark (absent on older servers). */
   subagents?: WireTask[];
@@ -761,7 +811,11 @@ type WireEventToolCompleted = WireEventBase<'event.tool.completed', {
 type WireEventApprovalRequested = WireEventBase<'event.approval.requested', WireApprovalRequest>;
 type WireEventApprovalResolved = WireEventBase<'event.approval.resolved', {
   approval_id: string;
-  decision: 'approved' | 'rejected' | 'cancelled';
+  /** Present on new servers — lets the client maintain its approval-results
+   *  map incrementally (legacy servers omit it and the map stays empty). */
+  tool_call_id?: string;
+  decision: 'approved' | 'rejected' | 'cancelled' | 'denied';
+  source?: 'user' | 'policy' | 'auto';
   scope?: 'session';
   feedback?: string;
   selected_label?: string;

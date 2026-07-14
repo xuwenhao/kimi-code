@@ -416,7 +416,7 @@ describe('IExternalHooksRunnerService integration', () => {
         toolName: 'Bash',
         action: 'Run command',
         toolInput: { command: 'pwd' },
-        display: { kind: 'command' as const, command: 'pwd' },
+        approvalData: { kind: 'command' as const, command: 'pwd' },
       };
       eventBus.publish({
         type: 'permission.approval.requested',
@@ -427,6 +427,7 @@ describe('IExternalHooksRunnerService integration', () => {
         ...requestContext,
         decision: 'approved',
         selectedLabel: 'Approve once',
+        source: 'user',
       });
       await flushMicrotasks();
 
@@ -443,6 +444,7 @@ describe('IExternalHooksRunnerService integration', () => {
             ...requestContext,
             decision: 'approved',
             selectedLabel: 'Approve once',
+            source: 'user',
           },
         },
       ]);

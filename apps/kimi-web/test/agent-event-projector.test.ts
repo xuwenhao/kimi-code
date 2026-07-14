@@ -296,3 +296,117 @@ describe('step-boundary delta alignment', () => {
     );
   });
 });
+
+describe('tool.result projection', () => {
+  it('attaches the structured outcome to the toolResult message part', () => {
+    const projector = createAgentProjector();
+    const events = projector.project(
+      'tool.result',
+      {
+        turnId: 1,
+        toolCallId: 'call_plan',
+        output: 'Plan rejected by user. Plan mode remains active.',
+        isError: true,
+        outcome: 'not_run',
+      },
+      's1',
+    );
+
+    const created = events.find((e) => e.type === 'messageCreated');
+    expect(created).toBeDefined();
+    const part = created!.type === 'messageCreated' ? created!.message.content[0] : undefined;
+    expect(part).toMatchObject({
+      type: 'toolResult',
+      toolCallId: 'call_plan',
+      isError: true,
+      outcome: 'not_run',
+    });
+  });
+
+  it('drops an unknown outcome value instead of trusting it', () => {
+    const projector = createAgentProjector();
+    const events = projector.project(
+      'tool.result',
+      { turnId: 1, toolCallId: 'call_read', output: 'x', outcome: 'bogus' },
+      's1',
+    );
+
+    const created = events.find((e) => e.type === 'messageCreated');
+    const part = created!.type === 'messageCreated' ? created!.message.content[0] : undefined;
+    expect(part!.type === 'toolResult' ? part!.outcome : 'n/a').toBeUndefined();
+  });
+
+  it('leaves the outcome undefined when the result event carries none (legacy)', () => {
+    const projector = createAgentProjector();
+    const events = projector.project(
+      'tool.result',
+      { turnId: 1, toolCallId: 'call_read', output: 'file text' },
+      's1',
+    );
+
+    const created = events.find((e) => e.type === 'messageCreated');
+    const part = created!.type === 'messageCreated' ? created!.message.content[0] : undefined;
+    expect(part).toMatchObject({ type: 'toolResult', toolCallId: 'call_read' });
+    expect(part!.type === 'toolResult' ? part!.outcome : 'n/a').toBeUndefined();
+  });
+});
+
+describe('tool.call.started toolData', () => {
+  function startStepWithTool(
+    projector: ReturnType<typeof createAgentProjector>,
+    toolPayload: Record<string, unknown>,
+  ) {
+    projector.project('turn.started', { turnId: 1 }, 's1');
+    projector.project('turn.step.started', { turnId: 1 }, 's1');
+    return projector.project(
+      'tool.call.started',
+      { turnId: 1, toolCallId: 'call_plan', name: 'ExitPlanMode', args: {}, ...toolPayload },
+      's1',
+    );
+  }
+
+  function seededToolUse(events: ReturnType<ReturnType<typeof createAgentProjector>['project']>) {
+    const updated = events.find((e) => e.type === 'messageUpdated');
+    const content = updated!.type === 'messageUpdated' ? updated!.content : [];
+    return content.find((c) => c.type === 'toolUse');
+  }
+
+  it('seeds the toolUse part from the toolData field', () => {
+    const projector = createAgentProjector();
+    const events = startStepWithTool(projector, {
+      toolData: { kind: 'plan_review', plan: '# Draft Plan', path: '/tmp/plan.md' },
+    });
+
+    expect(seededToolUse(events)).toMatchObject({
+      type: 'toolUse',
+      toolCallId: 'call_plan',
+      toolData: { kind: 'plan_review', plan: '# Draft Plan', path: '/tmp/plan.md' },
+    });
+  });
+
+  it('seeds toolData from the snapshot in-flight turn', () => {
+    const projector = createAgentProjector();
+    const seeded = projector.seedInFlight('s1', {
+      turnId: 7,
+      promptId: 'pr_1',
+      thinkingText: '',
+      assistantText: '',
+      runningTools: [
+        {
+          toolCallId: 'call_plan',
+          name: 'ExitPlanMode',
+          args: {},
+          toolData: { kind: 'plan_review', plan: '# In-flight Plan' },
+        },
+      ],
+    });
+
+    const created = seeded.find((e) => e.type === 'messageCreated');
+    const content = created!.type === 'messageCreated' ? created!.message.content : [];
+    expect(content[0]).toMatchObject({
+      type: 'toolUse',
+      toolCallId: 'call_plan',
+      toolData: { kind: 'plan_review', plan: '# In-flight Plan' },
+    });
+  });
+});

@@ -10,6 +10,7 @@
 
 import type {
   AppApprovalRequest,
+  AppApprovalResult,
   AppConfig,
   AppEvent,
   AppGoal,
@@ -58,6 +59,12 @@ export interface KimiClientState {
    *  approval resolution so the ExitPlanMode tool card can keep rendering the
    *  plan (approved / rejected / revised) instead of losing it. */
   planReviewByToolCallId: Record<string, { plan: string; path?: string }>;
+  /** Approval decisions keyed by toolCallId — hydrated from the snapshot and
+   *  /messages side maps, then maintained incrementally by approval.resolved
+   *  broadcasts. Joined with a tool result's `not_run` outcome to tell a user
+   *  rejection from a policy deny from a hook block (no record = hook). Empty
+   *  on legacy servers, which fall back to isError-based rendering. */
+  approvalResultsByToolCallId: Record<string, AppApprovalResult>;
   questionsBySession: Record<string, AppQuestionRequest[]>;
   tasksBySession: Record<string, AppTask[]>;
   goalBySession: Record<string, AppGoal>;
@@ -78,6 +85,7 @@ export function createInitialState(): KimiClientState {
     messagesBySession: {},
     approvalsBySession: {},
     planReviewByToolCallId: {},
+    approvalResultsByToolCallId: {},
     questionsBySession: {},
     tasksBySession: {},
     goalBySession: {},
@@ -105,6 +113,7 @@ function cloneState(s: KimiClientState): KimiClientState {
     messagesBySession: { ...s.messagesBySession },
     approvalsBySession: { ...s.approvalsBySession },
     planReviewByToolCallId: { ...s.planReviewByToolCallId },
+    approvalResultsByToolCallId: { ...s.approvalResultsByToolCallId },
     questionsBySession: { ...s.questionsBySession },
     tasksBySession: { ...s.tasksBySession },
     goalBySession: { ...s.goalBySession },
@@ -522,7 +531,29 @@ export function reduceAppEvent(
     }
 
     // -------------------------------------------------------------------------
-    case 'approvalResolved':
+    case 'approvalResolved': {
+      const sid = event.sessionId;
+      const aid = event.approvalId;
+      const list = next.approvalsBySession[sid] ?? [];
+      next.approvalsBySession[sid] = list.filter((a) => a.approvalId !== aid);
+      // Maintain the approval-results map incrementally (new servers carry
+      // toolCallId + the full decision on the broadcast; legacy servers omit
+      // them and the map stays empty → isError fallback).
+      if (event.toolCallId) {
+        next.approvalResultsByToolCallId = {
+          ...next.approvalResultsByToolCallId,
+          [event.toolCallId]: {
+            decision: event.decision,
+            source: event.source ?? 'user',
+            scope: event.scope,
+            feedback: event.feedback,
+            selectedLabel: event.selectedLabel,
+          },
+        };
+      }
+      break;
+    }
+
     case 'approvalExpired': {
       const sid = event.sessionId;
       const aid = event.approvalId;

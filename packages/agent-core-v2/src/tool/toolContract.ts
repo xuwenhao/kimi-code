@@ -17,7 +17,7 @@
 
 import type { ContentPart, ToolCall } from '#/app/llmProtocol/message';
 import type { Tool } from '#/app/llmProtocol/tool';
-import type { ToolInputDisplay } from '@moonshot-ai/protocol';
+import type { ToolInputDisplay, ToolOutcome } from '@moonshot-ai/protocol';
 
 export type ExecutableToolOutput = string | ContentPart[];
 
@@ -43,6 +43,13 @@ export interface ExecutableToolSuccessResult {
   readonly truncated?: boolean | undefined;
   readonly note?: string;
   readonly delivery?: ToolDelivery | undefined;
+  /** Structured execution outcome for this result (e.g. `completed` /
+   *  `not_run`). Persisted with the tool result and projected to clients;
+   *  never enters the model-facing context. Orthogonal to `isError` — a
+   *  revised plan exit is `not_run` but `isError: false` so the turn
+   *  continues. Assigned per branch at the source; the executor only
+   *  defaults it when a tool left it unset. */
+  readonly resultOutcome?: ToolOutcome;
 }
 
 export interface ExecutableToolErrorResult {
@@ -53,6 +60,7 @@ export interface ExecutableToolErrorResult {
   readonly truncated?: boolean | undefined;
   readonly note?: string;
   readonly delivery?: ToolDelivery | undefined;
+  readonly resultOutcome?: ToolOutcome;
 }
 
 export type ExecutableToolResult = ExecutableToolSuccessResult | ExecutableToolErrorResult;
@@ -77,7 +85,7 @@ export interface ExecutableToolContext {
 export interface RunnableToolExecution {
   readonly isError?: false | undefined;
   readonly accesses?: ToolAccesses | undefined;
-  readonly display?: ToolInputDisplay | undefined;
+  readonly toolData?: ToolInputDisplay | undefined;
   readonly description?: string;
   readonly stopBatchAfterThis?: boolean | undefined;
   readonly approvalRule: string;
@@ -109,7 +117,7 @@ export type BuiltinTool<Input = unknown> = ExecutableTool<Input>;
 
 export type ToolResult = ExecutableToolResult & {
   readonly description?: string;
-  readonly display?: ToolInputDisplay;
+  readonly toolData?: ToolInputDisplay;
   readonly approvalRule?: string;
   readonly stopBatchAfterThis?: boolean;
 };

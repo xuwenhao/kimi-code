@@ -86,6 +86,7 @@ watch(
 <template>
   <ToolRow
     :status="status"
+    :status-badge="tool.statusBadge"
     :icon="glyph"
     :name="label"
     :arg="!open ? summary : ''"

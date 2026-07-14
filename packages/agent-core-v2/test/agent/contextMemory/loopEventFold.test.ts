@@ -233,4 +233,74 @@ describe('loop-event fold parity', () => {
 
     expect(folded).toEqual(baseline);
   });
+
+  it('folds a persisted tool-call toolData onto the assistant ToolCall', () => {
+    const toolData = {
+      kind: 'plan_review',
+      plan: '# Draft Plan',
+      path: '/tmp/plan.md',
+    } as const;
+
+    context.appendLoopEvent({ type: 'step.begin', uuid: 's4' });
+    context.appendLoopEvent({
+      type: 'tool.call',
+      stepUuid: 's4',
+      toolCallId: 'c4',
+      name: 'ExitPlanMode',
+      args: {},
+      toolData,
+    });
+    context.appendLoopEvent({
+      type: 'tool.result',
+      toolCallId: 'c4',
+      result: {
+        output: 'Plan rejected by user. Plan mode remains active.',
+        isError: true,
+        outcome: 'not_run',
+      },
+    });
+    context.appendLoopEvent({ type: 'step.end', uuid: 's4' });
+
+    const assistant = context.get().find((m) => m.role === 'assistant');
+    expect(assistant?.toolCalls[0]?.toolData).toEqual(toolData);
+  });
+
+  it('folds a tool-result outcome as client-only structured metadata', () => {
+    context.appendLoopEvent({ type: 'step.begin', uuid: 's5' });
+    context.appendLoopEvent({
+      type: 'tool.call',
+      stepUuid: 's5',
+      toolCallId: 'c5',
+      name: 'ExitPlanMode',
+      args: {},
+    });
+    context.appendLoopEvent({
+      type: 'tool.result',
+      toolCallId: 'c5',
+      result: {
+        output: 'Plan rejected by user. Plan mode remains active.',
+        isError: true,
+        outcome: 'not_run',
+      },
+    });
+    context.appendLoopEvent({ type: 'step.end', uuid: 's5' });
+
+    const toolMessage = context.get().find((m) => m.role === 'tool' && m.toolCallId === 'c5');
+    expect(toolMessage?.outcome).toBe('not_run');
+  });
+
+  it('marks tool exchanges left open on resume with the interrupted outcome', () => {
+    context.appendLoopEvent({ type: 'step.begin', uuid: 's6' });
+    context.appendLoopEvent({
+      type: 'tool.call',
+      stepUuid: 's6',
+      toolCallId: 'c6',
+      name: 'Bash',
+      args: {},
+    });
+    context.appendLoopEvent({ type: 'step.begin', uuid: 's7' });
+
+    const toolMessage = context.get().find((m) => m.role === 'tool' && m.toolCallId === 'c6');
+    expect(toolMessage?.outcome).toBe('interrupted');
+  });
 });

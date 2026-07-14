@@ -78,6 +78,28 @@ describe('InFlightTurnTracker', () => {
     expect(t.get(SID)?.running_tools).toEqual([]);
   });
 
+  it('carries tool_data from tool.call.started (toolData) on running tools', () => {
+    const t = new InFlightTurnTracker();
+    t.apply(SID, ev({ type: 'turn.started', turnId: 1 }));
+    t.apply(
+      SID,
+      ev({
+        type: 'tool.call.started',
+        turnId: 1,
+        toolCallId: 'tc1',
+        name: 'bash',
+        toolData: { kind: 'command', command: 'ls', language: 'bash' },
+      }),
+    );
+    expect(t.get(SID)?.running_tools).toEqual([
+      {
+        tool_call_id: 'tc1',
+        name: 'bash',
+        tool_data: { kind: 'command', command: 'ls', language: 'bash' },
+      },
+    ]);
+  });
+
   it('resets text accumulation at step boundaries (step-relative in-flight text)', () => {
     const t = new InFlightTurnTracker();
     t.apply(SID, ev({ type: 'turn.started', turnId: 1 }));

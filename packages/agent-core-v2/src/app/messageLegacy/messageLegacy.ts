@@ -22,6 +22,7 @@
  */
 
 import type {
+  ApprovalResult,
   CursorQuery,
   Message,
   MessageRole,
@@ -37,7 +38,10 @@ export interface MessageListQuery extends CursorQuery {
 export interface IMessageLegacyService {
   readonly _serviceBrand: undefined;
 
-  list(sessionId: string, query: MessageListQuery): Promise<PageResponse<Message>>;
+  list(
+    sessionId: string,
+    query: MessageListQuery,
+  ): Promise<PageResponse<Message> & { approval_results?: Record<string, ApprovalResult> }>;
   get(sessionId: string, messageId: string): Promise<Message>;
 }
 

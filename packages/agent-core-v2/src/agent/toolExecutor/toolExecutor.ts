@@ -8,6 +8,7 @@
 
 import { createDecorator } from '#/_base/di/instantiation';
 import type { IDisposable } from '#/_base/di/lifecycle';
+import type { ToolInputDisplay } from '@moonshot-ai/protocol';
 import type { ToolResult } from '#/tool/toolContract';
 import type { ToolDidExecuteContext, ToolBeforeExecuteContext } from '#/agent/toolExecutor/toolHooks';
 import type { ToolCall } from '#/app/llmProtocol/message';
@@ -17,6 +18,10 @@ export interface ToolCallStartedPayload {
   readonly toolCallId: string;
   readonly name: string;
   readonly args: unknown;
+  /** Input-side structured display from the resolved execution, when any.
+   *  The live `tool.call.started` event carries it for every kind; whether it
+   *  is persisted with the `tool.call` record is up to the consumer. */
+  readonly toolData?: ToolInputDisplay;
 }
 
 export interface ToolExecutorExecuteOptions {

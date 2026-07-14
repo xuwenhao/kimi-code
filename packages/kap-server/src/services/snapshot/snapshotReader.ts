@@ -29,6 +29,7 @@ import {
   ISessionInteractionService,
   ISessionLifecycleService,
   IWorkspaceRegistry,
+  collectApprovalResults,
   normalizeSessionMeta,
   reduceContextTranscript,
   toProtocolMessage,
@@ -37,6 +38,7 @@ import {
   type SessionMeta,
 } from '@moonshot-ai/agent-core-v2';
 import type {
+  ApprovalResult,
   InFlightTurn,
   SessionSnapshotResponse,
   SessionStatus,
@@ -76,6 +78,7 @@ interface TranscriptCacheEntry {
   readonly size: number;
   readonly mtimeMs: number;
   readonly messages: ContextMessage[];
+  readonly approvalResults: Record<string, ApprovalResult>;
 }
 
 interface LocatedSession {
@@ -138,6 +141,7 @@ export class SnapshotReader implements ISnapshotReader {
       session,
       messages: { items, has_more: hasMore },
       in_flight_turn: inFlightTurn,
+      approval_results: transcript.approvalResults,
       pending_approvals: approvals,
       pending_questions: questions,
     };
@@ -180,6 +184,7 @@ export class SnapshotReader implements ISnapshotReader {
     sessionDir: string,
   ): Promise<{
     messages: ContextMessage[];
+    approvalResults: Record<string, ApprovalResult>;
     tag: 'hit' | 'miss' | 'shrink_invalidate' | 'enoent';
     wireBytes: number;
   }> {
@@ -192,7 +197,7 @@ export class SnapshotReader implements ISnapshotReader {
     }
     if (info === undefined) {
       this.transcriptCache.delete(sid);
-      return { messages: [], tag: 'enoent', wireBytes: 0 };
+      return { messages: [], approvalResults: {}, tag: 'enoent', wireBytes: 0 };
     }
 
     const cached = this.transcriptCache.get(sid);
@@ -200,7 +205,12 @@ export class SnapshotReader implements ISnapshotReader {
       // LRU touch.
       this.transcriptCache.delete(sid);
       this.transcriptCache.set(sid, cached);
-      return { messages: cached.messages, tag: 'hit', wireBytes: info.size };
+      return {
+        messages: cached.messages,
+        approvalResults: cached.approvalResults,
+        tag: 'hit',
+        wireBytes: info.size,
+      };
     }
 
     const tag: 'miss' | 'shrink_invalidate' =
@@ -209,13 +219,14 @@ export class SnapshotReader implements ISnapshotReader {
 
     const records = await readWireRecords(wirePath);
     const messages = [...reduceContextTranscript(records).entries];
-    this.transcriptCache.set(sid, { size: info.size, mtimeMs: info.mtimeMs, messages });
+    const approvalResults = collectApprovalResults(records);
+    this.transcriptCache.set(sid, { size: info.size, mtimeMs: info.mtimeMs, messages, approvalResults });
     while (this.transcriptCache.size > this.deps.config.cacheLimit) {
       const oldest = this.transcriptCache.keys().next().value;
       if (oldest === undefined) break;
       this.transcriptCache.delete(oldest);
     }
-    return { messages, tag, wireBytes: info.size };
+    return { messages, approvalResults, tag, wireBytes: info.size };
   }
 
   private resolveStatus(

@@ -14,6 +14,7 @@ import type { ContentPart } from '#/app/llmProtocol/message';
 import type {
   ToolCallStartedEvent,
   ToolInputDisplay,
+  ToolOutcome,
   ToolProgressEvent,
   ToolResultEvent,
 } from '@moonshot-ai/protocol';
@@ -296,11 +297,12 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
     const settleError = (
       args: unknown,
       output: string,
+      outcome: ToolOutcome,
       displayFields?: ToolCallDisplayFields,
     ): { task: ToolExecutionTask } => {
       this.dispatchToolCall(call, args, options, displayFields);
       return {
-        task: makeResolvedTask(makeErrorToolResult(call, args, output)),
+        task: makeResolvedTask(makeErrorToolResult(call, args, output, outcome)),
       };
     };
 
@@ -327,7 +329,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
     };
 
     if (call.kind === 'rejected') {
-      return settleError(call.args, call.output);
+      return settleError(call.args, call.output, 'invalid');
     }
 
     let execution: ToolExecution;
@@ -338,7 +340,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
         error instanceof PathSecurityError
           ? error.message
           : `Tool "${call.toolName}" failed to resolve execution: ${errorMessage(error)}`;
-      return settleError(call.args, output);
+      return settleError(call.args, output, 'failed');
     }
 
     const displayFields = toolCallDisplayFieldsFromExecution(execution);
@@ -347,6 +349,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       return settleError(
         call.args,
         abortedToolOutput(call.toolName, options.signal),
+        'cancelled',
         displayFields,
       );
     }
@@ -363,6 +366,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       return settleError(
         call.args,
         decision.reason ?? `Tool call "${call.toolName}" was blocked`,
+        'not_run',
         displayFields,
       );
     }
@@ -394,7 +398,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
   ): ToolExecutionTask {
     const output = 'Tool skipped because a previous tool call stopped the turn.';
     this.dispatchToolCall(call, call.args, options);
-    return makeResolvedTask(makeErrorToolResult(call, call.args, output));
+    return makeResolvedTask(makeErrorToolResult(call, call.args, output, 'skipped'));
   }
 
   private async *executeBatch(
@@ -455,6 +459,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
         call,
         call.args,
         abortedToolOutput(call.toolName, signal),
+        'cancelled',
       ).result;
     }
 
@@ -476,7 +481,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       const output = aborted
         ? abortedToolOutput(call.toolName, signal)
         : `Tool "${call.toolName}" failed: ${errorMessage(error)}`;
-      return makeErrorToolResult(call, call.args, output).result;
+      return makeErrorToolResult(call, call.args, output, aborted ? 'cancelled' : 'failed').result;
     }
 
     return this.normalizeAndMergeResult(rawResult, call.toolName, execution);
@@ -492,7 +497,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
     return {
       ...normalized,
       description: execution?.description ?? normalized.description,
-      display: execution?.display ?? normalized.display,
+      toolData: execution?.toolData ?? normalized.toolData,
       approvalRule: execution?.approvalRule,
       stopBatchAfterThis: normalized.stopBatchAfterThis ?? execution?.stopBatchAfterThis,
       delivery: coerced.delivery,
@@ -511,13 +516,13 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       toolCallId: call.toolCall.id,
       name: call.toolName,
       args,
-      description: displayFields?.description,
-      display: displayFields?.display,
+      ...displayFields,
     });
     options.onToolCall?.({
       toolCallId: call.toolCall.id,
       name: call.toolName,
       args,
+      toolData: displayFields?.toolData,
     });
   }
 
@@ -532,6 +537,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       toolCallId: call.toolCall.id,
       output: result.output,
       isError: result.isError,
+      outcome: result.resultOutcome,
     });
   }
 
@@ -577,8 +583,9 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       return {
         output,
         isError: true,
+        resultOutcome: aborted ? 'cancelled' : 'failed',
         description: result.description,
-        display: result.display,
+        toolData: result.toolData,
         approvalRule: result.approvalRule,
       };
     }
@@ -589,7 +596,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       ...effectiveResult,
       message: coercedResult.message ?? result.message,
       description: result.description,
-      display: result.display,
+      toolData: result.toolData,
       approvalRule: result.approvalRule,
       stopTurn:
         result.stopTurn === true ||
@@ -632,7 +639,7 @@ interface PreparedToolResult {
   readonly stopTurn?: boolean;
 }
 
-type ToolCallDisplayFields = { description?: string | undefined; display?: ToolInputDisplay | undefined };
+type ToolCallDisplayFields = { description?: string | undefined; toolData?: ToolInputDisplay | undefined };
 
 function buildWillExecuteContext(
   call: RunnableToolCall,
@@ -737,10 +744,10 @@ function toolCallDisplayFieldsFromExecution(
 ): ToolCallDisplayFields | undefined {
   if (execution.isError === true) return undefined;
   const description = execution.description;
-  const display = execution.display;
+  const toolData = execution.toolData;
   return {
     description: description !== undefined && description.length > 0 ? description : undefined,
-    display,
+    toolData,
   };
 }
 
@@ -755,12 +762,13 @@ function makeErrorToolResult(
   call: PreflightedToolCall,
   args: unknown,
   output: string,
+  outcome: ToolOutcome,
 ): PreparedToolResult {
   return {
     toolCall: call.toolCall,
     toolName: call.toolName,
     args,
-    result: { output, isError: true },
+    result: { output, isError: true, resultOutcome: outcome },
   };
 }
 
@@ -812,7 +820,15 @@ function normalizeToolResult(result: ExecutableToolResult): ToolResult {
     stopTurn?: boolean;
     truncated?: true;
     note?: string;
-  } = { output, stopTurn: result.stopTurn };
+    resultOutcome: ToolOutcome;
+  } = {
+    output,
+    stopTurn: result.stopTurn,
+    // Outcome is assigned per branch at the source; tools that leave it unset
+    // get the settle default: a real error is a failure, anything else
+    // completed normally.
+    resultOutcome: result.resultOutcome ?? (result.isError === true ? 'failed' : 'completed'),
+  };
   if (result.truncated === true) base.truncated = true;
   if (typeof result.note === 'string' && result.note.length > 0) base.note = result.note;
   if (result.isError === true) {
@@ -872,6 +888,7 @@ async function raceWithAbortGrace<Result>(
         resolve({
           output: abortedToolOutput(toolName, signal),
           isError: true,
+          resultOutcome: 'cancelled',
         } as unknown as Result);
       }, ABORT_GRACE_MS);
     };

@@ -29,6 +29,7 @@
  */
 
 import { type ContentPart, type ToolCall } from '#/app/llmProtocol/message';
+import type { ToolOutcome } from '@moonshot-ai/protocol';
 import type { PersistedRecord } from '#/wire/wireService';
 
 import {
@@ -57,6 +58,7 @@ interface MutableMessage {
   toolCallId?: string;
   isError?: boolean;
   origin?: ContextMessage['origin'];
+  outcome?: ToolOutcome;
 }
 
 interface MutableEntry {
@@ -92,6 +94,7 @@ export function reduceContextTranscript(records: Iterable<PersistedRecord>): Con
           toolCalls: [],
           toolCallId,
           isError: true,
+          outcome: 'interrupted',
         },
         time,
       });
@@ -135,6 +138,7 @@ export function reduceContextTranscript(records: Iterable<PersistedRecord>): Con
           name: event.name,
           arguments: event.args === undefined ? null : JSON.stringify(event.args),
           ...(event.extras !== undefined ? { extras: event.extras } : {}),
+          ...(event.toolData !== undefined ? { toolData: event.toolData } : {}),
         };
         openStep.message.toolCalls.push(call);
         pendingToolResultIds.add(event.toolCallId);
@@ -149,6 +153,7 @@ export function reduceContextTranscript(records: Iterable<PersistedRecord>): Con
             toolCalls: [],
             toolCallId: event.toolCallId,
             isError: event.result.isError,
+            outcome: event.result.outcome,
           },
           time,
         });

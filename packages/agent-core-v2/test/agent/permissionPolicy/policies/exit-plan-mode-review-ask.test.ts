@@ -6,7 +6,7 @@ import { DisposableStore } from '#/_base/di/lifecycle';
 import { createServices, type TestInstantiationService } from '#/_base/di/test';
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
 import { IAgentPermissionModeService } from '#/agent/permissionMode/permissionMode';
-import type { PermissionMode } from '#/agent/permissionPolicy/types';
+import type { PermissionMode, PermissionPolicyResolution } from '#/agent/permissionPolicy/types';
 import { ExitPlanModeReviewAskPermissionPolicyService } from '#/agent/permissionPolicy/policies/exit-plan-mode-review-ask';
 import { IAgentPlanService, type IAgentPlanService as AgentPlanService } from '#/agent/plan/plan';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
@@ -32,24 +32,28 @@ function approvalResponse(response: RuntimeApprovalResponse): ApprovalResponse {
   return response as unknown as ApprovalResponse;
 }
 
+function resultOutcomeOf(approval: PermissionPolicyResolution | undefined) {
+  return approval?.kind === 'result' ? approval.syntheticResult?.resultOutcome : undefined;
+}
+
 function planReviewDisplay(
   input: {
     readonly plan?: string;
     readonly options?: readonly (typeof options)[number][] | undefined;
   } = {},
 ): ToolInputDisplay {
-  const display: ToolInputDisplay = {
+  const toolData: ToolInputDisplay = {
     kind: 'plan_review',
     plan: input.plan ?? '# Plan',
     path: '/tmp/kimi-plan.md',
   };
   if (input.options !== undefined) {
-    display.options = input.options;
+    toolData.options = input.options;
   }
-  return display;
+  return toolData;
 }
 
-function policyContext(display: ToolInputDisplay): ResolvedToolExecutionHookContext {
+function policyContext(toolData: ToolInputDisplay): ResolvedToolExecutionHookContext {
   const toolCall: ToolCall = {
     type: 'function',
     id: 'call_exit_plan',
@@ -65,7 +69,7 @@ function policyContext(display: ToolInputDisplay): ResolvedToolExecutionHookCont
     execution: {
       accesses: ToolAccesses.none(),
       approvalRule: 'ExitPlanMode',
-      display,
+      toolData,
       execute: async () => ({ output: '' }),
     },
   };
@@ -152,6 +156,7 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
         output: expect.stringContaining('Selected approach: Approach B'),
       },
     });
+    expect(resultOutcomeOf(approval)).toBe('completed');
     expect(exitPlanMode).toHaveBeenCalledTimes(1);
     expect(records).toContainEqual({
       event: 'plan_submitted',
@@ -184,6 +189,10 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
         output: expect.stringContaining('Add verification.'),
       },
     });
+    expect(approval?.kind === 'result' ? approval.syntheticResult?.output : '').toContain(
+      '## Rejected Plan:\n# Plan',
+    );
+    expect(resultOutcomeOf(approval)).toBe('not_run');
     expect(exitPlanMode).not.toHaveBeenCalled();
     expect(records).toContainEqual({
       event: 'plan_resolved',
@@ -205,9 +214,13 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
       kind: 'result',
       syntheticResult: {
         isError: true,
-        output: 'Plan rejected by user. Plan mode remains active.',
+        output: expect.stringContaining('Plan rejected by user. Plan mode remains active.'),
       },
     });
+    expect(approval?.kind === 'result' ? approval.syntheticResult?.output : '').toContain(
+      '## Rejected Plan:\n# Plan',
+    );
+    expect(resultOutcomeOf(approval)).toBe('not_run');
     expect(exitPlanMode).not.toHaveBeenCalled();
     expect(records).toContainEqual({
       event: 'plan_resolved',
@@ -229,6 +242,7 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
         output: 'Plan approval dismissed. Plan mode remains active.',
       },
     });
+    expect(resultOutcomeOf(approval)).toBe('not_run');
     expect(exitPlanMode).not.toHaveBeenCalled();
     expect(records).toContainEqual({
       event: 'plan_resolved',
@@ -250,9 +264,13 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
       kind: 'result',
       syntheticResult: {
         isError: true,
-        output: 'Plan rejected by user. Plan mode deactivated.',
+        output: expect.stringContaining('Plan rejected by user. Plan mode deactivated.'),
       },
     });
+    expect(approval?.kind === 'result' ? approval.syntheticResult?.output : '').toContain(
+      '## Rejected Plan:\n# Plan',
+    );
+    expect(resultOutcomeOf(approval)).toBe('not_run');
     expect(exitPlanMode).toHaveBeenCalledTimes(1);
     expect(records).toContainEqual({
       event: 'plan_resolved',
@@ -261,11 +279,11 @@ describe('ExitPlanModeReviewAskPermissionPolicyService telemetry', () => {
   });
 
   it('returns approved plan output without a saved-to line when display has no path', async () => {
-    const display: ToolInputDisplay = {
+    const toolData: ToolInputDisplay = {
       kind: 'plan_review',
       plan: '# Draft Plan',
     };
-    const result = await makePolicy().evaluate(policyContext(display));
+    const result = await makePolicy().evaluate(policyContext(toolData));
     if (result?.kind !== 'ask') throw new Error('expected ask');
 
     const approval = result.resolveApproval?.(approvalResponse({ decision: 'approved' }));

@@ -221,7 +221,7 @@ export class GrepTool implements BuiltinTool<GrepInput> {
     return {
       accesses: ToolAccesses.searchTree(searchPaths[0]!),
       description: `Searching for '${args.pattern}' in ${searchPath}`,
-      display: { kind: 'file_io', operation: 'grep', path: searchPaths[0]! },
+      toolData: { kind: 'file_io', operation: 'grep', path: searchPaths[0]! },
       approvalRule: literalRulePattern(this.name, args.pattern),
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.pattern),
       execute: ({ signal }) => this.execution(args, signal, searchPaths),

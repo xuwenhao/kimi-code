@@ -320,6 +320,14 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
       // Live events may have appended messages while the request was in flight;
       // the updater receives the latest array so those messages are not overwritten.
       updateSessionMessages(sessionId, (latest) => [...older, ...latest]);
+      // Hydrate the approval-results map from the page's side map (merge —
+      // records are keyed by globally-unique toolCallId).
+      if (page.approvalResults) {
+        rawState.approvalResultsByToolCallId = {
+          ...rawState.approvalResultsByToolCallId,
+          ...page.approvalResults,
+        };
+      }
       rawState.messagesHasMoreBySession = {
         ...rawState.messagesHasMoreBySession,
         [sessionId]: page.hasMore,

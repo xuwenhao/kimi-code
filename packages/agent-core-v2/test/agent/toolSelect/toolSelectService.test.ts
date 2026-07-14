@@ -734,6 +734,7 @@ describe('AgentToolSelectService executor interception', () => {
         `Tool "${MCP_ALPHA}" is available but not loaded. ` +
         `Call select_tools with ["${MCP_ALPHA}"] first, then call the tool.`,
       isError: true,
+      resultOutcome: 'invalid',
     });
     expect(alpha.calls).toBe(0);
   });
@@ -764,6 +765,7 @@ describe('AgentToolSelectService executor interception', () => {
       output:
         `Tool "${MCP_ALPHA}" was loaded but is no longer active. Ask the user to enable it before calling it again.`,
       isError: true,
+      resultOutcome: 'invalid',
     });
     expect(alpha.calls).toBe(0);
   });
