@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import {
   ErrorCodes,
+  log,
   makeErrorPayload,
   type AgentContextData,
   type ApprovalRequest,
@@ -116,7 +117,7 @@ type ResolvedCoreAPI = RPCMethods<CoreAPI>;
 
 export abstract class SDKRpcClientBase {
   private readonly interactiveAgentScope = new AsyncLocalStorage<string>();
-  private readonly eventListeners = new Set<(event: Event) => void>();
+  private readonly eventListeners = new Set<(event: Event) => unknown>();
   private readonly approvalHandlers = new Map<string, ApprovalHandler>();
   private readonly questionHandlers = new Map<string, QuestionHandler>();
 
@@ -238,7 +239,7 @@ export abstract class SDKRpcClientBase {
   async prompt(input: SessionPromptRpcInput): Promise<void> {
     const agentId = this.interactiveAgentId;
     const rpc = await this.getRpc();
-    return rpc.prompt({
+    await rpc.prompt({
       sessionId: input.sessionId,
       agentId,
       input: input.input,
@@ -672,7 +673,7 @@ export abstract class SDKRpcClientBase {
     });
   }
 
-  onEvent(listener: (event: Event) => void): Unsubscribe {
+  onEvent(listener: (event: Event) => unknown): Unsubscribe {
     this.eventListeners.add(listener);
     return () => {
       this.eventListeners.delete(listener);
@@ -681,7 +682,25 @@ export abstract class SDKRpcClientBase {
 
   receiveEvent(event: Event): void {
     for (const listener of this.eventListeners) {
-      listener(event);
+      try {
+        const delivery = listener(event);
+        if (delivery !== undefined) {
+          void Promise.resolve(delivery).catch((error: unknown) => {
+            this.reportEventListenerFailure(error);
+          });
+        }
+      } catch (error) {
+        this.reportEventListenerFailure(error);
+      }
+    }
+  }
+
+  private reportEventListenerFailure(error: unknown): void {
+    try {
+      log.warn('SDK event listener failed', { error });
+    } catch {
+      // Listener failures are isolated from event dispatch even when a host
+      // provides a throwing diagnostic sink.
     }
   }
 

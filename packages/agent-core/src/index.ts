@@ -60,6 +60,7 @@ export type { ToolServices } from './tools/support/services';
 // them without a deep subpath.
 export {
   buildImageCompressionCaption,
+  extractImageCompressionCaptions,
   compressImageForModel,
   compressBase64ForModel,
   compressImageContentParts,

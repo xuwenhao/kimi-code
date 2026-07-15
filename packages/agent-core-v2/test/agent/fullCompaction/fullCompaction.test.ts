@@ -36,7 +36,15 @@ import { MASTER_ENV } from '#/app/flag/flagService';
 import { estimateTokensForMessages } from '#/_base/utils/tokens';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
 import type { TestAgentContext, TestAgentOptions, TestAgentServiceOverride } from '../../harness';
-import { appServices, createCommandRunner, execEnvServices, hostEnvironmentServices, sessionServices, testAgent } from '../../harness';
+import {
+  appServices,
+  createCommandRunner,
+  execEnvServices,
+  hostEnvironmentServices,
+  logServices,
+  sessionServices,
+  testAgent,
+} from '../../harness';
 import {
   IAgentFullCompactionService,
   IOAuthService,
@@ -50,7 +58,10 @@ import {
 } from '#/index';
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
+import { IAgentContextInjectorService } from '#/agent/contextInjector/contextInjector';
 import { IAgentGoalService } from '#/agent/goal/goal';
+import { CompactionModel } from '#/agent/fullCompaction/compactionOps';
+import { IWireService } from '#/wire/wire';
 import { HostFileSystem } from '#/os/backends/node-local/hostFsService';
 
 type GenerateFn = NonNullable<TestAgentOptions['generate']>;
@@ -348,6 +359,77 @@ describe('FullCompaction', () => {
         exactCompactionRefreshPrompt(workDir, 'new project instructions'),
       );
       expect(profile.getActiveToolNames()).toEqual(['Read']);
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true });
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the captured compaction prompt when retrying the same turn', async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), 'kimi-compact-turn-refresh-home-'));
+    const workDir = mkdtempSync(join(tmpdir(), 'kimi-compact-turn-refresh-work-'));
+    try {
+      writeFileSync(join(workDir, 'AGENTS.md'), 'old project instructions', 'utf-8');
+      let callCount = 0;
+      const systemPrompts: string[] = [];
+      const modelNames: string[] = [];
+      const thinkingEfforts: Array<string | null> = [];
+      const generate: GenerateFn = async (
+        provider,
+        systemPrompt,
+        _tools,
+        _history,
+        callbacks,
+      ) => {
+        callCount += 1;
+        systemPrompts.push(systemPrompt);
+        modelNames.push(provider.modelName);
+        thinkingEfforts.push(provider.thinkingEffort);
+        if (callCount === 1) {
+          writeFileSync(join(workDir, 'AGENTS.md'), 'new project instructions', 'utf-8');
+          throw new APIContextOverflowError(400, 'Context length exceeded', 'req-refresh-turn');
+        }
+        if (callCount === 2) return textResult('Compacted summary.');
+        if (callCount === 3) {
+          await callbacks?.onMessagePart?.({
+            type: 'text',
+            text: 'Retried with refreshed instructions.',
+          });
+          return textResult('Retried with refreshed instructions.');
+        }
+        throw new Error(`Unexpected generate call ${String(callCount)}`);
+      };
+      const ctx = testAgent(
+        execEnvServices({ hostFs: new HostFileSystem() }),
+        hostEnvironmentServices(homeDir),
+        { autoConfigure: false, cwd: workDir, generate },
+      );
+      ctx.configureRuntimeModel(CATALOGUED_PROVIDER, CATALOGUED_MODEL_CAPABILITIES);
+      const profile = ctx.get(IAgentProfileService);
+      await profile.applyProfile(EXACT_COMPACTION_REFRESH_PROFILE);
+      ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+      ctx.emitter.once('compaction.completed', () => {
+        profile.update({
+          systemPrompt: 'ORDINARY-MID-TURN-CONFIG',
+          thinkingLevel: 'high',
+        });
+      });
+
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Retry after overflow' }] });
+      await ctx.untilTurnEnd();
+
+      expect(systemPrompts).toEqual([
+        exactCompactionRefreshPrompt(workDir, 'old project instructions'),
+        exactCompactionRefreshPrompt(workDir, 'old project instructions'),
+        exactCompactionRefreshPrompt(workDir, 'new project instructions'),
+      ]);
+      expect(modelNames).toEqual(['kimi-code', 'kimi-code', 'kimi-code']);
+      expect(thinkingEfforts[2]).toBe(thinkingEfforts[0]);
+      expect(profile.data()).toMatchObject({
+        systemPrompt: 'ORDINARY-MID-TURN-CONFIG',
+        thinkingLevel: 'on',
+      });
+      await ctx.expectResumeMatches();
     } finally {
       rmSync(homeDir, { recursive: true, force: true });
       rmSync(workDir, { recursive: true, force: true });
@@ -957,7 +1039,7 @@ describe('FullCompaction', () => {
     await ctx.expectResumeMatches();
   });
 
-  it('cancels the compaction lifecycle when manual compaction generation fails', async () => {
+  it('fails the compaction lifecycle when manual compaction generation fails', async () => {
     const records: TelemetryRecord[] = [];
     const generate: GenerateFn = async () => {
       throw new Error('compaction exploded');
@@ -977,12 +1059,18 @@ describe('FullCompaction', () => {
     const events = ctx.newEvents();
     expect(events).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: '[wire]', event: 'full_compaction.cancel' }),
-        expect.objectContaining({ type: '[rpc]', event: 'compaction.cancelled' }),
+        expect.objectContaining({
+          type: '[wire]',
+          event: 'full_compaction.complete',
+          args: expect.objectContaining({ outcome: 'failed' }),
+        }),
         expect.objectContaining({ type: '[rpc]', event: 'error' }),
       ]),
     );
-    expect(eventIndex(events, 'compaction.cancelled')).toBeLessThan(eventIndex(events, 'error'));
+    expect(countEvents(events, 'full_compaction.cancel')).toBe(0);
+    expect(countEvents(events, 'compaction.cancelled')).toBe(0);
+    expect(countEvents(events, 'compaction.completed')).toBe(0);
+    expect(eventIndex(events, 'full_compaction.complete')).toBeLessThan(eventIndex(events, 'error'));
     expect(ctx.compactHistory()).toEqual([
       { role: 'user', text: 'old user one' },
       { role: 'assistant', text: 'old assistant one' },
@@ -1003,6 +1091,163 @@ describe('FullCompaction', () => {
     expect(
       records.find((record) => record.event === 'compaction_failed')?.properties,
     ).not.toHaveProperty('tokens_after');
+    await ctx.expectResumeMatches();
+  });
+
+  it('treats a provider-originated AbortError as failure rather than cancellation', async () => {
+    const generate: GenerateFn = async () => {
+      const error = new Error('provider aborted its own request');
+      error.name = 'AbortError';
+      throw error;
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const failed = ctx.once('error');
+
+    await ctx.rpc.beginCompaction({});
+    await failed;
+
+    const events = ctx.newEvents();
+    expect(countEvents(events, 'full_compaction.complete')).toBe(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: '[wire]',
+        event: 'full_compaction.complete',
+        args: expect.objectContaining({ outcome: 'failed' }),
+      }),
+    );
+    expect(countEvents(events, 'full_compaction.cancel')).toBe(0);
+    expect(countEvents(events, 'compaction.cancelled')).toBe(0);
+    expect(countEvents(events, 'compaction.completed')).toBe(0);
+    await ctx.expectResumeMatches();
+  });
+
+  it('keeps a committed summary and retries transient reinjection before the next request', async () => {
+    const ctx = testAgent(
+      logServices({
+        info() {},
+        warn() {},
+        error() {
+          throw new Error('error sink failed');
+        },
+        debug() {},
+      }),
+    );
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const inject = vi
+      .spyOn(ctx.get(IAgentContextInjectorService), 'injectAfterCompaction')
+      .mockRejectedValueOnce(new Error('transient reinjection failure'))
+      .mockResolvedValue(undefined);
+    const completed = ctx.once('compaction.completed');
+
+    ctx.mockNextResponse({ type: 'text', text: 'Committed summary.' });
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('committed');
+    expect(ctx.compactHistory().map((entry) => entry.text).join('\n')).toContain(
+      'Committed summary.',
+    );
+    expect(countEvents(ctx.allEvents, 'full_compaction.complete')).toBe(0);
+    expect(countEvents(ctx.allEvents, 'compaction.cancelled')).toBe(0);
+
+    ctx.mockNextResponse({ type: 'text', text: 'Continued after maintenance.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
+    await ctx.untilTurnEnd();
+
+    expect(inject).toHaveBeenCalledTimes(2);
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(countEvents(ctx.allEvents, 'full_compaction.complete')).toBe(1);
+    expect(countEvents(ctx.allEvents, 'full_compaction.cancel')).toBe(0);
+    expect(countEvents(ctx.allEvents, 'compaction.completed')).toBe(1);
+    expect(
+      ctx.llmCalls
+        .at(-1)!
+        .history.map(messageText)
+        .some((text) => text.includes('Committed summary.')),
+    ).toBe(true);
+    await ctx.expectResumeMatches();
+  });
+
+  it('retries a transient system-prompt refresh without re-running successful reinjection', async () => {
+    const ctx = testAgent();
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const refresh = vi
+      .spyOn(ctx.get(IAgentProfileService), 'refreshSystemPrompt')
+      .mockRejectedValueOnce(new Error('transient refresh failure'))
+      .mockResolvedValue(undefined);
+    const inject = vi.spyOn(
+      ctx.get(IAgentContextInjectorService),
+      'injectAfterCompaction',
+    );
+    const completed = ctx.once('compaction.completed');
+
+    ctx.mockNextResponse({ type: 'text', text: 'Committed summary.' });
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('committed');
+
+    ctx.mockNextResponse({ type: 'text', text: 'Continued after refresh.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
+    await ctx.untilTurnEnd();
+
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(inject).toHaveBeenCalledTimes(1);
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(countEvents(ctx.allEvents, 'full_compaction.complete')).toBe(1);
+    expect(countEvents(ctx.allEvents, 'full_compaction.cancel')).toBe(0);
+    await ctx.expectResumeMatches();
+  });
+
+  it('does not cancel or roll back after the context replacement commits', async () => {
+    const ctx = testAgent();
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
+    const maintenanceStarted = deferred<void>();
+    const releaseMaintenance = deferred<void>();
+    vi.spyOn(ctx.get(IAgentContextInjectorService), 'injectAfterCompaction').mockImplementation(
+      async () => {
+        maintenanceStarted.resolve();
+        await releaseMaintenance.promise;
+      },
+    );
+    const completed = ctx.once('compaction.completed');
+
+    ctx.mockNextResponse({ type: 'text', text: 'Committed summary.' });
+    await ctx.rpc.beginCompaction({});
+    await maintenanceStarted.promise;
+    await ctx.rpc.cancelCompaction({});
+    releaseMaintenance.resolve();
+    await completed;
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(ctx.compactHistory().map((entry) => entry.text).join('\n')).toContain(
+      'Committed summary.',
+    );
+    expect(countEvents(ctx.allEvents, 'full_compaction.complete')).toBe(1);
+    expect(countEvents(ctx.allEvents, 'full_compaction.cancel')).toBe(0);
+    expect(countEvents(ctx.allEvents, 'compaction.cancelled')).toBe(0);
+    expect(countEvents(ctx.allEvents, 'compaction.completed')).toBe(1);
     await ctx.expectResumeMatches();
   });
 
@@ -2918,7 +3163,7 @@ describe('prompt deferral during full compaction', () => {
     });
     ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
     ctx.appendExchange(2, 'recent user two', 'recent assistant two', 80);
-    const cancelled = ctx.once('compaction.cancelled');
+    const failed = ctx.once('full_compaction.complete');
 
     await ctx.rpc.beginCompaction({});
     await compactionRequested.promise;
@@ -2928,9 +3173,18 @@ describe('prompt deferral during full compaction', () => {
     expect(launch).toBeUndefined();
 
     releaseCompaction.resolve();
-    await cancelled;
+    await failed;
     const events = await ctx.untilTurnEnd();
 
+    expect(countEvents(events, 'full_compaction.complete')).toBe(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: '[wire]',
+        event: 'full_compaction.complete',
+        args: expect.objectContaining({ outcome: 'failed' }),
+      }),
+    );
+    expect(countEvents(events, 'compaction.cancelled')).toBe(0);
     expect(countEvents(events, 'compaction.completed')).toBe(0);
     expect(events).toContainEqual(
       expect.objectContaining({

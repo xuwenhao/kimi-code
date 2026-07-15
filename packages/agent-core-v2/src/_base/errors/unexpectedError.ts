@@ -24,8 +24,13 @@ export function onUnexpectedError(err: unknown): void {
   try {
     currentHandler(err);
   } catch (handlerErr) {
-    // eslint-disable-next-line no-console
-    console.error('[unexpected] handler threw', handlerErr, 'while reporting', err);
+    try {
+      // eslint-disable-next-line no-console
+      console.error('[unexpected] handler threw', handlerErr, 'while reporting', err);
+    } catch {
+      // Unexpected-error reporting is the final diagnostic boundary. A broken
+      // custom handler and a broken console fallback must both remain isolated.
+    }
   }
 }
 

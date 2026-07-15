@@ -34,6 +34,7 @@ const V1_RECORD_TYPES: ReadonlySet<string> = new Set([
   'turn.prompt',
   'turn.steer',
   'turn.cancel',
+  'turn.outcome',
   'config.update',
   'permission.set_mode',
   'permission.record_approval_result',

@@ -1,5 +1,9 @@
 import type { Agent } from '..';
 import {
+  agentRecordAppendAccepted,
+  markAgentRecordAppendError,
+} from './append-error';
+import {
   AGENT_WIRE_PROTOCOL_VERSION,
   isNewerWireVersion,
   migrateWireRecord,
@@ -10,6 +14,7 @@ import {
 import type { AgentRecord, AgentRecordPersistence } from './types';
 
 export * from './types';
+export { agentRecordAppendAccepted, markAgentRecordAppendError } from './append-error';
 export { AGENT_WIRE_PROTOCOL_VERSION } from './migration';
 export {
   FileSystemAgentRecordPersistence,
@@ -37,13 +42,49 @@ function restoreAgentRecord(agent: Agent, input: AgentRecord): void {
       agent.goal.restoreForked(input);
       return;
     case 'turn.prompt':
-      agent.turn.restorePrompt();
+      agent.turn.restorePrompt(
+        input.input,
+        input.origin,
+        input.deferredPromptId,
+        input.promptId,
+        input.admissionId,
+        input.turnId,
+      );
+      return;
+    case 'turn.deferred_prompt_started':
+      agent.turn.restoreDeferredPromptStarted(input.deferredPromptId, input.turnId);
       return;
     case 'turn.steer':
-      agent.turn.restoreSteer(input.input, input.origin);
+      agent.turn.restoreSteer(
+        input.input,
+        input.origin,
+        input.expectedPromptId,
+        input.ownerTurnId,
+        input.ownerDeferredPromptId,
+        input.admissionId,
+        input.turnId,
+      );
       return;
     case 'turn.cancel':
-      agent.turn.cancel(input.turnId);
+      if (
+        input.outcomeId !== undefined &&
+        input.outcomeTurnId !== undefined &&
+        input.outcomeContent !== undefined
+      ) {
+        agent.turn.restoreOutcome(input.outcomeId, input.outcomeTurnId, input.outcomeContent);
+      }
+      void agent.turn.cancel(input.turnId, undefined, {
+        restoredPromptId: input.promptId,
+        restoredOwnerTurnId: input.ownerTurnId,
+        restoredOwnerDeferredPromptId: input.ownerDeferredPromptId,
+        restoredOutcomeId: input.outcomeId,
+        restoredOutcomeTurnId: input.outcomeTurnId,
+        restoredOutcomeContent: input.outcomeContent,
+        restoredCancelledTurnInputs: input.cancelledTurnInputs,
+      });
+      return;
+    case 'turn.outcome':
+      agent.turn.restoreOutcome(input.outcomeId, input.turnId, input.content);
       return;
     case 'config.update':
       agent.config.update(input);
@@ -61,7 +102,7 @@ function restoreAgentRecord(agent: Agent, input: AgentRecord): void {
       agent.fullCompaction.begin(input);
       return;
     case 'full_compaction.cancel':
-      agent.fullCompaction.cancel();
+      void agent.fullCompaction.cancel();
       return;
     case 'full_compaction.complete':
       agent.fullCompaction.markCompleted();
@@ -85,7 +126,15 @@ function restoreAgentRecord(agent: Agent, input: AgentRecord): void {
       agent.swarmMode.exit();
       return;
     case 'context.append_message':
-      agent.context.appendMessage(input.message);
+      agent.context.appendMessage(
+        input.message,
+        input.consumedTurnInput,
+        input.turnInputPart,
+        input.materializedTurnOutcomeId,
+      );
+      return;
+    case 'turn.input_consumed':
+      agent.turn.consumeTurnInput(input.consumedTurnInput);
       return;
     case 'context.append_loop_event':
       agent.context.appendLoopEvent(input.event);
@@ -187,8 +236,8 @@ export class AgentRecords {
 
   /**
    * Register a callback fired once, when the log opens. Not fired for a
-   * range-limited (frozen) replay — those agents are transient previews and
-   * must not append new records.
+   * range-limited replay or another read-only projection — those agents are
+   * transient previews and must not append new records.
    */
   onOpened(callback: () => void): void {
     if (this._opened) {
@@ -216,12 +265,21 @@ export class AgentRecords {
       !this.metadataInitialized &&
       stamped.type !== 'metadata'
     ) {
-      this.persistence.append({
-        type: 'metadata',
-        protocol_version: AGENT_WIRE_PROTOCOL_VERSION,
-        created_at: Date.now(),
-      });
-      this.metadataInitialized = true;
+      try {
+        this.persistence.append({
+          type: 'metadata',
+          protocol_version: AGENT_WIRE_PROTOCOL_VERSION,
+          created_at: Date.now(),
+        });
+        this.metadataInitialized = true;
+      } catch (error) {
+        if (agentRecordAppendAccepted(error) === true) {
+          this.metadataInitialized = true;
+        }
+        // The caller's requested record has not been attempted yet, regardless
+        // of whether the prerequisite metadata append itself was accepted.
+        throw markAgentRecordAppendError(error, false);
+      }
     }
     if (stamped.type === 'metadata') {
       this.metadataInitialized = true;
@@ -232,7 +290,12 @@ export class AgentRecords {
     // (currently hypothetical) mid-replay logRecord — opening there would
     // let observability writes race the dedup-cursor restore.
     if (!this._replaying) {
-      this.markOpened();
+      try {
+        this.markOpened();
+      } catch (error) {
+        // The record was accepted before log-open observers ran.
+        throw markAgentRecordAppendError(error, true);
+      }
     }
   }
 
@@ -247,6 +310,18 @@ export class AgentRecords {
   }
 
   async replay(options: AgentRecordsReplayOptions = {}): Promise<{ warning?: string }> {
+    return this.replayRecords(options, true);
+  }
+
+  /** Restore records for a transient projection without opening the live log. */
+  async replayReadOnly(options: AgentRecordsReplayOptions = {}): Promise<{ warning?: string }> {
+    return this.replayRecords(options, false);
+  }
+
+  private async replayRecords(
+    options: AgentRecordsReplayOptions,
+    openAfterReplay: boolean,
+  ): Promise<{ warning?: string }> {
     if (!this.persistence) throw new Error('No persistence provided for AgentRecords');
     const rewriteMigratedRecords = options.rewriteMigratedRecords ?? true;
     let migrations: readonly WireMigration[] = [];
@@ -303,8 +378,8 @@ export class AgentRecords {
     }
     // Open only AFTER the migration rewrite has flushed — records appended by
     // onOpened callbacks before the rewrite would be wiped by it. A frozen
-    // (range-limited) replay never opens: see onOpened.
-    if (completed) {
+    // range or an explicitly read-only projection never opens: see onOpened.
+    if (completed && openAfterReplay) {
       this.markOpened();
     }
     return { warning };

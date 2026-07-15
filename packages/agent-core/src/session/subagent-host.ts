@@ -3,6 +3,7 @@ import {
   isProviderRateLimitError,
   type TokenUsage,
 } from '@moonshot-ai/kosong';
+import { createControlledPromise } from '@antfu/utils';
 
 import type { Agent } from '../agent';
 import type { PromptOrigin } from '../agent/context';
@@ -16,6 +17,7 @@ import {
   type ResolvedAgentProfile,
 } from '../profile';
 import {
+  abortable,
   linkAbortSignal,
   userCancellationReason,
 } from '../utils/abort';
@@ -141,6 +143,7 @@ export class SessionSubagentHost {
     {
       readonly controller: AbortController;
       runInBackground: boolean;
+      readonly settled: Promise<void>;
     }
   >();
 
@@ -152,16 +155,27 @@ export class SessionSubagentHost {
   async spawn(options: SpawnSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
 
-    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const parent = await abortable(
+      this.session.ensureAgentResumed(this.ownerAgentId),
+      options.signal,
+    );
     const profile = this.resolveProfile(parent, options.profileName);
-    const { id, agent } = await this.session.createAgent(
-      { type: 'sub', generate: parent.rawGenerate },
-      { parentAgentId: this.ownerAgentId, swarmItem: options.swarmItem },
+    const { id, agent } = await abortable(
+      this.session.createAgent(
+        { type: 'sub', generate: parent.rawGenerate },
+        {
+          parentAgentId: this.ownerAgentId,
+          swarmItem: options.swarmItem,
+          signal: options.signal,
+        },
+      ),
+      options.signal,
     );
     const completion = this.runWithActiveChild(id, options, async (runOptions) => {
+      runOptions.signal.throwIfAborted();
       this.emitSubagentSpawned(parent, id, profile.name, runOptions);
       try {
-        await this.configureChild(parent, agent, profile);
+        await this.configureChild(parent, agent, profile, runOptions.signal);
         return await this.runPromptTurn(parent, id, agent, profile.name, runOptions);
       } catch (error) {
         this.emitSubagentFailed(parent, id, runOptions, error);
@@ -178,8 +192,12 @@ export class SessionSubagentHost {
 
   async resume(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName } = await this.ensureIdleSubagent(
+      agentId,
+      options.signal,
+    );
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
+      runOptions.signal.throwIfAborted();
       this.emitSubagentSpawned(parent, agentId, profileName, runOptions);
       try {
         child.config.update({ modelAlias: parent.config.modelAlias });
@@ -194,7 +212,10 @@ export class SessionSubagentHost {
 
   async retry(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-    const { parent, child, profileName } = await this.ensureIdleSubagent(agentId);
+    const { parent, child, profileName } = await this.ensureIdleSubagent(
+      agentId,
+      options.signal,
+    );
     const completion = this.runWithActiveChild(agentId, options, async (runOptions) => {
       try {
         runOptions.signal.throwIfAborted();
@@ -216,8 +237,9 @@ export class SessionSubagentHost {
 
   private async ensureIdleSubagent(
     agentId: string,
+    signal: AbortSignal,
   ): Promise<{ readonly parent: Agent; readonly child: Agent; readonly profileName: string }> {
-    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const parent = await abortable(this.session.ensureAgentResumed(this.ownerAgentId), signal);
     const metadata = this.session.metadata.agents[agentId];
     if (metadata?.type !== 'sub') {
       throw new Error(`Agent instance "${agentId}" is not a subagent`);
@@ -225,7 +247,7 @@ export class SessionSubagentHost {
     if (metadata.parentAgentId !== this.ownerAgentId) {
       throw new Error(`Agent instance "${agentId}" does not belong to this parent agent`);
     }
-    const child = await this.session.ensureAgentResumed(agentId);
+    const child = await abortable(this.session.ensureAgentResumed(agentId), signal);
     if (this.activeChildren.has(agentId) || child.turn.hasActiveTurn) {
       throw new Error(`Agent instance "${agentId}" is already running and cannot run concurrently`);
     }
@@ -274,16 +296,39 @@ export class SessionSubagentHost {
     return id;
   }
 
-  cancelAll(reason: unknown = userCancellationReason()): void {
+  cancelAll(reason: unknown = userCancellationReason()): Promise<void> {
     const foregroundChildren = Array.from(this.activeChildren).filter(
       ([, child]) => !child.runInBackground,
     );
+    const barriers: Promise<unknown>[] = [];
     for (const [childId, child] of foregroundChildren) {
-      this.session.getReadyAgent(childId)?.subagentHost?.cancelAll(reason);
+      const childAgent = this.session.getReadyAgent(childId);
+      let childTurnSettlement: Promise<unknown> | undefined;
+      if (childAgent?.turn.hasActiveTurn === true) {
+        try {
+          // Capture the un-abort-raced worker promise before signalling the
+          // child. `waitForCurrentTurn(signal)` deliberately rejects as soon as
+          // its caller aborts, which is too early for a cancellation barrier.
+          childTurnSettlement = childAgent.turn.waitForCurrentTurn();
+        } catch {
+          // The child may have settled between the public state check and the
+          // wait. Its host lifecycle barrier below still covers final cleanup.
+        }
+      }
+      const descendantBarrier = childAgent?.subagentHost?.cancelAll(reason);
       // Abort with the cancel reason (a user interruption by default) so the
       // subagent's in-flight tools report the cause accurately to the model.
       child.controller.abort(reason);
+
+      barriers.push(child.settled);
+      if (childTurnSettlement !== undefined) barriers.push(childTurnSettlement);
+      if (descendantBarrier !== undefined) barriers.push(descendantBarrier);
     }
+
+    // This method is also called from replay and direct fire-and-forget paths.
+    // Never reject: callers that need the barrier can await it, while legacy
+    // callers can safely ignore it without creating an unhandled rejection.
+    return Promise.allSettled(barriers).then(() => undefined);
   }
 
   markActiveChildDetached(agentId: string): void {
@@ -324,15 +369,25 @@ export class SessionSubagentHost {
   ): Promise<SubagentCompletion> {
     const controller = new AbortController();
     const unlinkAbortSignal = linkAbortSignal(options.signal, controller);
+    const settled = createControlledPromise<void>();
     this.activeChildren.set(childId, {
       controller,
       runInBackground: options.runInBackground,
+      settled,
     });
 
-    return run({ ...options, signal: controller.signal }).finally(() => {
+    const finish = (): void => {
       unlinkAbortSignal();
       this.activeChildren.delete(childId);
-    });
+      settled.resolve();
+    };
+
+    try {
+      return run({ ...options, signal: controller.signal }).finally(finish);
+    } catch (error) {
+      finish();
+      return Promise.reject(error);
+    }
   }
 
   private async runPromptTurn(
@@ -348,7 +403,10 @@ export class SessionSubagentHost {
 
     let childPrompt = options.prompt;
     if (profileName === 'explore') {
-      const gitContext = await collectGitContext(child.kaos, child.config.cwd);
+      const gitContext = await abortable(
+        collectGitContext(child.kaos, child.config.cwd),
+        options.signal,
+      );
       if (gitContext) childPrompt = `${gitContext}\n\n${childPrompt}`;
     }
 
@@ -399,7 +457,9 @@ export class SessionSubagentHost {
     parent: Agent,
     child: Agent,
     profile: ResolvedAgentProfile,
+    signal: AbortSignal,
   ): Promise<void> {
+    signal.throwIfAborted();
     // A subagent always inherits the parent agent's model.
     child.config.update({
       cwd: parent.config.cwd,
@@ -407,10 +467,13 @@ export class SessionSubagentHost {
       thinkingEffort: parent.config.thinkingEffort,
     });
 
-    const context = await prepareSystemPromptContext(
-      this.session.systemContextKaos(child.kaos.getcwd()),
-      this.session.options.kimiHomeDir,
-      { additionalDirs: child.getAdditionalDirs() },
+    const context = await abortable(
+      prepareSystemPromptContext(
+        this.session.systemContextKaos(child.kaos.getcwd()),
+        this.session.options.kimiHomeDir,
+        { additionalDirs: child.getAdditionalDirs() },
+      ),
+      signal,
     );
     child.useProfile(profile, context, this.session.options.kimiHomeDir);
     child.tools.inheritUserTools(parent.tools);
@@ -422,7 +485,7 @@ export class SessionSubagentHost {
     prompt: string,
     signal: AbortSignal,
   ): Promise<void> {
-    await parent.hooks?.trigger('SubagentStart', {
+    const trigger = parent.hooks?.trigger('SubagentStart', {
       matcherValue: profileName,
       signal,
       inputData: {
@@ -430,6 +493,7 @@ export class SessionSubagentHost {
         prompt: prompt.slice(0, HOOK_TEXT_PREVIEW_LENGTH),
       },
     });
+    if (trigger !== undefined) await abortable(trigger, signal);
   }
 
   private triggerSubagentStop(parent: Agent, profileName: string, result: string): void {
@@ -504,7 +568,28 @@ export class SessionSubagentHost {
 }
 
 async function runChildTurnToCompletion(child: Agent, signal: AbortSignal): Promise<void> {
-  const completion = await child.turn.waitForCurrentTurn(signal);
+  const turnSettlement = child.turn.waitForCurrentTurn();
+  let cancellationBarrier: Promise<void> | undefined;
+  const onAbort = (): void => {
+    cancellationBarrier = child.turn.cancel(undefined, signal.reason);
+  };
+  if (signal.aborted) {
+    onAbort();
+  } else {
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  let completion;
+  try {
+    completion = await abortable(turnSettlement, signal);
+  } catch (error) {
+    if (signal.aborted) {
+      await Promise.allSettled([turnSettlement, cancellationBarrier ?? Promise.resolve()]);
+    }
+    throw error;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
   const turnEnded = completion.event;
   if (turnEnded.reason !== 'completed') {
     if (turnEnded.error?.code === ErrorCodes.PROVIDER_FILTERED) {

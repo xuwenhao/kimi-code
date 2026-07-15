@@ -85,7 +85,13 @@ import {
   type TurnSeed,
 } from './stepRequest';
 import { StepRequestQueue, type StepRequestBatch } from './stepRequestQueue';
-import { cancelTurn, promptTurn, TurnModel } from './turnOps';
+import {
+  cancelTurn,
+  promptTurn,
+  TurnModel,
+  turnOutcome,
+  type TurnOutcomeIntent,
+} from './turnOps';
 import {
   renderTurnCancellationReminder,
   renderTurnFailureReminder,
@@ -112,6 +118,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
   private readonly pendingTurns: TurnJob[] = [];
   private activeTurnJob: TurnJob | undefined;
   private nextReservedTurnId: number | undefined;
+  private readonly cancellingTurnIds = new Set<number>();
   private disposing = false;
 
   constructor(
@@ -128,6 +135,12 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     @IAgentTelemetryContextService private readonly telemetryContext: IAgentTelemetryContextService,
   ) {
     super();
+    this._register(
+      this.wire.hooks.onDidRestore.register('loop-turn-outcome', async (_ctx, next) => {
+        await next();
+        this.materializePendingTurnOutcomes(true);
+      }),
+    );
   }
 
   override dispose(): void {
@@ -209,7 +222,15 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
   private cancelActiveTurn(turnId: number | undefined, cancellation: unknown): boolean {
     const turn = this.activeTurnJob?.turn;
     if (turn === undefined || (turnId !== undefined && turn.id !== turnId)) return false;
-    this.wire.dispatch(cancelTurn({ turnId }));
+    if (this.cancellingTurnIds.has(turn.id)) return true;
+    this.cancellingTurnIds.add(turn.id);
+    const outcome = this.createCancellationOutcome(turn.id, cancellation);
+    this.wire.dispatch(cancelTurn({
+      turnId,
+      outcomeId: outcome?.outcomeId,
+      outcomeTurnId: outcome?.turnId,
+      outcomeContent: outcome?.content,
+    }));
     return this.activity.cancel(cancellation);
   }
 
@@ -332,19 +353,37 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     return true;
   }
 
-  private pumpTurns(): void {
+  private pumpTurns(continueAfterStartFailure = false): void {
     if (this.disposing || this.activeTurnJob !== undefined) return;
-    const job = this.pendingTurns.shift();
-    if (job === undefined) return;
-    this.startTurn(job);
+    while (!this.disposing && this.activeTurnJob === undefined) {
+      const job = this.pendingTurns.shift();
+      if (job === undefined) return;
+      try {
+        this.startTurn(job);
+        return;
+      } catch (error) {
+        if (!continueAfterStartFailure || job.turn.state !== 'failed') throw error;
+      }
+    }
   }
 
   private startTurn(job: TurnJob): void {
     const lease = this.activity.begin('turn', { origin: job.seed.origin, turnId: job.turn.id });
-    this.wire.dispatch(promptTurn({ input: job.seed.input, origin: lease.origin }));
     job.turn.state = 'running';
     job.turn.signal = lease.signal;
     this.activeTurnJob = job;
+    try {
+      // An abnormal-turn intent is a durable ordering barrier: the reminder
+      // must reach context before the next prompt can be admitted. If the
+      // append actually committed and only a downstream observer threw, the
+      // TurnModel acknowledgement below lets this continue without retrying or
+      // duplicating it.
+      this.materializePendingTurnOutcomes(true);
+    } catch (error) {
+      this.failTurnStart(job, lease, error);
+      throw error;
+    }
+    this.wire.dispatch(promptTurn({ input: job.seed.input, origin: lease.origin }));
     this.eventBus.publish({ type: 'turn.started', turnId: job.turn.id, origin: lease.origin });
     void this.runTurn(job.turn, lease, job.ready).then(job.result.resolve, job.result.reject);
   }
@@ -359,6 +398,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     const turnTelemetry = this.telemetry.withContext(telemetryContext);
     const { mode, provider_type, protocol } = telemetryContext;
     let result: TurnResult | undefined;
+    let terminalOutcome: TurnOutcomeIntent | undefined;
     try {
       const started: TurnStartedTelemetryEvent = { turn_id: turn.id, mode, provider_type, protocol };
       turnTelemetry.track2('turn_started', started);
@@ -372,14 +412,17 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       result = this.resultFromTurnError(lease, error);
       return result;
     } finally {
+      const error = result?.type === 'failed' ? toKimiErrorPayload(result.error) : undefined;
+      if (result !== undefined) {
+        terminalOutcome = this.ensureTurnOutcomeIntent(turn.id, result, error);
+      }
       this.settleTurnReady(ready, result);
       this.releaseActiveTurn(turn, result);
       const outcome = result?.type ?? 'failed';
       lease.end(outcome, result?.type === 'failed' ? { error: result.error } : undefined);
       if (result !== undefined) {
-        const error = result.type === 'failed' ? toKimiErrorPayload(result.error) : undefined;
         this.closeAbandonedToolExchange(turn.id, result, error);
-        this.appendTurnOutcomeReminder(turn.id, result, error);
+        if (terminalOutcome !== undefined) this.materializeTurnOutcome(terminalOutcome);
         this.eventBus.publish({
           type: 'turn.ended',
           turnId: turn.id,
@@ -409,30 +452,120 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         protocol,
       };
       turnTelemetry.track2('turn_ended', ended);
-      this.pumpTurns();
+      this.pumpTurns(true);
     }
   }
 
-  private appendTurnOutcomeReminder(
+  private failTurnStart(job: TurnJob, lease: ActivityLease, error: unknown): void {
+    const failure: TurnResult = { type: 'failed', error, steps: 0 };
+    for (const step of job.steps.values()) step.cancel(error);
+    job.controller.abort(error);
+    job.turn.state = 'failed';
+    this.cancellingTurnIds.delete(job.turn.id);
+    if (this.activeTurnJob === job) this.activeTurnJob = undefined;
+    if (
+      this.pendingTurns.length === 0 &&
+      this.nextReservedTurnId === job.turn.id + 1
+    ) {
+      this.nextReservedTurnId = job.turn.id;
+    }
+    job.ready.reject(error instanceof Error ? error : new Error(toErrorMessage(error)));
+    job.result.resolve(failure);
+    lease.end('failed', { error });
+  }
+
+  private ensureTurnOutcomeIntent(
     turnId: number,
     result: TurnResult,
     error: ReturnType<typeof toKimiErrorPayload> | undefined,
-  ): void {
-    try {
-      const content =
-        result.type === 'failed'
-          ? renderTurnFailureReminder(error)
-          : result.type === 'cancelled'
-            ? renderTurnCancellationReminder(result.reason, isUserCancellation(result.reason))
-            : undefined;
-      if (content === undefined) return;
-      this.reminders.appendSystemReminder(content, {
-        kind: 'injection',
-        variant: TURN_OUTCOME_REMINDER_VARIANT,
-      });
-    } catch (reminderError) {
-      this.log.warn('failed to append turn outcome reminder', { turnId, error: reminderError });
+  ): TurnOutcomeIntent | undefined {
+    if (result.type === 'completed') return undefined;
+    const existing = this.pendingTurnOutcome(turnId);
+    if (existing !== undefined) return existing;
+    // Active cancellation reserves its stable intent in turn.cancel. If a
+    // destructive context operation consumed that intent before the worker
+    // observed the abort, it is a tombstone—not permission to mint a second
+    // outcome after the clear/undo boundary.
+    if (result.type === 'cancelled' && this.cancellingTurnIds.has(turnId)) {
+      return undefined;
     }
+    try {
+      const content = result.type === 'failed'
+        ? renderTurnFailureReminder(error)
+        : renderTurnCancellationReminder(result.reason, isUserCancellation(result.reason));
+      const outcome = { outcomeId: randomUUID(), turnId, content };
+      this.wire.dispatch(turnOutcome(outcome));
+      return this.pendingTurnOutcome(turnId) ?? outcome;
+    } catch (outcomeError) {
+      this.safeDiagnostic('failed to persist turn outcome intent', {
+        turnId,
+        error: outcomeError,
+      });
+      return undefined;
+    }
+  }
+
+  private createCancellationOutcome(
+    turnId: number,
+    cancellation: unknown,
+  ): TurnOutcomeIntent | undefined {
+    const existing = this.pendingTurnOutcome(turnId);
+    if (existing !== undefined) return existing;
+    try {
+      return {
+        outcomeId: randomUUID(),
+        turnId,
+        content: renderTurnCancellationReminder(
+          cancellation,
+          isUserCancellation(cancellation),
+        ),
+      };
+    } catch (error) {
+      this.safeDiagnostic('failed to render turn cancellation outcome', { turnId, error });
+      return undefined;
+    }
+  }
+
+  private pendingTurnOutcome(turnId: number): TurnOutcomeIntent | undefined {
+    return this.wire
+      .getModel(TurnModel)
+      .pendingOutcomes.find((outcome) => outcome.turnId === turnId);
+  }
+
+  private materializePendingTurnOutcomes(strict = false): void {
+    for (const outcome of this.wire.getModel(TurnModel).pendingOutcomes) {
+      this.materializeTurnOutcome(outcome, strict);
+    }
+  }
+
+  private materializeTurnOutcome(outcome: TurnOutcomeIntent, strict = false): void {
+    if (!this.hasPendingTurnOutcome(outcome.outcomeId)) return;
+    try {
+      this.reminders.appendSystemReminder(
+        outcome.content,
+        { kind: 'injection', variant: TURN_OUTCOME_REMINDER_VARIANT },
+        outcome.outcomeId,
+      );
+    } catch (error) {
+      if (this.pendingTurnOutcome(outcome.turnId)?.outcomeId !== outcome.outcomeId) {
+        this.safeDiagnostic('turn outcome reminder committed with observer failure', {
+          turnId: outcome.turnId,
+          error,
+        });
+        return;
+      }
+      if (strict) throw error;
+      this.safeDiagnostic('failed to append turn outcome reminder', {
+        turnId: outcome.turnId,
+        error,
+      });
+    }
+  }
+
+  private hasPendingTurnOutcome(outcomeId: string): boolean {
+    return this.wire
+      .getModel(TurnModel)
+      .pendingOutcomes.some((outcome) => outcome.outcomeId === outcomeId);
   }
 
   private closeAbandonedToolExchange(
@@ -445,14 +578,23 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
         abandonedToolResultOutput(result, error),
       );
       if (closed === 0) return;
-      this.log.warn('closed abandoned tool exchange at turn end', {
+      this.safeDiagnostic('closed abandoned tool exchange at turn end', {
         turnId,
         reason: result.type,
         closed,
       });
     } catch (closeError) {
-      this.log.warn('failed to close abandoned tool exchange', { turnId, error: closeError });
+      this.safeDiagnostic('failed to close abandoned tool exchange', {
+        turnId,
+        error: closeError,
+      });
     }
+  }
+
+  private safeDiagnostic(message: string, payload?: unknown): void {
+    try {
+      this.log.warn(message, payload);
+    } catch { }
   }
 
   private resultFromTurnError(lease: ActivityLease, error: unknown): TurnResult {
@@ -475,6 +617,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
 
   private releaseActiveTurn(turn: Turn, result: TurnResult | undefined): void {
     (turn as MutableTurn).state = result?.type ?? 'failed';
+    this.cancellingTurnIds.delete(turn.id);
     const job = this.activeTurnJob?.turn === turn ? this.activeTurnJob : undefined;
     if (job === undefined) return;
     const reason = result?.type === 'cancelled' ? result.reason : abortError('Turn ended');

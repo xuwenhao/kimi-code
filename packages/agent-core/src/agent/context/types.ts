@@ -111,6 +111,19 @@ export type ContextMessage = Message & {
   readonly note?: string;
 };
 
+/**
+ * Durable acknowledgement that an accepted prompt/steer has reached context.
+ *
+ * This metadata is persisted on the same record as the context mutation, so
+ * replay can distinguish an admission that still needs delivery from one that
+ * was already committed immediately before a process crash.
+ */
+export interface TurnInputConsumption {
+  readonly kind: 'prompt' | 'steer';
+  readonly id: string;
+  readonly turnId: number;
+}
+
 export interface UserMessageRecord {
   content: readonly ContentPart[];
   origin: PromptOrigin;

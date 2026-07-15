@@ -146,6 +146,12 @@ export class AgentLLMRequesterService implements IAgentLLMRequesterService {
     @IFaultInjectionService private readonly faultInjection: IFaultInjectionService,
   ) {}
 
+  refreshTurnSystemPrompt(turnId: number, systemPrompt: string): void {
+    const snapshot = this.turnConfigs.get(turnId);
+    if (snapshot === undefined) return;
+    this.turnConfigs.set(turnId, { ...snapshot, systemPrompt });
+  }
+
   async request(
     overrides: LLMRequestOverrides = {},
     onPart: LLMRequestPartHandler = noopOnPart,

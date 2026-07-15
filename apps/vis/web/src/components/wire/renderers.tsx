@@ -120,6 +120,19 @@ export const WIRE_RENDERERS: RendererMap = {
     ),
   },
 
+  'turn.deferred_prompt_started': {
+    tone: 'turn',
+    label: 'prompt→',
+    headline: (r) => ({
+      main: (
+        <span className="flex items-center gap-2 min-w-0">
+          <Mono>turn {r.turnId}</Mono>
+          <Dim className="truncate">deferred {r.deferredPromptId}</Dim>
+        </span>
+      ),
+    }),
+  },
+
   'turn.steer': {
     tone: 'turn',
     label: 'steer',
@@ -162,6 +175,50 @@ export const WIRE_RENDERERS: RendererMap = {
     label: 'cancel',
     headline: (r) => ({
       main: <Mono>{r.turnId !== undefined ? `turn ${r.turnId}` : '(latest)'}</Mono>,
+    }),
+  },
+
+  'turn.outcome': {
+    tone: 'warning',
+    label: 'outcome',
+    headline: (r) => ({
+      main: (
+        <span className="flex items-center gap-2 min-w-0">
+          <Mono>turn {r.turnId}</Mono>
+          <Dim className="truncate">{truncate(r.content, 80)}</Dim>
+        </span>
+      ),
+    }),
+    detail: (r) => (
+      <div className="grid grid-cols-[140px_1fr] gap-x-3 gap-y-[2px]">
+        <FieldRow label="outcomeId" wide>
+          <Mono className="break-all">{r.outcomeId}</Mono>
+        </FieldRow>
+        <FieldRow label="turnId">
+          <span className="text-[var(--color-sev-info)]">{r.turnId}</span>
+        </FieldRow>
+        <FieldRow label="content" wide>
+          <SizePreview label="content" sizeBytes={r.content.length} preview={r.content}>
+            <pre className="whitespace-pre-wrap break-words text-fg-1">{r.content}</pre>
+          </SizePreview>
+        </FieldRow>
+      </div>
+    ),
+  },
+
+  'turn.input_consumed': {
+    tone: 'meta',
+    label: 'consumed',
+    headline: (r) => ({
+      main: (
+        <span className="flex items-center gap-2 min-w-0">
+          <Pill tone="turn" variant="soft">
+            {r.consumedTurnInput.kind}
+          </Pill>
+          <Mono>turn {r.consumedTurnInput.turnId}</Mono>
+          <Dim className="truncate">{r.consumedTurnInput.id}</Dim>
+        </span>
+      ),
     }),
   },
 

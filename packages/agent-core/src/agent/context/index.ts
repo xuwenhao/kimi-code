@@ -17,7 +17,10 @@ import {
   type CompactionInput,
   type CompactionResult,
 } from '../compaction';
+import { agentRecordAppendAccepted } from '../records/append-error';
+import type { AgentRecord } from '../records/types';
 import { TURN_OUTCOME_REMINDER_VARIANT } from '../turn/outcome-reminder';
+import { stripDynamicToolContext } from './dynamic-tools';
 import {
   captureMediaStripSnapshot,
   degradeOlderMediaParts,
@@ -28,12 +31,12 @@ import {
   type ProjectOptions,
   trimTrailingOpenToolExchange,
 } from './projector';
-import { stripDynamicToolContext } from './dynamic-tools';
 import {
   USER_PROMPT_ORIGIN,
   type AgentContextData,
   type ContextMessage,
   type PromptOrigin,
+  type TurnInputConsumption,
 } from './types';
 
 export * from './types';
@@ -53,12 +56,60 @@ export class ContextMemory {
   private openSteps: Map<string, ContextMessage> = new Map();
   private pendingToolResultIds = new Set<string>();
   private deferredMessages: ContextMessage[] = [];
+  private readonly committedTurnInputParts = new Map<string, Set<number>>();
+  private readonly committedTurnInputPartMessages = new Map<string, Map<number, ContextMessage>>();
+  private readonly inFlightTurnInputParts = new Map<string, { final: boolean }>();
+  private readonly consumedTurnInputs = new Set<string>();
+  private readonly cancelledTurnInputs = new Set<string>();
+  private readonly materializedTurnOutcomeIds = new Set<string>();
+  private contextMutationPersistenceDepth = 0;
   private _lastAssistantAt: number | null = null;
   // Signature of the last logged set of projection repairs, so a repair that
   // recurs identically on every send is logged once rather than per step.
   private lastProjectionRepairSignature: string | null = null;
 
   constructor(protected readonly agent: Agent) {}
+
+  private assertNotPersistingContextMutation(): void {
+    if (this.contextMutationPersistenceDepth > 0) {
+      throw new KimiError(
+        ErrorCodes.SESSION_STATE_INVALID,
+        'Cannot mutate context re-entrantly from record persistence',
+      );
+    }
+  }
+
+  private persistContextMutation(record: AgentRecord): unknown {
+    this.assertNotPersistingContextMutation();
+    this.contextMutationPersistenceDepth++;
+    try {
+      this.agent.records.logRecord(record);
+      return undefined;
+    } catch (error) {
+      if (agentRecordAppendAccepted(error) === true) return error;
+      throw error;
+    } finally {
+      this.contextMutationPersistenceDepth--;
+    }
+  }
+
+  private reportAcceptedContextObserverError(error: unknown, operation: string): void {
+    if (error === undefined) return;
+    this.reportContextWarning('context record committed with observer failure', {
+      error,
+      operation,
+    });
+  }
+
+  private reportContextWarning(message: string, payload: unknown): void {
+    try {
+      this.agent.log.warn(message, payload);
+    } catch {
+      // The context mutation is already durable and applied locally. Logging
+      // is best-effort here: surfacing a diagnostic sink failure would invite
+      // the caller to retry an accepted record. Do not recurse into logging.
+    }
+  }
 
   get lastAssistantAt(): number | null {
     return this._lastAssistantAt;
@@ -67,8 +118,12 @@ export class ContextMemory {
   appendUserMessage(
     content: readonly ContentPart[],
     origin: PromptOrigin = USER_PROMPT_ORIGIN,
+    consumedTurnInput?: TurnInputConsumption,
   ): void {
-    if (content.length === 0) return;
+    if (content.length === 0) {
+      if (consumedTurnInput !== undefined) this.consumeEmptyTurnInput(consumedTurnInput);
+      return;
+    }
     // Prompt ingestion (server upload/base64 route, TUI paste, ACP) annotates
     // a compressed image with an inline `<system>` caption next to the image.
     // Left inside the user message, that raw markup is user-visible in every
@@ -79,26 +134,57 @@ export class ContextMemory {
       origin.kind === 'user'
         ? splitImageCompressionCaptions(content)
         : { captions: [], parts: [...content] };
-    for (const caption of captions) {
-      this.appendSystemReminder(caption, { kind: 'injection', variant: 'image_compression' });
+    const messages: ContextMessage[] = captions.map((caption) =>
+      this.buildSystemReminderMessage(caption, { kind: 'injection', variant: 'image_compression' }),
+    );
+    if (parts.length > 0) {
+      messages.push({
+        role: 'user',
+        content: parts,
+        toolCalls: [],
+        origin,
+      });
     }
-    if (parts.length === 0) return;
-    this.appendMessage({
-      role: 'user',
-      content: parts,
-      toolCalls: [],
-      origin,
-    });
+    if (messages.length === 0) {
+      if (consumedTurnInput !== undefined) this.consumeEmptyTurnInput(consumedTurnInput);
+      return;
+    }
+    for (const [index, message] of messages.entries()) {
+      const turnInputPart =
+        consumedTurnInput !== undefined && messages.length > 1
+          ? { consumedTurnInput, index }
+          : undefined;
+      if (turnInputPart !== undefined && this.hasCommittedTurnInputPart(turnInputPart)) continue;
+      this.appendMessage(
+        message,
+        index === messages.length - 1 ? consumedTurnInput : undefined,
+        turnInputPart,
+      );
+    }
   }
 
-  appendSystemReminder(content: string, origin: PromptOrigin): void {
+  appendSystemReminder(
+    content: string,
+    origin: PromptOrigin,
+    consumedTurnInput?: TurnInputConsumption,
+    materializedTurnOutcomeId?: string,
+  ): void {
+    this.appendMessage(
+      this.buildSystemReminderMessage(content, origin),
+      consumedTurnInput,
+      undefined,
+      materializedTurnOutcomeId,
+    );
+  }
+
+  private buildSystemReminderMessage(content: string, origin: PromptOrigin): ContextMessage {
     const text = `<system-reminder>\n${content.trim()}\n</system-reminder>`;
-    this.appendMessage({
+    return {
       role: 'user',
       content: [{ type: 'text', text }],
       toolCalls: [],
       origin,
-    });
+    };
   }
 
   /**
@@ -154,6 +240,12 @@ export class ContextMemory {
   }
 
   popMatchedMessage(matcher: (origin: PromptOrigin | undefined) => boolean): boolean {
+    // Unlike record-backed mutations, this projection cleanup has no durable
+    // event of its own. Letting it run inside an outer context append observer
+    // would reverse live/replay order, so reject before inspecting or changing
+    // either history buffer. Turn-cancellation convergence intentionally uses
+    // cancelTurnInputExpansions instead and remains available in this window.
+    this.assertNotPersistingContextMutation();
     const lastDeferred = this.deferredMessages.at(-1);
     const last = lastDeferred ?? this._history.at(-1);
     if (last === undefined) return false;
@@ -166,26 +258,73 @@ export class ContextMemory {
     return true;
   }
 
+  /**
+   * Tombstone incomplete child records belonging to a cancelled prompt/steer.
+   * A completed expansion has already cleared its child map and is retained;
+   * only orphan captions staged before the final consumption record are
+   * removed.
+   */
+  cancelTurnInputExpansions(inputs: readonly TurnInputConsumption[]): void {
+    const removed = new Set<ContextMessage>();
+    for (const input of inputs) {
+      const key = turnInputKey(input);
+      this.cancelledTurnInputs.add(key);
+      for (const message of this.committedTurnInputPartMessages.get(key)?.values() ?? []) {
+        removed.add(message);
+      }
+      this.committedTurnInputParts.delete(key);
+      this.committedTurnInputPartMessages.delete(key);
+    }
+    if (removed.size === 0) return;
+
+    for (let i = this._history.length - 1; i >= 0; i--) {
+      const message = this._history[i];
+      if (message === undefined || !removed.has(message)) continue;
+      this._history.splice(i, 1);
+      this.agent.injection.onContextMessageRemoved(i);
+      if (i < this.tokenCountCoveredMessageCount) {
+        this.tokenCountCoveredMessageCount--;
+        this._tokenCount -= estimateTokensForMessages([message]);
+      }
+    }
+    this.deferredMessages = this.deferredMessages.filter((message) => !removed.has(message));
+    this.agent.replayBuilder.removeLastMessages(removed);
+  }
+
+  hasIncompleteTurnInput(input: Pick<TurnInputConsumption, 'kind' | 'id'>): boolean {
+    const key = turnInputKey(input);
+    const inFlight = this.inFlightTurnInputParts.get(key);
+    if (inFlight?.final === true) return false;
+    return inFlight !== undefined || this.committedTurnInputParts.has(key);
+  }
+
   clear(): void {
-    this.agent.records.logRecord({ type: 'context.clear' });
+    const acceptedError = this.persistContextMutation({
+      type: 'context.clear',
+    });
     this._history = [];
     this._tokenCount = 0;
     this.tokenCountCoveredMessageCount = 0;
     this.openSteps.clear();
     this.pendingToolResultIds.clear();
     this.deferredMessages = [];
+    this.committedTurnInputParts.clear();
+    this.committedTurnInputPartMessages.clear();
+    this.inFlightTurnInputParts.clear();
     this._lastAssistantAt = null;
+    this.agent.turn.clearPendingOutcomes();
     this.agent.microCompaction.reset();
     this.agent.injection.onContextClear();
     this.agent.tools.onContextCleared();
     this.agent.emitStatusUpdated();
+    this.reportAcceptedContextObserverError(acceptedError, 'clear');
   }
 
   undo(count: number): void {
     if (count <= 0) return;
     if (this._history.length === 0) return;
 
-    this.agent.records.logRecord({ type: 'context.undo', count });
+    const acceptedError = this.persistContextMutation({ type: 'context.undo', count });
 
     let removedUserCount = 0;
     const removedMessages = new Set<ContextMessage>();
@@ -215,6 +354,23 @@ export class ContextMemory {
 
       if (isRealUserInput(message)) {
         removedUserCount++;
+        // Image-compression captions are hidden children of this exact user
+        // prompt and were appended immediately before it. Undoing the parent
+        // must remove those children too; otherwise an orphan system reminder
+        // remains in model context after the image/text itself is gone.
+        for (let j = i - 1; j >= 0; j--) {
+          const child = this._history[j];
+          if (child?.origin?.kind !== 'injection' || child.origin.variant !== 'image_compression') {
+            break;
+          }
+          removedMessages.add(child);
+          this._history.splice(j, 1);
+          this.agent.injection.onContextMessageRemoved(j);
+          if (j < this.tokenCountCoveredMessageCount) {
+            this.tokenCountCoveredMessageCount--;
+            this._tokenCount -= estimateTokensForMessages([child]);
+          }
+        }
         if (removedUserCount >= count) break;
       }
     }
@@ -224,13 +380,12 @@ export class ContextMemory {
     this.openSteps.clear();
     this.pendingToolResultIds.clear();
     this.deferredMessages = [];
+    if (removedUserCount > 0) this.agent.turn.clearPendingOutcomes();
     this.agent.microCompaction.reset(this._history.length);
     this.agent.emitStatusUpdated();
+    this.reportAcceptedContextObserverError(acceptedError, 'undo');
 
-    if (
-      !this.agent.records.restoring &&
-      (stoppedAtBoundary || removedUserCount < count)
-    ) {
+    if (!this.agent.records.restoring && (stoppedAtBoundary || removedUserCount < count)) {
       throw new KimiError(
         ErrorCodes.REQUEST_INVALID,
         formatUndoUnavailableMessage(count, removedUserCount, stoppedAtBoundary),
@@ -291,8 +446,7 @@ export class ContextMemory {
     // so their `summary` remains the model-context text during restore.
     const contextSummary = input.contextSummary ?? input.summary;
     const tokensAfter =
-      input.tokensAfter ??
-      estimateTokens(contextSummary) + estimateTokensForMessages(keptMessages);
+      input.tokensAfter ?? estimateTokens(contextSummary) + estimateTokensForMessages(keptMessages);
     const keptUserMessageCount =
       input.keptUserMessageCount ?? selection.head.length + selection.tail.length;
     const keptHeadUserMessageCount =
@@ -307,10 +461,17 @@ export class ContextMemory {
       keptHeadUserMessageCount,
       droppedCount: input.droppedCount,
     };
-    this.agent.records.logRecord({
+    const acceptedError = this.persistContextMutation({
       type: 'context.apply_compaction',
       ...result,
     });
+    // A partial prompt expansion can have durable caption children without
+    // its final user message. Compaction drops those injections, so their
+    // child acknowledgements must be reset as well; retry then reconstructs
+    // the complete prompt exactly once in the new context.
+    this.committedTurnInputParts.clear();
+    this.committedTurnInputPartMessages.clear();
+    this.inFlightTurnInputParts.clear();
     this.agent.replayBuilder.patchLast('compaction', {
       result: {
         summary: result.summary,
@@ -361,6 +522,7 @@ export class ContextMemory {
     this.agent.injection.onContextCompacted();
     this.agent.tools.onContextCompacted();
     this.agent.emitStatusUpdated();
+    this.reportAcceptedContextObserverError(acceptedError, 'apply_compaction');
     return result;
   }
 
@@ -420,7 +582,9 @@ export class ContextMemory {
       return;
     }
     const signature = notable
-      .map((anomaly) => ('toolCallId' in anomaly ? `${anomaly.kind}:${anomaly.toolCallId}` : anomaly.kind))
+      .map((anomaly) =>
+        'toolCallId' in anomaly ? `${anomaly.kind}:${anomaly.toolCallId}` : anomaly.kind,
+      )
       .toSorted()
       .join('|');
     if (signature === this.lastProjectionRepairSignature) return;
@@ -578,124 +742,236 @@ export class ContextMemory {
   }
 
   appendLoopEvent(event: LoopRecordedEvent): void {
-    this.agent.records.logRecord({
+    const acceptedError = this.persistContextMutation({
       type: 'context.append_loop_event',
       event,
     });
-    switch (event.type) {
-      case 'step.begin': {
-        // A new assistant step means any tool calls still pending from an
-        // earlier step were interrupted (the invariant guarantees this never
-        // happens live, so this is a no-op outside replay). Close them in place
-        // before opening the new step so mid-history gaps stay aligned.
-        const closed = this.closePendingToolResults();
-        if (closed.length > 0) {
-          // A mid-history gap means results were lost before this boundary —
-          // a genuine defect worth investigating, unlike the expected trailing
-          // interruption `finishResume` closes.
-          this.agent.log.warn('closed unresolved tool calls at a step boundary', {
-            closed: closed.length,
-            toolCallIds: closed.slice(0, 5),
-          });
+    try {
+      switch (event.type) {
+        case 'step.begin': {
+          // A new assistant step means any tool calls still pending from an
+          // earlier step were interrupted (the invariant guarantees this never
+          // happens live, so this is a no-op outside replay). Close them in place
+          // before opening the new step so mid-history gaps stay aligned.
+          const closed = this.closePendingToolResults();
+          if (closed.length > 0) {
+            // A mid-history gap means results were lost before this boundary —
+            // a genuine defect worth investigating, unlike the expected trailing
+            // interruption `finishResume` closes.
+            this.reportContextWarning('closed unresolved tool calls at a step boundary', {
+              closed: closed.length,
+              toolCallIds: closed.slice(0, 5),
+            });
+          }
+          const message: ContextMessage = {
+            role: 'assistant',
+            content: [],
+            toolCalls: [],
+          };
+          this.pushHistory(message);
+          this.openSteps.set(event.uuid, message);
+          return;
         }
-        const message: ContextMessage = {
-          role: 'assistant',
-          content: [],
-          toolCalls: [],
-        };
-        this.pushHistory(message);
-        this.openSteps.set(event.uuid, message);
-        return;
-      }
-      case 'step.end': {
-        const openStep = this.openSteps.get(event.uuid);
-        this.openSteps.delete(event.uuid);
-        if (event.usage !== undefined) {
-          const openStepIndex = openStep === undefined ? -1 : this._history.indexOf(openStep);
-          const coveredCount =
-            openStepIndex === -1 ? this._history.length : openStepIndex + 1;
-          const totalUsage =
-            event.usage.inputCacheRead +
-            event.usage.inputCacheCreation +
-            event.usage.inputOther +
-            event.usage.output;
-          if (totalUsage > 0) {
-            this._tokenCount = totalUsage;
-          } else {
-            // The provider reported zero usage (e.g. content filter). Do not
-            // overwrite the accumulated context token count with 0; add an
-            // estimate for the newly covered messages so the invariant between
-            // _tokenCount and tokenCountCoveredMessageCount stays intact.
-            const previousCoveredCount = this.tokenCountCoveredMessageCount;
-            this._tokenCount += estimateTokensForMessages(
-              this._history.slice(previousCoveredCount, coveredCount),
+        case 'step.end': {
+          const openStep = this.openSteps.get(event.uuid);
+          this.openSteps.delete(event.uuid);
+          if (event.usage !== undefined) {
+            const openStepIndex = openStep === undefined ? -1 : this._history.indexOf(openStep);
+            const coveredCount = openStepIndex === -1 ? this._history.length : openStepIndex + 1;
+            const totalUsage =
+              event.usage.inputCacheRead +
+              event.usage.inputCacheCreation +
+              event.usage.inputOther +
+              event.usage.output;
+            if (totalUsage > 0) {
+              this._tokenCount = totalUsage;
+            } else {
+              // The provider reported zero usage (e.g. content filter). Do not
+              // overwrite the accumulated context token count with 0; add an
+              // estimate for the newly covered messages so the invariant between
+              // _tokenCount and tokenCountCoveredMessageCount stays intact.
+              const previousCoveredCount = this.tokenCountCoveredMessageCount;
+              this._tokenCount += estimateTokensForMessages(
+                this._history.slice(previousCoveredCount, coveredCount),
+              );
+            }
+            this.tokenCountCoveredMessageCount = coveredCount;
+          }
+          this.flushDeferredMessagesIfToolExchangeClosed();
+          return;
+        }
+        case 'content.part': {
+          const openStep = this.openSteps.get(event.stepUuid);
+          if (openStep === undefined) {
+            throw new Error(
+              `Received content_part for unknown step_uuid '${event.stepUuid}' (no open step_begin)`,
             );
           }
-          this.tokenCountCoveredMessageCount = coveredCount;
+          openStep.content.push(event.part);
+          return;
         }
-        this.flushDeferredMessagesIfToolExchangeClosed();
-        return;
-      }
-      case 'content.part': {
-        const openStep = this.openSteps.get(event.stepUuid);
-        if (openStep === undefined) {
-          throw new Error(
-            `Received content_part for unknown step_uuid '${event.stepUuid}' (no open step_begin)`,
-          );
+        case 'tool.call': {
+          const openStep = this.openSteps.get(event.stepUuid);
+          if (openStep === undefined) {
+            throw new Error(
+              `Received tool_call for unknown step_uuid '${event.stepUuid}' (no open step_begin)`,
+            );
+          }
+          openStep.toolCalls.push({
+            type: 'function',
+            id: event.toolCallId,
+            name: event.name,
+            arguments: event.args === undefined ? null : JSON.stringify(event.args),
+            extras: event.extras,
+          });
+          this.pendingToolResultIds.add(event.toolCallId);
+          return;
         }
-        openStep.content.push(event.part);
-        return;
-      }
-      case 'tool.call': {
-        const openStep = this.openSteps.get(event.stepUuid);
-        if (openStep === undefined) {
-          throw new Error(
-            `Received tool_call for unknown step_uuid '${event.stepUuid}' (no open step_begin)`,
-          );
+        case 'tool.result': {
+          // Drop a result for an id that is not awaiting one: it was already
+          // closed in place at a step boundary (a stale duplicate from an older
+          // tail-only finishResume), or its call is gone.
+          if (!this.pendingToolResultIds.has(event.toolCallId)) return;
+          // History stores the fact verbatim: the tool's own output plus the
+          // structured isError/note fields. Model-facing status text (error
+          // prefix, empty placeholder) and the note are rendered only at LLM
+          // projection time (see tool-result-render.ts).
+          const message = createToolMessage(event.toolCallId, event.result.output);
+          this.pushHistory({
+            ...message,
+            role: 'tool',
+            isError: event.result.isError,
+            note: event.result.note,
+          });
+          this.pendingToolResultIds.delete(event.toolCallId);
+          this.flushDeferredMessagesIfToolExchangeClosed();
+          return;
         }
-        openStep.toolCalls.push({
-          type: 'function',
-          id: event.toolCallId,
-          name: event.name,
-          arguments: event.args === undefined ? null : JSON.stringify(event.args),
-          extras: event.extras,
-        });
-        this.pendingToolResultIds.add(event.toolCallId);
-        return;
       }
-      case 'tool.result': {
-        // Drop a result for an id that is not awaiting one: it was already
-        // closed in place at a step boundary (a stale duplicate from an older
-        // tail-only finishResume), or its call is gone.
-        if (!this.pendingToolResultIds.has(event.toolCallId)) return;
-        // History stores the fact verbatim: the tool's own output plus the
-        // structured isError/note fields. Model-facing status text (error
-        // prefix, empty placeholder) and the note are rendered only at LLM
-        // projection time (see tool-result-render.ts).
-        const message = createToolMessage(event.toolCallId, event.result.output);
-        this.pushHistory({
-          ...message,
-          role: 'tool',
-          isError: event.result.isError,
-          note: event.result.note,
-        });
-        this.pendingToolResultIds.delete(event.toolCallId);
-        this.flushDeferredMessagesIfToolExchangeClosed();
-        return;
-      }
+    } finally {
+      this.reportAcceptedContextObserverError(acceptedError, 'append_loop_event');
     }
   }
 
-  appendMessage(message: ContextMessage): void {
-    this.agent.records.logRecord({
-      type: 'context.append_message',
-      message,
-    });
-    if (this.hasOpenToolExchange()) {
-      this.deferredMessages.push(message);
+  appendMessage(
+    message: ContextMessage,
+    consumedTurnInput?: TurnInputConsumption,
+    turnInputPart?: { consumedTurnInput: TurnInputConsumption; index: number },
+    materializedTurnOutcomeId?: string,
+  ): void {
+    if (
+      materializedTurnOutcomeId !== undefined &&
+      this.materializedTurnOutcomeIds.has(materializedTurnOutcomeId)
+    ) {
+      this.agent.turn.consumeOutcome(materializedTurnOutcomeId);
       return;
     }
-    this.pushHistory(message);
+    if (
+      consumedTurnInput !== undefined &&
+      this.consumedTurnInputs.has(turnInputKey(consumedTurnInput))
+    ) {
+      this.agent.turn.consumeTurnInput(consumedTurnInput);
+      return;
+    }
+    if (turnInputPart !== undefined) {
+      const partKey = turnInputKey(turnInputPart.consumedTurnInput);
+      if (
+        this.consumedTurnInputs.has(partKey) ||
+        this.hasCommittedTurnInputPart(turnInputPart) ||
+        this.cancelledTurnInputs.has(partKey)
+      ) {
+        return;
+      }
+    }
+
+    let acceptedError: unknown;
+    const inFlightPartKey =
+      turnInputPart === undefined ? undefined : turnInputKey(turnInputPart.consumedTurnInput);
+    if (inFlightPartKey !== undefined) {
+      this.inFlightTurnInputParts.set(inFlightPartKey, {
+        final: consumedTurnInput !== undefined,
+      });
+    }
+    try {
+      acceptedError = this.persistContextMutation({
+        type: 'context.append_message',
+        message,
+        consumedTurnInput,
+        turnInputPart,
+        materializedTurnOutcomeId,
+      });
+    } catch (error) {
+      if (inFlightPartKey !== undefined) this.inFlightTurnInputParts.delete(inFlightPartKey);
+      throw error;
+    }
+
+    if (
+      turnInputPart !== undefined &&
+      this.cancelledTurnInputs.has(turnInputKey(turnInputPart.consumedTurnInput))
+    ) {
+      if (inFlightPartKey !== undefined) this.inFlightTurnInputParts.delete(inFlightPartKey);
+      this.reportAcceptedContextObserverError(acceptedError, 'append_message');
+      return;
+    }
+
+    if (turnInputPart !== undefined) this.markTurnInputPartCommitted(turnInputPart, message);
+    if (inFlightPartKey !== undefined) this.inFlightTurnInputParts.delete(inFlightPartKey);
+    if (consumedTurnInput !== undefined) {
+      const key = turnInputKey(consumedTurnInput);
+      this.committedTurnInputParts.delete(key);
+      this.committedTurnInputPartMessages.delete(key);
+      this.consumedTurnInputs.add(key);
+      this.agent.turn.consumeTurnInput(consumedTurnInput);
+    }
+    if (materializedTurnOutcomeId !== undefined) {
+      this.materializedTurnOutcomeIds.add(materializedTurnOutcomeId);
+      this.agent.turn.consumeOutcome(materializedTurnOutcomeId);
+    }
+    if (this.hasOpenToolExchange()) {
+      this.deferredMessages.push(message);
+    } else {
+      this.pushHistory(message);
+    }
+    this.reportAcceptedContextObserverError(acceptedError, 'append_message');
+  }
+
+  private consumeEmptyTurnInput(consumedTurnInput: TurnInputConsumption): void {
+    const key = turnInputKey(consumedTurnInput);
+    if (this.consumedTurnInputs.has(key)) {
+      this.agent.turn.consumeTurnInput(consumedTurnInput);
+      return;
+    }
+    const acceptedError = this.persistContextMutation({
+      type: 'turn.input_consumed',
+      consumedTurnInput,
+    });
+    this.consumedTurnInputs.add(key);
+    this.agent.turn.consumeTurnInput(consumedTurnInput);
+    this.reportAcceptedContextObserverError(acceptedError, 'consume_empty_turn_input');
+  }
+
+  private hasCommittedTurnInputPart(part: {
+    consumedTurnInput: TurnInputConsumption;
+    index: number;
+  }): boolean {
+    return (
+      this.committedTurnInputParts.get(turnInputKey(part.consumedTurnInput))?.has(part.index) ===
+      true
+    );
+  }
+
+  private markTurnInputPartCommitted(
+    part: { consumedTurnInput: TurnInputConsumption; index: number },
+    message: ContextMessage,
+  ): void {
+    const key = turnInputKey(part.consumedTurnInput);
+    const indices = this.committedTurnInputParts.get(key) ?? new Set<number>();
+    indices.add(part.index);
+    this.committedTurnInputParts.set(key, indices);
+    const messages =
+      this.committedTurnInputPartMessages.get(key) ?? new Map<number, ContextMessage>();
+    messages.set(part.index, message);
+    this.committedTurnInputPartMessages.set(key, messages);
   }
 
   private flushDeferredMessagesIfToolExchangeClosed(): void {
@@ -756,13 +1032,19 @@ function splitImageCompressionCaptions(content: readonly ContentPart[]): {
   return { captions, parts };
 }
 
+function turnInputKey(input: Pick<TurnInputConsumption, 'kind' | 'id'>): string {
+  return `${input.kind}:${input.id}`;
+}
+
 function formatUndoUnavailableMessage(
   requestedCount: number,
   undoableCount: number,
   stoppedAtCompaction: boolean,
 ): string {
   const reason = stoppedAtCompaction ? ' after the last compaction' : '';
-  return `Cannot undo ${formatPromptCount(requestedCount)}; only ${formatPromptCount(undoableCount)} can be undone in the active context${reason}.`;
+  return `Cannot undo ${formatPromptCount(requestedCount)}; only ${formatPromptCount(
+    undoableCount,
+  )} can be undone in the active context${reason}.`;
 
   function formatPromptCount(count: number): string {
     return `${String(count)} ${count === 1 ? 'prompt' : 'prompts'}`;

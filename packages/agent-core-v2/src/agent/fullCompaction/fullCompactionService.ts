@@ -1,16 +1,20 @@
-import { Disposable, type IDisposable } from "#/_base/di/lifecycle";
+import { Disposable, type IDisposable } from '#/_base/di/lifecycle';
 import { InstantiationType } from '#/_base/di/extensions';
 import { IInstantiationService } from '#/_base/di/instantiation';
 import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
-import { renderPrompt } from "#/_base/utils/render-prompt";
+import { renderPrompt } from '#/_base/utils/render-prompt';
 import {
   estimateTokens,
   estimateTokensForMessage,
   estimateTokensForMessages,
   estimateTokensForTools,
-} from "#/_base/utils/tokens";
-import { buildCompactionSummaryText, isRealUserInput } from '#/agent/contextMemory/compactionHandoff';
+} from '#/_base/utils/tokens';
+import {
+  buildCompactionSummaryText,
+  buildContextCompactionShape,
+  isRealUserInput,
+} from '#/agent/contextMemory/compactionHandoff';
 import { IAgentContextInjectorService } from '#/agent/contextInjector/contextInjector';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage } from '#/agent/contextMemory/types';
@@ -38,7 +42,14 @@ import { inputTotal, type TokenUsage } from '#/app/llmProtocol/usage';
 import { IEventBus } from '#/app/event/eventBus';
 import type { CompactionFinishedEvent } from '#/app/telemetry/events';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
-import { ErrorCodes, Error2, isCodedError, isError2, toKimiErrorPayload, unwrapErrorCause } from "#/errors";
+import {
+  ErrorCodes,
+  Error2,
+  isCodedError,
+  isError2,
+  toKimiErrorPayload,
+  unwrapErrorCause,
+} from '#/errors';
 import { IWireService } from '#/wire/wire';
 import compactionInstructionTemplate from './compaction-instruction.md?raw';
 import {
@@ -55,6 +66,7 @@ import {
   fullCompactionBegin,
   fullCompactionCancel,
   fullCompactionComplete,
+  fullCompactionFail,
 } from './compactionOps';
 import {
   type CompactionBeginData,
@@ -81,6 +93,9 @@ type CompactionTelemetryProperties = Pick<
 
 interface ActiveCompaction extends FullCompactionTask {
   blockedByTurn: boolean;
+  turnId?: number;
+  phase: 'running' | 'cancelling' | 'committing' | 'committed' | 'finished';
+  committedResult?: CompactionResult;
   bgRegistration?: IDisposable;
 }
 
@@ -111,6 +126,10 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
   private lastCompactedTokenCount: number | null = null;
   private consecutiveOverflowCompactions = 0;
   private contextInjectorService: IAgentContextInjectorService | undefined;
+  private systemPromptRefreshPending = false;
+  private systemPromptRefreshTurnId: number | undefined;
+  private contextReinjectionPending = false;
+  private postCommitMaintenance: Promise<Error | undefined> | undefined;
 
   constructor(
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
@@ -132,8 +151,8 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     this.strategy = new RuntimeCompactionStrategy(() => this.resolveModelContextWithEffectiveMax());
     this._register(
       this.wire.hooks.onDidRestore.register('full-compaction', async (_ctx, next) => {
-        this.normalizeAfterReplay();
         await next();
+        await this.normalizeAfterReplay();
       }),
     );
     this._register(
@@ -146,8 +165,8 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
       }),
     );
     this._register(
-      this.loopService.hooks.onDidFinishStep.register('full-compaction', async (_ctx, next) => {
-        await this.afterStep();
+      this.loopService.hooks.onDidFinishStep.register('full-compaction', async (ctx, next) => {
+        await this.afterStep(ctx.turnId);
         await next();
       }),
     );
@@ -236,15 +255,15 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     this.observedMaxContextTokensByModel.set(modelAlias, observed);
   }
 
-  begin(input: FullCompactionInput): boolean {
-    if (this._compacting) return false;
+  begin(input: FullCompactionInput, turnId?: number): boolean {
+    if (this._compacting || this.wire.getModel(CompactionModel).phase !== 'idle') return false;
     const data: CompactionBeginData = { source: input.source, instruction: input.instruction };
     if (!this.reserveCompactionSlot(data.source)) return false;
 
     const tokenCount = this.validateCompactionStart(data.source);
     this.wire.dispatch(fullCompactionBegin(data));
 
-    const active = this.createActiveCompaction(data.source, tokenCount);
+    const active = this.createActiveCompaction(data.source, tokenCount, turnId);
     this._compacting = active.task;
     active.task.abortController.signal.addEventListener(
       'abort',
@@ -282,6 +301,7 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
   private createActiveCompaction(
     trigger: CompactionBeginData['source'],
     tokenCount: number,
+    turnId?: number,
   ): {
     readonly task: ActiveCompaction;
     readonly resolve: (result: CompactionResult) => void;
@@ -301,6 +321,8 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
         trigger,
         tokenCount,
         blockedByTurn: false,
+        turnId,
+        phase: 'running',
         bgRegistration: this.activity.registerBackground('compaction', abortController),
       },
       resolve,
@@ -309,7 +331,8 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
   }
 
   private cancelActive(active: ActiveCompaction): boolean {
-    if (this._compacting !== active) return false;
+    if (this._compacting !== active || active.phase !== 'running') return false;
+    active.phase = 'cancelling';
     this.wire.dispatch(fullCompactionCancel({}));
     this._compacting = null;
     active.bgRegistration?.dispose();
@@ -320,17 +343,37 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     return true;
   }
 
-  private markCompleted(active: ActiveCompaction): boolean {
-    if (this._compacting !== active) return false;
-    this.wire.dispatch(fullCompactionComplete({}));
+  private failActive(active: ActiveCompaction): boolean {
+    if (
+      this._compacting !== active ||
+      (active.phase !== 'running' && active.phase !== 'committing')
+    ) {
+      return false;
+    }
+    active.phase = 'finished';
+    this.wire.dispatch(fullCompactionFail());
     this._compacting = null;
     active.bgRegistration?.dispose();
     return true;
   }
 
-  private normalizeAfterReplay(): void {
-    if (this.wire.getModel(CompactionModel).phase !== 'running') return;
-    this.wire.dispatch(fullCompactionCancel({}));
+  private releaseCommitted(active: ActiveCompaction): boolean {
+    if (this._compacting !== active || active.phase !== 'committed') return false;
+    active.phase = 'finished';
+    this._compacting = null;
+    active.bgRegistration?.dispose();
+    return true;
+  }
+
+  private async normalizeAfterReplay(): Promise<void> {
+    const phase = this.wire.getModel(CompactionModel).phase;
+    if (phase === 'running') {
+      this.wire.dispatch(fullCompactionFail());
+      return;
+    }
+    if (phase !== 'committed') return;
+    this.schedulePostCommitMaintenance();
+    await this.retryPostCommitMaintenance(false);
   }
 
   private resetForTurn(): void {
@@ -343,7 +386,7 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     context: LoopErrorContext,
   ): Promise<boolean> {
     this.recordOverflowRecovery(context.error);
-    const didStartCompaction = this.beginAutoCompaction();
+    const didStartCompaction = this.beginAutoCompaction(true, context.turnId);
     if (!didStartCompaction && !this._compacting) return false;
 
     await this.block(context.signal, context.turnId);
@@ -370,20 +413,22 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
   }
 
   private async beforeStep(signal: AbortSignal, turnId?: number): Promise<void> {
-    this.checkAutoCompaction();
+    await this.retryPostCommitMaintenance(true);
+    this.checkAutoCompaction(true, turnId);
     if (this.strategy.shouldBlock(this.tokenCountWithPending())) {
       await this.block(signal, turnId);
     }
+    await this.retryPostCommitMaintenance(true);
   }
 
-  private async afterStep(): Promise<void> {
+  private async afterStep(turnId: number): Promise<void> {
     this.consecutiveOverflowCompactions = 0;
     if (this.strategy.checkAfterStep) {
-      this.checkAutoCompaction(false);
+      this.checkAutoCompaction(false, turnId);
     }
   }
 
-  private checkAutoCompaction(throwOnLimit = true): boolean {
+  private checkAutoCompaction(throwOnLimit = true, turnId?: number): boolean {
     if (this._compacting) return true;
     if (
       this.lastCompactedTokenCount !== null &&
@@ -392,10 +437,10 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
       return false;
     }
     if (!this.strategy.shouldCompact(this.tokenCountWithPending())) return false;
-    return this.beginAutoCompaction(throwOnLimit);
+    return this.beginAutoCompaction(throwOnLimit, turnId);
   }
 
-  private beginAutoCompaction(throwOnLimit = true): boolean {
+  private beginAutoCompaction(throwOnLimit = true, turnId?: number): boolean {
     if (this._compacting) return true;
     const maxCompactions = this.strategy.maxCompactionPerTurn;
     if (this.compactionCountInTurn >= maxCompactions) {
@@ -406,13 +451,14 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
       }
       return false;
     }
-    return this.begin({ source: 'auto' });
+    return this.begin({ source: 'auto' }, turnId);
   }
 
   private async block(signal?: AbortSignal, turnId?: number): Promise<void> {
     const active = this._compacting;
     if (active === null) return;
     active.blockedByTurn = true;
+    active.turnId ??= turnId;
     this.propagateBlockingAbort(active, signal);
     this.eventBus.publish({ type: 'compaction.blocked', turnId });
     try {
@@ -451,30 +497,24 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     try {
       const result = await this.compactionRound(active, data);
       if (this._compacting !== active) throw compactionCancelledReason(active);
-      try {
-        await this.profile.refreshSystemPrompt();
-      } catch (error) {
-        this.log.error('failed to refresh system prompt after compaction', { error });
-      }
-      this.lastCompactedTokenCount = result.tokensAfter;
-      await this.contextInjector.injectAfterCompaction();
-      this.lastCompactedTokenCount = this.tokenCountWithPending();
-      if (!this.markCompleted(active)) {
-        throw compactionCancelledReason(active);
-      }
-      const { contextSummary: _contextSummary, ...eventResult } = result;
-      void _contextSummary;
-      this.eventBus.publish({ type: 'compaction.completed', result: eventResult });
-      return result;
+      return await this.finishCommittedCompaction(active, result);
     } catch (error) {
-      if (active.abortController.signal.aborted || isAbortError(error)) {
+      if (
+        active.phase === 'committing' &&
+        this.wire.getModel(CompactionModel).phase === 'committed'
+      ) {
+        active.phase = 'committed';
+      }
+      if (active.phase === 'committed' && active.committedResult !== undefined) {
+        this.reportDiagnosticError('post-commit compaction work failed', error);
+        return await this.finishCommittedCompaction(active, active.committedResult);
+      }
+      if (active.abortController.signal.aborted) {
         this.cancelActive(active);
         throw error;
       }
       const blockedByTurn = this._compacting === active && active.blockedByTurn;
-      if (this._compacting === active) {
-        this.cancelActive(active);
-      }
+      this.failActive(active);
       if (blockedByTurn) {
         throw error;
       }
@@ -486,6 +526,20 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
     } finally {
       this._onDidFinishCompaction.fire(active);
     }
+  }
+
+  private async finishCommittedCompaction(
+    active: ActiveCompaction,
+    result: CompactionResult,
+  ): Promise<CompactionResult> {
+    this.lastCompactedTokenCount = result.tokensAfter;
+    this.schedulePostCommitMaintenance(active.turnId);
+    await this.retryPostCommitMaintenance(false);
+    this.releaseCommitted(active);
+    const { contextSummary: _contextSummary, ...eventResult } = result;
+    void _contextSummary;
+    this.eventBus.publish({ type: 'compaction.completed', result: eventResult });
+    return result;
   }
 
   private async compactionRound(
@@ -611,13 +665,21 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
       }
 
       const summary = this.postProcessSummary(attempt.summary);
-      const result = this.context.applyCompaction({
+      const compactionInput = {
         summary,
         contextSummary: buildCompactionSummaryText(summary),
         compactedCount: originalHistory.length,
         tokensBefore,
         droppedCount: droppedCount === 0 ? undefined : droppedCount,
-      });
+      };
+      const prepared = buildContextCompactionShape(this.context.get(), compactionInput);
+      const { messages: _messages, ...preparedResult } = prepared;
+      void _messages;
+      active.phase = 'committing';
+      active.committedResult = preparedResult;
+      const result = this.context.applyCompaction(compactionInput);
+      active.phase = 'committed';
+      active.committedResult = result;
 
       const properties: CompactionFinishedEvent = {
         source: data.source,
@@ -634,7 +696,7 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
       this.telemetry.track2('compaction_finished', properties);
       return result;
     } catch (error) {
-      if (isAbortError(error)) throw error;
+      if (isAbortError(error) && active.abortController.signal.aborted) throw error;
       this.telemetry.track2('compaction_failed', {
         source: data.source,
         tokens_before: tokensBefore,
@@ -669,6 +731,81 @@ export class AgentFullCompactionService extends Disposable implements IAgentFull
 
   private tokenCountWithPending(): number {
     return this.contextSize.get().size;
+  }
+
+  private schedulePostCommitMaintenance(turnId?: number): void {
+    this.systemPromptRefreshPending = true;
+    this.systemPromptRefreshTurnId = turnId;
+    this.contextReinjectionPending = true;
+  }
+
+  private async retryPostCommitMaintenance(throwOnFailure: boolean): Promise<void> {
+    if (
+      !this.systemPromptRefreshPending &&
+      !this.contextReinjectionPending &&
+      this.wire.getModel(CompactionModel).phase !== 'committed'
+    ) {
+      return;
+    }
+    let maintenance = this.postCommitMaintenance;
+    if (maintenance === undefined) {
+      maintenance = this.performPostCommitMaintenance();
+      this.postCommitMaintenance = maintenance;
+      void maintenance.finally(() => {
+        if (this.postCommitMaintenance === maintenance) {
+          this.postCommitMaintenance = undefined;
+        }
+      });
+    }
+    const error = await maintenance;
+    if (throwOnFailure && error !== undefined) throw error;
+  }
+
+  private async performPostCommitMaintenance(): Promise<Error | undefined> {
+    let firstError: Error | undefined;
+    if (this.systemPromptRefreshPending) {
+      try {
+        const systemPrompt = await this.profile.refreshSystemPrompt();
+        if (systemPrompt !== undefined && this.systemPromptRefreshTurnId !== undefined) {
+          this.llmRequester.refreshTurnSystemPrompt(
+            this.systemPromptRefreshTurnId,
+            systemPrompt,
+          );
+        }
+        this.systemPromptRefreshPending = false;
+        this.systemPromptRefreshTurnId = undefined;
+      } catch (error) {
+        firstError = error instanceof Error ? error : new Error(String(error));
+        this.reportDiagnosticError('failed to refresh system prompt after compaction', error);
+      }
+    }
+    if (this.contextReinjectionPending) {
+      try {
+        await this.contextInjector.injectAfterCompaction();
+        this.contextReinjectionPending = false;
+      } catch (error) {
+        firstError ??= error instanceof Error ? error : new Error(String(error));
+        this.reportDiagnosticError('failed to inject context after compaction', error);
+      }
+    }
+    this.lastCompactedTokenCount = this.tokenCountWithPending();
+    if (
+      !this.systemPromptRefreshPending &&
+      !this.contextReinjectionPending &&
+      this.wire.getModel(CompactionModel).phase === 'committed'
+    ) {
+      this.wire.dispatch(fullCompactionComplete({}));
+    }
+    return firstError;
+  }
+
+  private reportDiagnosticError(message: string, error: unknown): void {
+    try {
+      this.log.error(message, { error });
+    } catch {
+      // Post-commit diagnostics must not alter compaction convergence or make
+      // an already-committed result appear to have failed.
+    }
   }
 
   private get contextInjector(): IAgentContextInjectorService {

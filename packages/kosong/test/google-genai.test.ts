@@ -1,3 +1,11 @@
+/**
+ * Google GenAI provider scenarios — covers request/response translation,
+ * streaming metadata, errors, and cancellation with the SDK client as the
+ * stubbed external boundary.
+ *
+ * Run: pnpm --filter @moonshot-ai/kosong exec vitest run test/google-genai.test.ts
+ */
+
 import {
   APIConnectionError,
   APIContextOverflowError,
@@ -6,6 +14,7 @@ import {
   APITimeoutError,
   ChatProviderError,
 } from '#/errors';
+import { generate } from '#/generate';
 import type { Message, StreamedMessagePart, ToolCall } from '#/message';
 import {
   convertGoogleGenAIError,
@@ -1560,7 +1569,7 @@ describe('GoogleGenAIChatProvider', () => {
       expect(streamFn).not.toHaveBeenCalled();
     });
 
-    it('rejects promptly if the signal aborts before the first stream response resolves', async () => {
+    it('outer generation rejects when cancellation precedes the first Google response', async () => {
       const provider = createProvider({ stream: true });
       const mockModels = (provider as unknown as { _client: { models: Record<string, unknown> } })
         ._client.models;
@@ -1574,32 +1583,18 @@ describe('GoogleGenAIChatProvider', () => {
           }),
       );
 
-      const pending = provider.generate(
+      const pending = generate(
+        provider,
         '',
         [],
         [{ role: 'user', content: [{ type: 'text', text: 'Hi' }], toolCalls: [] }],
+        undefined,
         { signal: controller.signal },
       );
 
       controller.abort();
 
-      const result = await Promise.race([
-        pending.then(
-          () => ({ settled: 'resolved' as const }),
-          (error: unknown) => ({ settled: 'rejected' as const, error }),
-        ),
-        new Promise<{ settled: 'timeout' }>((resolve) =>
-          setTimeout(() => {
-            resolve({ settled: 'timeout' });
-          }, 100),
-        ),
-      ]);
-
-      expect(result.settled).toBe('rejected');
-      if (result.settled === 'rejected') {
-        expect(result.error).toBeInstanceOf(DOMException);
-        expect((result.error as DOMException).name).toBe('AbortError');
-      }
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
     });
 
     it('throws AbortError at the next chunk boundary when aborted mid-stream', async () => {

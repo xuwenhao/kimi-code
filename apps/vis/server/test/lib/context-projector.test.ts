@@ -35,6 +35,41 @@ describe('context-projector', () => {
     expect(proj.planMode.active).toBe(false);
   });
 
+  it('does not project a pending turn outcome before it is materialized into context', () => {
+    const reminder = 'The previous turn ended before producing a final response.';
+    const entries = [
+      {
+        lineNo: 1,
+        data: {
+          type: 'context.append_message' as const,
+          message: {
+            role: 'user' as const,
+            content: [{ type: 'text' as const, text: 'continue' }],
+            toolCalls: [],
+          },
+        },
+        raw: {},
+      },
+      {
+        lineNo: 2,
+        data: {
+          type: 'turn.outcome' as const,
+          outcomeId: 'outcome-1',
+          turnId: 0,
+          content: reminder,
+        },
+        raw: {},
+      },
+    ];
+
+    for (const mode of ['model', 'full'] as const) {
+      const proj = projectContext(entries, mode);
+      expect(proj.messages.map((message) => message.message.content)).toEqual([
+        [{ type: 'text', text: 'continue' }],
+      ]);
+    }
+  });
+
   it('reconstructs assistant tool-call messages and separates tool results', async () => {
     const entries = [
       {

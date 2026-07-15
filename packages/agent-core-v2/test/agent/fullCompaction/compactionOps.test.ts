@@ -10,7 +10,9 @@ import {
   fullCompactionBegin,
   fullCompactionCancel,
   fullCompactionComplete,
+  fullCompactionFail,
 } from '#/agent/fullCompaction/compactionOps';
+import { contextApplyCompaction } from '#/agent/contextMemory/contextOps';
 import { AppendLogStore } from '#/persistence/backends/node-fs/appendLogStore';
 import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
 import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
@@ -58,7 +60,7 @@ async function readRecords(key = KEY): Promise<WireRecord[]> {
 }
 
 describe('fullCompaction ops (wire-backed)', () => {
-  it('begin/complete/cancel drive the phase and persist flat records', async () => {
+  it('begin/complete/cancel/fail drive the phase and persist flat records', async () => {
     expect(wire.getModel(CompactionModel).phase).toBe('idle');
 
     wire.dispatch(fullCompactionBegin({ source: 'manual', instruction: 'keep facts' }));
@@ -72,12 +74,19 @@ describe('fullCompaction ops (wire-backed)', () => {
     wire.dispatch(fullCompactionCancel({}));
     expect(wire.getModel(CompactionModel).phase).toBe('idle');
 
+    wire.dispatch(fullCompactionBegin({ source: 'manual' }));
+    expect(wire.getModel(CompactionModel).phase).toBe('running');
+    wire.dispatch(fullCompactionFail());
+    expect(wire.getModel(CompactionModel).phase).toBe('idle');
+
     const records = await readRecords();
     expect(records.map((record) => record.type)).toEqual([
       'full_compaction.begin',
       'full_compaction.complete',
       'full_compaction.begin',
       'full_compaction.cancel',
+      'full_compaction.begin',
+      'full_compaction.complete',
     ]);
     expect(records.every((record) => 'payload' in record === false)).toBe(true);
     expect(records[0]).toEqual(
@@ -88,6 +97,22 @@ describe('fullCompaction ops (wire-backed)', () => {
       }),
     );
     expect(records[1]).toEqual({ type: 'full_compaction.complete', time: expect.any(Number) });
+    expect(records.at(-1)).toEqual({
+      type: 'full_compaction.complete',
+      outcome: 'failed',
+      time: expect.any(Number),
+    });
+  });
+
+  it('treats context replacement as the durable commit point', () => {
+    wire.dispatch(fullCompactionBegin({ source: 'manual' }));
+    wire.dispatch(contextApplyCompaction({
+      summary: 'Committed summary',
+      compactedCount: 0,
+      tokensBefore: 0,
+    }));
+
+    expect(wire.getModel(CompactionModel).phase).toBe('committed');
   });
 
   it('apply returns the same reference on a no-op (gate stays quiet)', () => {

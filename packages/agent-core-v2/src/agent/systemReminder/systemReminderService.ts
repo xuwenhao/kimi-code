@@ -1,4 +1,4 @@
-import { Disposable } from "#/_base/di/lifecycle";
+import { Disposable } from '#/_base/di/lifecycle';
 import { InstantiationType } from '#/_base/di/extensions';
 import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
@@ -15,7 +15,11 @@ export class AgentSystemReminderService extends Disposable implements IAgentSyst
     super();
   }
 
-  appendSystemReminder(content: string, origin: PromptOrigin): ContextMessage {
+  appendSystemReminder(
+    content: string,
+    origin: PromptOrigin,
+    materializedTurnOutcomeId?: string,
+  ): ContextMessage {
     const message: ContextMessage = {
       role: 'user',
       content: [
@@ -27,7 +31,11 @@ export class AgentSystemReminderService extends Disposable implements IAgentSyst
       toolCalls: [],
       origin,
     };
-    this.context.append(message);
+    if (materializedTurnOutcomeId === undefined) {
+      this.context.append(message);
+    } else {
+      this.context.appendTurnOutcome(message, materializedTurnOutcomeId);
+    }
     return message;
   }
 }

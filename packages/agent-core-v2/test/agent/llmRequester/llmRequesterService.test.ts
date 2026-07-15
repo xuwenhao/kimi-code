@@ -260,6 +260,34 @@ describe('AgentLLMRequesterService strict resend', () => {
   });
 });
 
+describe('AgentLLMRequesterService turn prompt refresh', () => {
+  it('updates only an existing turn snapshot', async () => {
+    const calls = { value: 0 };
+    const inputs: LLMRequestInput[] = [];
+    const { service } = createService(createModel(calls, null, [], inputs), undefined);
+
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+    service.refreshTurnSystemPrompt(1, 'refreshed after compaction');
+    await service.request({ source: { type: 'turn', turnId: 1, step: 2 } });
+
+    expect(inputs.map((input) => input.systemPrompt)).toEqual([
+      'system',
+      'refreshed after compaction',
+    ]);
+  });
+
+  it('does not create a turn snapshot before its first request', async () => {
+    const calls = { value: 0 };
+    const inputs: LLMRequestInput[] = [];
+    const { service } = createService(createModel(calls, null, [], inputs), undefined);
+
+    service.refreshTurnSystemPrompt(1, 'premature compaction prompt');
+    await service.request({ source: { type: 'turn', turnId: 1, step: 1 } });
+
+    expect(inputs[0]?.systemPrompt).toBe('system');
+  });
+});
+
 describe('AgentLLMRequesterService media-stripped resend', () => {
   const IMAGE_FORMAT_400 = new APIStatusError(
     400,

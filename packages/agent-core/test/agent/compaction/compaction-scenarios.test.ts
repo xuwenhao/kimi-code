@@ -13,17 +13,21 @@
 // Agent/ContextMemory/FullCompaction machinery through the test harness rather
 // than mocking it.
 import type { ContentPart, Message } from '@moonshot-ai/kosong';
-import { describe, expect, it } from 'vitest';
+import { createControlledPromise } from '@antfu/utils';
+import { describe, expect, it, vi } from 'vitest';
 
-import type { AgentOptions } from '../../../src/agent';
+import type { AgentOptions, AgentRecord, AgentRecordPersistence } from '../../../src/agent';
+import type { BackgroundTaskInfo } from '../../../src/agent/background';
 import { COMPACTION_ELISION_VARIANT, COMPACTION_SUMMARY_PREFIX } from '../../../src/agent/compaction';
-import type { AgentRecord } from '../../../src/agent';
 import {
   AGENT_WIRE_PROTOCOL_VERSION,
   InMemoryAgentRecordPersistence,
+  markAgentRecordAppendError,
 } from '../../../src/agent/records';
 import type { ContextMessage } from '../../../src/agent/context';
 import { FLAG_DEFINITIONS, FlagResolver } from '../../../src/flags';
+import type { ResolvedAgentProfile } from '../../../src/profile';
+import { abortError } from '../../../src/utils/abort';
 import { testAgent, type TestAgentContext } from '../harness/agent';
 
 type GenerateFn = NonNullable<AgentOptions['generate']>;
@@ -37,6 +41,19 @@ const CAPS = {
   tool_use: true,
   max_context_tokens: 256_000,
 } as const;
+
+const RUNNING_BACKGROUND_TASK = {
+  taskId: 'process-example',
+  kind: 'process',
+  description: 'important background work',
+  status: 'running',
+  detached: true,
+  startedAt: 1,
+  endedAt: null,
+  command: 'example-command',
+  pid: 42,
+  exitCode: null,
+} satisfies BackgroundTaskInfo;
 
 function textResult(text: string): Awaited<ReturnType<GenerateFn>> {
   return {
@@ -61,7 +78,815 @@ function summaryMessageText(ctx: TestAgentContext): string {
   return summary?.content.map((part) => (part.type === 'text' ? part.text : '')).join('') ?? '';
 }
 
+function recordsThrough(
+  records: readonly AgentRecord[],
+  predicate: (record: AgentRecord) => boolean,
+): AgentRecord[] {
+  const index = records.findIndex(predicate);
+  if (index < 0) throw new Error('record boundary not found');
+  return structuredClone(records.slice(0, index + 1));
+}
+
 describe('compaction — guard tests', () => {
+  it('continues compaction when a synchronous started-event observer throws', async () => {
+    const ctx = testAgent();
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    ctx.emitter.once('compaction.started', () => {
+      throw new Error('observer failed');
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await expect(ctx.rpc.beginCompaction({})).resolves.toBeUndefined();
+    await completed;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(summaryMessageText(ctx)).toContain('Compacted summary.');
+  });
+
+  it('reserves compaction before its persistence callback can re-enter prompt', async () => {
+    let ctx!: TestAgentContext;
+    let reentrantAdmission: ReturnType<TestAgentContext['agent']['turn']['submitPrompt']> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type !== 'full_compaction.begin' || reentrantAdmission !== undefined) return;
+        reentrantAdmission = ctx.agent.turn.submitPrompt([
+          { type: 'text', text: 'PROMPT-FROM-COMPACTION-REENTRY' },
+        ]);
+      },
+    });
+    let generateCalls = 0;
+    ctx = testAgent({
+      persistence,
+      generate: async () => {
+        generateCalls += 1;
+        return generateCalls === 1
+          ? textResult('Compacted summary.')
+          : textResult('Deferred prompt completed.');
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    const ended = ctx.once('turn.ended');
+
+    await ctx.rpc.beginCompaction({});
+    expect(reentrantAdmission).toMatchObject({ kind: 'deferred' });
+    await ended;
+
+    expect(generateCalls).toBe(2);
+    expect(historyTexts(ctx).join('\n')).toContain('PROMPT-FROM-COMPACTION-REENTRY');
+  });
+
+  it('keeps the successful compaction reservation through synchronous completed listeners', async () => {
+    let generateCalls = 0;
+    const ctx = testAgent({
+      generate: async () => {
+        generateCalls += 1;
+        return generateCalls === 1
+          ? textResult('Compacted summary.')
+          : textResult('Deferred prompt completed.');
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    let admission: ReturnType<typeof ctx.agent.turn.submitPrompt> | undefined;
+    ctx.emitter.once('compaction.completed', () => {
+      admission = ctx.agent.turn.submitPrompt([
+        { type: 'text', text: 'PROMPT-FROM-COMPLETED-LISTENER' },
+      ]);
+    });
+    const ended = ctx.once('turn.ended');
+
+    await ctx.rpc.beginCompaction({});
+    await ended;
+
+    expect(admission).toMatchObject({ kind: 'deferred' });
+    expect(generateCalls).toBe(2);
+    expect(historyTexts(ctx).join('\n')).toContain('PROMPT-FROM-COMPLETED-LISTENER');
+  });
+
+  it('treats cancellation after context commit as a join on the completed outcome', async () => {
+    const refreshStarted = createControlledPromise<void>();
+    const releaseRefresh = createControlledPromise<void>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(ctx.agent, 'refreshSystemPrompt').mockImplementation(async () => {
+      refreshStarted.resolve();
+      await releaseRefresh;
+      return 'refreshed system prompt';
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await refreshStarted;
+    let cancelSettled = false;
+    const cancel = ctx.rpc.cancelCompaction({}).then(() => {
+      cancelSettled = true;
+    });
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(true);
+    expect(ctx.allEvents.some((event) => event.event === 'compaction.cancelled')).toBe(false);
+
+    releaseRefresh.resolve();
+    await cancel;
+    await completed;
+
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.cancel'),
+    ).toHaveLength(0);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+  });
+
+  it('does not turn a completed-listener cancellation into a second terminal outcome', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    let listenerCancellation: ReturnType<typeof ctx.rpc.cancelCompaction> | undefined;
+    ctx.emitter.once('compaction.completed', () => {
+      listenerCancellation = ctx.rpc.cancelCompaction({});
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+    await listenerCancellation;
+
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.cancel'),
+    ).toHaveLength(0);
+  });
+
+  it('converges to one completed terminal when system-prompt refresh rejects after commit', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(ctx.agent, 'refreshSystemPrompt').mockRejectedValue(
+      abortError('refresh failed independently of compaction cancellation'),
+    );
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.cancel'),
+    ).toHaveLength(0);
+  });
+
+  it('retries an async post-compaction injection failure without duplicating reminders', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(ctx.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+    const originalInjection = ctx.agent.injection.injectAfterCompaction.bind(ctx.agent.injection);
+    let attempts = 0;
+    vi.spyOn(ctx.agent.injection, 'injectAfterCompaction').mockImplementation(async () => {
+      attempts += 1;
+      await originalInjection();
+      if (attempts === 1) throw new Error('injection failed after appending reminders');
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(attempts).toBe(2);
+    expect(
+      ctx.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(1);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+  });
+
+  it('resets injector cursors when a reminder append throws before persistence', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.agent.permission.setMode('auto');
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    const originalAppend = ctx.agent.context.appendSystemReminder.bind(ctx.agent.context);
+    let permissionAppendAttempts = 0;
+    vi.spyOn(ctx.agent.context, 'appendSystemReminder').mockImplementation((content, origin) => {
+      if (origin.kind === 'injection' && origin.variant === 'permission_mode') {
+        permissionAppendAttempts += 1;
+        if (permissionAppendAttempts === 1) {
+          throw new Error('append rejected before accepting the reminder');
+        }
+      }
+      originalAppend(content, origin);
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(permissionAppendAttempts).toBe(2);
+    expect(
+      ctx.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' && message.origin.variant === 'permission_mode',
+      ),
+    ).toHaveLength(1);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+  });
+
+  it('persists one completion when markCompleted throws before entering its implementation', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(ctx.agent.fullCompaction, 'markCompleted').mockImplementationOnce(() => {
+      throw new Error('completion callback failed before persistence');
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+  });
+
+  it('retries completion after persistence explicitly rejects it before acceptance', async () => {
+    const persistenceError = new Error('completion rejected before append');
+    const accepted = new InMemoryAgentRecordPersistence();
+    let completionAttempts = 0;
+    const persistence: AgentRecordPersistence = {
+      read: () => accepted.read(),
+      append: (record) => {
+        if (record.type === 'full_compaction.complete') {
+          completionAttempts += 1;
+          if (completionAttempts === 1) {
+            throw markAgentRecordAppendError(persistenceError, false);
+          }
+        }
+        accepted.append(record);
+      },
+      rewrite: (records) => {
+        accepted.rewrite(records);
+      },
+      flush: () => accepted.flush(),
+      close: () => accepted.close(),
+    };
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(completionAttempts).toBe(2);
+    expect(
+      accepted.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+  });
+
+  it('does not duplicate completion when persistence throws after accepting the terminal record', async () => {
+    const persistenceError = new Error('completion observer failed after append');
+    let ctx!: TestAgentContext;
+    let reentrantCancellation: Promise<void> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type !== 'full_compaction.complete') return;
+        reentrantCancellation = ctx.agent.fullCompaction.cancel();
+        throw persistenceError;
+      },
+    });
+    ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+    await reentrantCancellation;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+  });
+
+  it('does not duplicate completion when an async markCompleted wrapper rejects after persistence', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    ctx.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    const originalMarkCompleted = ctx.agent.fullCompaction.markCompleted.bind(
+      ctx.agent.fullCompaction,
+    );
+    vi.spyOn(ctx.agent.fullCompaction, 'markCompleted').mockImplementationOnce(
+      (() => {
+        originalMarkCompleted();
+        return Promise.reject(new Error('async completion observer failed after persistence'));
+      }) as () => void,
+    );
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await completed;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(1);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+  });
+
+  it('keeps deferred work blocked until a transient post-commit injection failure recovers', async () => {
+    const injectionStarted = createControlledPromise<void>();
+    const releaseFailure = createControlledPromise<void>();
+    let generateCalls = 0;
+    const ctx = testAgent({
+      generate: async () => {
+        generateCalls += 1;
+        return generateCalls === 1
+          ? textResult('Compacted summary.')
+          : textResult('Deferred prompt completed.');
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    const originalInjection = ctx.agent.injection.injectAfterCompaction.bind(ctx.agent.injection);
+    let injectionAttempts = 0;
+    vi.spyOn(ctx.agent.injection, 'injectAfterCompaction').mockImplementation(async () => {
+      injectionAttempts += 1;
+      if (injectionAttempts === 1) {
+        injectionStarted.resolve();
+        await releaseFailure;
+      }
+      if (injectionAttempts <= 2) throw new Error('transient injection failure');
+      await originalInjection();
+    });
+    const completed = ctx.once('compaction.completed');
+
+    await ctx.rpc.beginCompaction({});
+    await injectionStarted;
+    const admission = await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'PROMPT-WAITING-FOR-FINALIZATION' }],
+    });
+    expect(admission).toMatchObject({ kind: 'deferred' });
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(generateCalls).toBe(1);
+
+    const ended = ctx.once('turn.ended');
+    releaseFailure.resolve();
+    await completed;
+    await ended;
+
+    // The two post-commit attempts are exhausted first. Completion may release
+    // the TUI reservation, but the deferred turn's beforeStep must repair the
+    // pending injection before its first model request is built.
+    expect(injectionAttempts).toBe(3);
+    expect(generateCalls).toBe(2);
+    expect(historyTexts(ctx).join('\n')).toContain('PROMPT-WAITING-FOR-FINALIZATION');
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+  });
+
+  it('reports a provider AbortError as failure when the compaction signal was not aborted', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({
+      persistence,
+      generate: async () => {
+        throw abortError('provider aborted its own request');
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    const failed = ctx.once('error');
+
+    await ctx.rpc.beginCompaction({});
+    await failed;
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(ctx.allEvents.filter((event) => event.event === 'compaction.cancelled')).toHaveLength(0);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.cancel'),
+    ).toHaveLength(0);
+    expect(
+      persistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(0);
+    expect(ctx.allEvents).toContainEqual(
+      expect.objectContaining({
+        type: '[rpc]',
+        event: 'error',
+        args: expect.objectContaining({ code: 'compaction.failed' }),
+      }),
+    );
+  });
+
+  it('patches the pending compaction across interleaved replay updates for crash and complete prefixes', async () => {
+    const summaryRequested = createControlledPromise<void>();
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const originalPersistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({
+      persistence: originalPersistence,
+      generate: () => {
+        summaryRequested.resolve();
+        return summary;
+      },
+    });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await original.rpc.beginCompaction({});
+    await summaryRequested;
+    // These replay entries intentionally land between full_compaction.begin and
+    // context.apply_compaction. The apply record must patch the open compaction,
+    // not assume that compaction is still the replay array tail.
+    original.agent.config.update({ systemPrompt: 'INTERLEAVED-SYSTEM-PROMPT' });
+    original.agent.permission.setMode('auto');
+    const originalCompleted = original.once('compaction.completed');
+    summary.resolve(textResult('Compacted summary with interleaved updates.'));
+    await originalCompleted;
+
+    for (const terminalIncluded of [false, true]) {
+      const prefix = recordsThrough(
+        originalPersistence.records,
+        (record) =>
+          record.type ===
+          (terminalIncluded ? 'full_compaction.complete' : 'context.apply_compaction'),
+      );
+      const resumedPersistence = new InMemoryAgentRecordPersistence(prefix);
+      const resumed = testAgent({ persistence: resumedPersistence });
+
+      await resumed.agent.resume();
+
+      const replay = resumed.agent.replayBuilder.buildResult();
+      const compactionIndex = replay.findIndex((record) => record.type === 'compaction');
+      const compaction = replay[compactionIndex];
+      expect(compaction).toMatchObject({
+        type: 'compaction',
+        result: expect.objectContaining({
+          summary: 'Compacted summary with interleaved updates.',
+        }),
+      });
+      expect(
+        replay.slice(compactionIndex + 1).some((record) => record.type === 'config_updated'),
+      ).toBe(true);
+      expect(
+        replay.slice(compactionIndex + 1).some((record) => record.type === 'permission_updated'),
+      ).toBe(true);
+      expect(
+        resumedPersistence.records.filter(
+          (record) => record.type === 'full_compaction.complete',
+        ),
+      ).toHaveLength(1);
+      expect(
+        resumed.allEvents.filter((event) => event.event === 'compaction.completed'),
+      ).toHaveLength(0);
+    }
+  });
+
+  it('recovers missing after-compaction reminders from a crash immediately after context commit', async () => {
+    const originalPersistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence: originalPersistence });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+    original.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(original.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+    const originalCompleted = original.once('compaction.completed');
+    await original.rpc.beginCompaction({});
+    await originalCompleted;
+
+    const prefix = recordsThrough(
+      originalPersistence.records,
+      (record) => record.type === 'context.apply_compaction',
+    );
+    const recoveryCompleted = createControlledPromise<void>();
+    const resumedPersistence = new InMemoryAgentRecordPersistence(prefix, {
+      onRecord: (record) => {
+        if (record.type === 'full_compaction.complete') recoveryCompleted.resolve();
+      },
+    });
+    const loadStarted = createControlledPromise<void>();
+    const releaseLoad = createControlledPromise<void>();
+    let backgroundLoaded = false;
+    let firstModelRequestText = '';
+    const resumed = testAgent({
+      persistence: resumedPersistence,
+      generate: async (_provider, _system, _tools, messages) => {
+        firstModelRequestText = messages
+          .flatMap((message) => message.content)
+          .filter((part): part is Extract<ContentPart, { type: 'text' }> => part.type === 'text')
+          .map((part) => part.text)
+          .join('\n');
+        return textResult('Recovered request completed.');
+      },
+      initialConfig: {
+        providers: {
+          'test-provider': { type: 'kimi', apiKey: 'test-key' },
+        },
+        models: {
+          'kimi-code': {
+            provider: 'test-provider',
+            model: 'kimi-code',
+            maxContextSize: CAPS.max_context_tokens,
+          },
+        },
+      },
+    });
+    vi.spyOn(resumed.agent.background, 'loadFromDisk').mockImplementation(async () => {
+      loadStarted.resolve();
+      await releaseLoad;
+      backgroundLoaded = true;
+    });
+    vi.spyOn(resumed.agent.background, 'list').mockImplementation(() =>
+      backgroundLoaded ? [RUNNING_BACKGROUND_TASK] : [],
+    );
+
+    const resume = resumed.agent.resume();
+    await loadStarted;
+    await Promise.resolve();
+
+    // The replay callback may reserve compaction, but recovery must not read
+    // background state or emit the terminal until background restoration has
+    // actually completed.
+    expect(resumed.agent.fullCompaction.isCompacting).toBe(true);
+    expect(
+      resumedPersistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(0);
+
+    releaseLoad.resolve();
+    await recoveryCompleted;
+    await resume;
+
+    expect(resumed.agent.fullCompaction.isCompacting).toBe(false);
+    expect(
+      resumed.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(1);
+    expect(
+      resumedPersistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(
+      resumedPersistence.records.filter((record) => record.type === 'full_compaction.cancel'),
+    ).toHaveLength(0);
+    expect(resumed.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(0);
+
+    const admission = await resumed.rpc.prompt({
+      input: [{ type: 'text', text: 'FIRST-REQUEST-AFTER-RECOVERY' }],
+    });
+    expect(admission).toMatchObject({ kind: 'started' });
+    const end = await resumed.agent.turn.waitForCurrentTurn();
+    expect(end.event.reason).toBe('completed');
+    expect(firstModelRequestText).toContain(RUNNING_BACKGROUND_TASK.description);
+  });
+
+  it('does not duplicate an after-compaction reminder that was durable before a crash', async () => {
+    const originalPersistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence: originalPersistence });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+    original.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(original.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+    const originalCompleted = original.once('compaction.completed');
+    await original.rpc.beginCompaction({});
+    await originalCompleted;
+
+    const prefix = recordsThrough(
+      originalPersistence.records,
+      (record) => record.type === 'full_compaction.complete',
+    );
+    const resumedPersistence = new InMemoryAgentRecordPersistence(prefix);
+    const resumed = testAgent({ persistence: resumedPersistence });
+    vi.spyOn(resumed.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+
+    await resumed.agent.resume();
+    await resumed.agent.fullCompaction.beforeStep(new AbortController().signal);
+
+    expect(
+      resumed.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(1);
+    expect(
+      resumedPersistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.message.origin?.kind === 'injection' &&
+          record.message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(1);
+    expect(
+      resumedPersistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(resumed.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(0);
+  });
+
+  it('repairs missing reminders after a crash following the completed terminal', async () => {
+    const originalPersistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence: originalPersistence });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+    original.mockNextResponse({ type: 'text', text: 'Compacted summary.' });
+    vi.spyOn(original.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+    vi.spyOn(original.agent.injection, 'injectAfterCompaction').mockRejectedValue(
+      new Error('post-compaction injection remained unavailable'),
+    );
+    const originalCompleted = original.once('compaction.completed');
+
+    await original.rpc.beginCompaction({});
+    await originalCompleted;
+
+    expect(
+      original.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(0);
+    const prefix = recordsThrough(
+      originalPersistence.records,
+      (record) => record.type === 'full_compaction.complete',
+    );
+
+    let firstModelRequestText = '';
+    const resumedPersistence = new InMemoryAgentRecordPersistence(prefix);
+    const resumed = testAgent({
+      persistence: resumedPersistence,
+      generate: async (_provider, _system, _tools, messages) => {
+        firstModelRequestText = messages
+          .flatMap((message) => message.content)
+          .filter((part): part is Extract<ContentPart, { type: 'text' }> => part.type === 'text')
+          .map((part) => part.text)
+          .join('\n');
+        return textResult('Recovered request completed.');
+      },
+      initialConfig: {
+        providers: {
+          'test-provider': { type: 'kimi', apiKey: 'test-key' },
+        },
+        models: {
+          'kimi-code': {
+            provider: 'test-provider',
+            model: 'kimi-code',
+            maxContextSize: CAPS.max_context_tokens,
+          },
+        },
+      },
+    });
+    vi.spyOn(resumed.agent.background, 'list').mockReturnValue([RUNNING_BACKGROUND_TASK]);
+
+    await resumed.agent.resume();
+    expect(resumed.agent.fullCompaction.isCompacting).toBe(false);
+    expect(
+      resumed.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(0);
+
+    await resumed.rpc.prompt({ input: [{ type: 'text', text: 'FIRST-REQUEST-AFTER-RESTART' }] });
+    await resumed.agent.turn.waitForCurrentTurn();
+
+    expect(firstModelRequestText).toContain(RUNNING_BACKGROUND_TASK.description);
+    expect(
+      resumed.agent.context.history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' &&
+          message.origin.variant === 'background_task_status',
+      ),
+    ).toHaveLength(1);
+    expect(
+      resumedPersistence.records.filter((record) => record.type === 'full_compaction.complete'),
+    ).toHaveLength(1);
+    expect(resumed.allEvents.filter((event) => event.event === 'compaction.completed')).toHaveLength(0);
+  });
+
+  it('restores runtime profile handles before recovered compaction releases deferred work', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const compactionApplied = createControlledPromise<void>();
+    const originalPersistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type === 'context.apply_compaction') compactionApplied.resolve();
+      },
+    });
+    const original = testAgent({ persistence: originalPersistence, generate: () => summary });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.agent.config.update({
+      profileName: 'recovered-runtime-profile',
+      systemPrompt: 'STALE-PERSISTED-SYSTEM-PROMPT',
+    });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await original.rpc.beginCompaction({});
+    await expect(
+      original.rpc.prompt({
+        input: [{ type: 'text', text: 'DEFERRED-BEHIND-RECOVERY' }],
+      }),
+    ).resolves.toMatchObject({ kind: 'deferred' });
+    const originalCompleted = original.once('compaction.completed');
+    const originalTurnEnded = original.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await compactionApplied;
+    const prefix = recordsThrough(
+      originalPersistence.records,
+      (record) => record.type === 'context.apply_compaction',
+    );
+    await originalCompleted;
+    await originalTurnEnded;
+
+    let runtimeProfileInstalled = false;
+    let refreshedRuntimeContext: Parameters<ResolvedAgentProfile['systemPrompt']>[0] | undefined;
+    let runtimeProfileInstalledAtGenerate = false;
+    let generatedSystemPrompt = '';
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(prefix),
+      generate: async (_provider, systemPrompt) => {
+        runtimeProfileInstalledAtGenerate = runtimeProfileInstalled;
+        generatedSystemPrompt = systemPrompt;
+        return textResult('Recovered deferred request completed.');
+      },
+      initialConfig: {
+        providers: {
+          'test-provider': { type: 'kimi', apiKey: 'test-key' },
+        },
+        models: {
+          'kimi-code': {
+            provider: 'test-provider',
+            model: 'kimi-code',
+            maxContextSize: CAPS.max_context_tokens,
+          },
+        },
+      },
+    });
+    const runtimeProfile: ResolvedAgentProfile = {
+      name: 'recovered-runtime-profile',
+      tools: [],
+      systemPrompt: (context) => {
+        refreshedRuntimeContext = context;
+        return `REFRESHED-RUNTIME-SYSTEM-PROMPT\n${context.cwdListing ?? ''}`;
+      },
+    };
+    const resumedTurnEnded = resumed.once('turn.ended');
+
+    await resumed.agent.resume({
+      beforePendingWorkResume: () => {
+        runtimeProfileInstalled = true;
+        resumed.agent.setActiveProfile(runtimeProfile);
+      },
+    });
+    await resumedTurnEnded;
+
+    expect(runtimeProfileInstalledAtGenerate).toBe(true);
+    expect(refreshedRuntimeContext).toBeDefined();
+    expect(generatedSystemPrompt).toContain('REFRESHED-RUNTIME-SYSTEM-PROMPT');
+    expect(generatedSystemPrompt).not.toContain('STALE-PERSISTED-SYSTEM-PROMPT');
+    expect(resumed.agent.config.systemPrompt).toContain('REFRESHED-RUNTIME-SYSTEM-PROMPT');
+    expect(historyTexts(resumed).join('\n')).toContain('DEFERRED-BEHIND-RECOVERY');
+  });
+
   it('repeated compaction folds the prior summary into the new one, never stacking two summaries', async () => {
     const ctx = testAgent();
     ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
@@ -156,6 +981,563 @@ describe('compaction — guard tests', () => {
 
     // Ran after compaction — neither lost nor stuck.
     expect(historyTexts(ctx).join('\n')).toContain('DEFERRED-PROMPT');
+  });
+
+  it('clears a deferred prompt when the user cancels before compaction finishes', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let generateCalls = 0;
+    const generate: GenerateFn = () => {
+      generateCalls += 1;
+      return summary;
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'user one', 'assistant one', 40);
+
+    const compaction = ctx.rpc.beginCompaction({});
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(true);
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'CANCELLED-DEFERRED-PROMPT' }] });
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'CANCELLED-DEFERRED-STEER' }],
+    });
+
+    await ctx.rpc.cancel({});
+    summary.resolve(textResult('Compacted summary.'));
+    await compaction;
+
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(generateCalls).toBe(1);
+    const texts = historyTexts(ctx).join('\n');
+    expect(texts).not.toContain('CANCELLED-DEFERRED-PROMPT');
+    expect(texts).not.toContain('CANCELLED-DEFERRED-STEER');
+  });
+
+  it('does not let a stale prompt-owned cancel kill its deferred replacement', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let generateCalls = 0;
+    const ctx = testAgent({
+      generate: () => {
+        generateCalls += 1;
+        return generateCalls === 1
+          ? summary
+          : Promise.resolve(textResult('Replacement completed.'));
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    await ctx.rpc.beginCompaction({});
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'DEFERRED-A' }],
+      promptId: 'prompt-deferred-a',
+    });
+
+    await ctx.rpc.cancel({
+      expectedPromptId: 'prompt-deferred-a',
+      requireActive: true,
+    });
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'DEFERRED-REPLACEMENT-X' }],
+      promptId: 'prompt-replacement-x',
+    });
+    await expect(
+      ctx.rpc.cancel({
+        expectedPromptId: 'prompt-deferred-a',
+        requireActive: true,
+      }),
+    ).rejects.toMatchObject({ code: 'turn.agent_busy' });
+
+    const ended = ctx.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await ended;
+
+    expect(generateCalls).toBe(2);
+    const texts = historyTexts(ctx).join('\n');
+    expect(texts).not.toContain('DEFERRED-A');
+    expect(texts).toContain('DEFERRED-REPLACEMENT-X');
+  });
+
+  it('keeps a deferred prompt when a stale turn-scoped cancel arrives during compaction', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let generateCalls = 0;
+    const generate: GenerateFn = () => {
+      generateCalls += 1;
+      if (generateCalls === 1) return Promise.resolve(textResult('Initial turn completed.'));
+      if (generateCalls === 2) return summary;
+      return Promise.resolve(textResult('Deferred turn completed.'));
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'INITIAL-PROMPT' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+    const staleTurnId = ctx.agent.turn.currentId;
+    expect(staleTurnId).toBe(0);
+    ctx.appendExchange(2, 'older user context', 'older assistant context', 40);
+
+    const compaction = ctx.rpc.beginCompaction({});
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(true);
+    expect(
+      ctx.agent.turn.submitPrompt([{ type: 'text', text: 'PRESERVED-DEFERRED-PROMPT' }]),
+    ).toMatchObject({ kind: 'deferred', deferredPromptId: expect.any(String) });
+    await ctx.agent.turn.cancel(staleTurnId);
+
+    const deferredTurnEnded = ctx.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await compaction;
+    await deferredTurnEnded;
+
+    expect(generateCalls).toBe(3);
+    expect(historyTexts(ctx).join('\n')).toContain('PRESERVED-DEFERRED-PROMPT');
+  });
+
+  it('admits only one direct deferred prompt and echoes both correlations when it starts', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    let generateCalls = 0;
+    const generate: GenerateFn = () => {
+      generateCalls += 1;
+      return generateCalls === 1
+        ? summary
+        : Promise.resolve(textResult('Deferred turn completed.'));
+    };
+    const ctx = testAgent({ generate, persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    const accepted = await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'FIRST-DEFERRED-PROMPT' }],
+      promptId: 'prompt-first',
+    });
+    expect(accepted).toMatchObject({
+      kind: 'deferred',
+      deferredPromptId: expect.any(String),
+    });
+    if (accepted.kind !== 'deferred') throw new Error('expected deferred prompt admission');
+
+    await expect(
+      ctx.rpc.prompt({
+        input: [{ type: 'text', text: 'SECOND-DEFERRED-PROMPT' }],
+        promptId: 'prompt-second',
+      }),
+    ).rejects.toMatchObject({ code: 'turn.agent_busy' });
+
+    const ended = ctx.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await ended;
+
+    expect(
+      persistence.records
+        .filter((record) => record.type === 'turn.prompt')
+        .flatMap((record) => record.input)
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text),
+    ).toEqual(['FIRST-DEFERRED-PROMPT']);
+    expect(ctx.allEvents).toContainEqual(
+      expect.objectContaining({
+        type: '[rpc]',
+        event: 'turn.started',
+        args: expect.objectContaining({
+          promptId: 'prompt-first',
+          deferredPromptId: accepted.deferredPromptId,
+        }),
+      }),
+    );
+    expect(historyTexts(ctx).join('\n')).not.toContain('SECOND-DEFERRED-PROMPT');
+  });
+
+  it('cancels only the deferred user prompt while preserving a background steer', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let generateCalls = 0;
+    const generate: GenerateFn = () => {
+      generateCalls += 1;
+      return generateCalls === 1
+        ? summary
+        : Promise.resolve(textResult('Background steer handled.'));
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'CANCEL-ME' }] });
+    ctx.agent.turn.steer([{ type: 'text', text: 'KEEP-BACKGROUND-STEER' }], {
+      kind: 'background_task',
+      taskId: 'task-1',
+      status: 'completed',
+      notificationId: 'notification-1',
+    });
+    await ctx.rpc.cancel({});
+
+    const ended = ctx.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await ended;
+
+    expect(generateCalls).toBe(2);
+    expect(historyTexts(ctx).join('\n')).toContain('KEEP-BACKGROUND-STEER');
+    expect(historyTexts(ctx).join('\n')).not.toContain('CANCEL-ME');
+  });
+
+  it('steers a compaction-deferred prompt by its stable prompt correlation', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let generateCalls = 0;
+    const ctx = testAgent({
+      generate: () => {
+        generateCalls += 1;
+        return generateCalls === 1
+          ? summary
+          : Promise.resolve(textResult('Deferred prompt and steer handled.'));
+      },
+    });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await expect(
+      ctx.rpc.prompt({
+        input: [{ type: 'text', text: 'DEFERRED-OWNER' }],
+        promptId: 'prompt-deferred-owner',
+      }),
+    ).resolves.toMatchObject({ kind: 'deferred' });
+    await expect(
+      ctx.rpc.steer({
+        input: [{ type: 'text', text: 'STEER-FOR-DEFERRED-OWNER' }],
+        expectedPromptId: 'prompt-deferred-owner',
+        requireActive: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    const ended = ctx.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await ended;
+
+    const texts = historyTexts(ctx).join('\n');
+    expect(texts).toContain('DEFERRED-OWNER');
+    expect(texts).toContain('STEER-FOR-DEFERRED-OWNER');
+  });
+
+  it('replays a still-pending steer with its deferred prompt after a crash', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => summary });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await original.rpc.beginCompaction({});
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'CRASH-DEFERRED-OWNER' }],
+      promptId: 'prompt-crash-owner',
+    });
+    await original.rpc.steer({
+      input: [{ type: 'text', text: 'CRASH-PENDING-STEER' }],
+      expectedPromptId: 'prompt-crash-owner',
+      requireActive: true,
+    });
+
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(persistence.records)),
+      generate: async () => textResult('Recovered deferred work.'),
+      initialConfig: {
+        providers: {
+          'test-provider': { type: 'kimi', apiKey: 'test-key' },
+        },
+        models: {
+          'kimi-code': {
+            provider: 'test-provider',
+            model: 'kimi-code',
+            maxContextSize: CAPS.max_context_tokens,
+          },
+        },
+      },
+    });
+    await resumed.agent.resume();
+    await resumed.agent.turn.waitForCurrentTurn();
+
+    const texts = historyTexts(resumed).join('\n');
+    expect(texts).toContain('CRASH-DEFERRED-OWNER');
+    expect(texts).toContain('CRASH-PENDING-STEER');
+  });
+
+  it('does not replay an activated empty deferred prompt after restart', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    let originalGenerateCalls = 0;
+    const original = testAgent({
+      persistence,
+      generate: () => {
+        originalGenerateCalls += 1;
+        return originalGenerateCalls === 1
+          ? summary
+          : Promise.resolve(textResult('Empty retry completed.'));
+      },
+    });
+    original.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    original.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await original.rpc.beginCompaction({});
+    await original.rpc.prompt({ input: [], promptId: 'empty-retry' });
+    const ended = original.once('turn.ended');
+    summary.resolve(textResult('Compacted summary.'));
+    await ended;
+
+    expect(
+      persistence.records.some((record) => record.type === 'turn.deferred_prompt_started'),
+    ).toBe(true);
+    let replayGenerateCalls = 0;
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(persistence.records)),
+      generate: async () => {
+        replayGenerateCalls += 1;
+        return textResult('Unexpected duplicate execution.');
+      },
+    });
+    await resumed.agent.resume();
+    await Promise.resolve();
+
+    expect(replayGenerateCalls).toBe(0);
+    expect(resumed.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('keeps cancelCompaction pending until the aborted worker has settled', async () => {
+    const summarizerStarted = createControlledPromise<void>();
+    const abortObserved = createControlledPromise<void>();
+    const releaseCleanup = createControlledPromise<void>();
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      generateCalls += 1;
+      if (generateCalls !== 1) return textResult('Follow-up completed.');
+      summarizerStarted.resolve();
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          abortObserved.resolve();
+          resolve();
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      await releaseCleanup;
+      throw abortError();
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await summarizerStarted;
+    let cancelSettled = false;
+    const cancel = ctx.rpc.cancelCompaction({}).then(() => {
+      cancelSettled = true;
+    });
+    await abortObserved;
+    await Promise.resolve();
+    expect(cancelSettled).toBe(false);
+
+    releaseCleanup.resolve();
+    await cancel;
+    expect(
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FOLLOW-UP-AFTER-CANCEL' }] }),
+    ).toMatchObject({ kind: 'started' });
+    await ctx.agent.turn.waitForCurrentTurn();
+  });
+
+  it('aborts compaction before reporting a cancellation-record persistence failure', async () => {
+    const persistenceError = new Error('compaction cancel persistence failed');
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type === 'full_compaction.cancel') throw persistenceError;
+      },
+    });
+    const summarizerStarted = createControlledPromise<void>();
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      summarizerStarted.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      return textResult('Unexpected summary.');
+    };
+    const ctx = testAgent({ generate, persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await summarizerStarted;
+    await expect(ctx.rpc.cancelCompaction({})).rejects.toBe(persistenceError);
+
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+    expect(historyTexts(ctx).join('\n')).not.toContain('Unexpected summary.');
+  });
+
+  it('deduplicates compaction cancellation re-entered by its persistence observer', async () => {
+    const summarizerStarted = createControlledPromise<void>();
+    let ctx!: TestAgentContext;
+    let nestedCancellation: Promise<void> | undefined;
+    let cancelRecords = 0;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type !== 'full_compaction.cancel') return;
+        cancelRecords += 1;
+        nestedCancellation ??= ctx.agent.fullCompaction.cancel();
+      },
+    });
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      summarizerStarted.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      return textResult('Unexpected summary.');
+    };
+    ctx = testAgent({ generate, persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+    await ctx.rpc.beginCompaction({});
+    await summarizerStarted;
+
+    const cancellation = ctx.agent.fullCompaction.cancel();
+    expect(nestedCancellation).toBe(cancellation);
+    await cancellation;
+
+    expect(cancelRecords).toBe(1);
+    expect(ctx.agent.fullCompaction.isCompacting).toBe(false);
+  });
+
+  it('keeps a concurrent prompt deferred until cancelled compaction cleanup finishes', async () => {
+    const summarizerStarted = createControlledPromise<void>();
+    const abortObserved = createControlledPromise<void>();
+    const releaseLateSummary = createControlledPromise<void>();
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      generateCalls += 1;
+      if (generateCalls !== 1) return textResult('Deferred prompt completed.');
+      summarizerStarted.resolve();
+      const onAbort = (): void => {
+        abortObserved.resolve();
+      };
+      if (options?.signal?.aborted === true) onAbort();
+      else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      await releaseLateSummary;
+      // Deliberately ignore the abort and return a stale summary. The runtime
+      // must discard it before applyCompaction.
+      return textResult('LATE-CANCELLED-SUMMARY');
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'ORIGINAL-USER', 'ORIGINAL-ASSISTANT', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await summarizerStarted;
+    const cancel = ctx.rpc.cancelCompaction({});
+    await abortObserved;
+    const admitted = await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'PROMPT-DURING-CANCEL-CLEANUP' }],
+    });
+    expect(admitted).toMatchObject({ kind: 'deferred' });
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+
+    const ended = ctx.once('turn.ended');
+    releaseLateSummary.resolve();
+    await cancel;
+    await ended;
+
+    const texts = historyTexts(ctx).join('\n');
+    expect(texts).toContain('ORIGINAL-ASSISTANT');
+    expect(texts).toContain('PROMPT-DURING-CANCEL-CLEANUP');
+    expect(texts).not.toContain('LATE-CANCELLED-SUMMARY');
+  });
+
+  it('drops deferred work and awaits compaction settlement during shutdown', async () => {
+    const abortObserved = createControlledPromise<void>();
+    const releaseCleanup = createControlledPromise<void>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      generateCalls += 1;
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          abortObserved.resolve();
+          resolve();
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      await releaseCleanup;
+      throw abortError();
+    };
+    const ctx = testAgent({ generate, persistence });
+    ctx.configure({ provider: PROVIDER, modelCapabilities: CAPS });
+    ctx.appendExchange(1, 'older user context', 'older assistant context', 40);
+
+    await ctx.rpc.beginCompaction({});
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'MUST-NOT-LAUNCH-AFTER-CLOSE' }],
+      promptId: 'prompt-closed-before-start',
+    });
+    let shutdownSettled = false;
+    const shutdown = ctx.agent.turn.shutdown(abortError('Session closed')).then(() => {
+      shutdownSettled = true;
+    });
+    await abortObserved;
+    await Promise.resolve();
+    expect(shutdownSettled).toBe(false);
+
+    releaseCleanup.resolve();
+    await shutdown;
+    expect(generateCalls).toBe(1);
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(historyTexts(ctx).join('\n')).not.toContain('MUST-NOT-LAUNCH-AFTER-CLOSE');
+    expect(
+      persistence.records.find((record) => record.type === 'turn.cancel'),
+    ).toMatchObject({ promptId: 'prompt-closed-before-start' });
+
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(persistence.records)),
+      generate: async () => textResult('Unexpected resurrected prompt.'),
+    });
+    await resumed.agent.resume();
+    expect(resumed.agent.turn.hasActiveTurn).toBe(false);
+    expect(historyTexts(resumed).join('\n')).not.toContain('MUST-NOT-LAUNCH-AFTER-CLOSE');
   });
 
   it('defers a steer arriving during compaction and delivers it afterward', async () => {

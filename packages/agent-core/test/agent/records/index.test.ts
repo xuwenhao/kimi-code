@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { buildReplay } from '../../../src';
 import {
@@ -8,6 +8,13 @@ import {
 } from '../../../src/agent/records';
 import type { ContextMessage } from '../../../src/agent/context';
 import { testAgent } from '../harness/agent';
+
+const generateMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@moonshot-ai/kosong', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@moonshot-ai/kosong')>();
+  return { ...actual, generate: generateMock };
+});
 
 describe('AgentRecords persistence metadata', () => {
   it('writes metadata before the first persisted record', async () => {
@@ -370,6 +377,35 @@ describe('AgentRecords persistence metadata', () => {
 });
 
 describe('agent replay range build', () => {
+  it('projects unconsumed prompt and steer admissions without resuming work', async () => {
+    generateMock.mockRejectedValue(new Error('projection must not generate'));
+    const persistence = new InMemoryAgentRecordPersistence([
+      { type: 'metadata', protocol_version: AGENT_WIRE_PROTOCOL_VERSION, created_at: 1 },
+      {
+        type: 'turn.prompt',
+        admissionId: 'prompt-admission',
+        turnId: 1,
+        input: [{ type: 'text', text: 'pending prompt' }],
+        origin: { kind: 'user' },
+      },
+      {
+        type: 'turn.steer',
+        admissionId: 'steer-admission',
+        turnId: 1,
+        ownerTurnId: 1,
+        input: [{ type: 'text', text: 'pending steer' }],
+        origin: { kind: 'user' },
+      },
+    ]);
+    const originalRecords = [...persistence.records];
+
+    await expect(buildReplay(persistence)).resolves.toEqual([]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(generateMock).not.toHaveBeenCalled();
+    expect(persistence.records).toEqual(originalRecords);
+  });
+
   it('returns the complete replay when no range is requested', async () => {
     const firstMessage = userMessage('first');
     const afterClearMessage = userMessage('after-clear');

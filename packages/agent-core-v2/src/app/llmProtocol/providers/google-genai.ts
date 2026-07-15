@@ -1,3 +1,10 @@
+/**
+ * `llmProtocol` domain (L0) — adapts Google GenAI requests and responses.
+ *
+ * Owns protocol translation, provider error normalization, and composition of
+ * configured, per-request, and transport cancellation signals. Owns no scoped state.
+ */
+
 import {
   APIConnectionError,
   APITimeoutError,
@@ -21,6 +28,7 @@ import { ApiError as GoogleApiError, GoogleGenAI as GenAIClient } from '@google/
 import { mergeConsecutiveUserMessages } from './merge-user-messages';
 
 import { requireProviderApiKey, resolveAuthBackedClient } from './request-auth';
+import { cancelNativeStream } from './stream-cancellation';
 
 function normalizeGoogleGenAIFinishReason(raw: unknown): {
   finishReason: FinishReason | null;
@@ -185,23 +193,13 @@ function createAbortError(): DOMException {
   return new DOMException('The operation was aborted.', 'AbortError');
 }
 
-async function abortPromise(signal: AbortSignal | undefined): Promise<never> {
-  if (signal === undefined) {
-    return new Promise(() => {
-    });
-  }
-  if (signal.aborted) {
-    throw createAbortError();
-  }
-  return new Promise((_, reject) => {
-    signal.addEventListener(
-      'abort',
-      () => {
-        reject(createAbortError());
-      },
-      { once: true },
-    );
-  });
+function mergeAbortSignals(
+  ...signals: Array<AbortSignal | null | undefined>
+): AbortSignal {
+  const definedSignals = signals.filter(
+    (signal): signal is AbortSignal => signal !== null && signal !== undefined,
+  );
+  return AbortSignal.any(definedSignals);
 }
 
 function messageToGoogleGenAI(message: Message): GoogleContent {
@@ -428,12 +426,15 @@ export class GoogleGenAIStreamedMessage implements StreamedMessage {
   private _finishReason: FinishReason | null = null;
   private _rawFinishReason: string | null = null;
   private readonly _iter: AsyncGenerator<StreamedMessagePart>;
+  private readonly _nativeStream: unknown;
 
   constructor(
     response: AsyncIterable<Record<string, unknown>> | Record<string, unknown>,
     isStream: boolean,
     signal?: AbortSignal,
+    private readonly _transportController?: AbortController,
   ) {
+    this._nativeStream = isStream ? response : undefined;
     if (isStream) {
       this._iter = this._convertStreamResponse(
         response as AsyncIterable<Record<string, unknown>>,
@@ -458,6 +459,13 @@ export class GoogleGenAIStreamedMessage implements StreamedMessage {
 
   get rawFinishReason(): string | null {
     return this._rawFinishReason;
+  }
+
+  cancel(): void {
+    try {
+      this._transportController?.abort();
+    } catch {}
+    cancelNativeStream(this._nativeStream);
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {
@@ -730,10 +738,24 @@ export class GoogleGenAIChatProvider implements ChatProvider {
     }
 
     const contents = messagesToGoogleGenAIContents(history);
+    const transportController = new AbortController();
+    const configuredSignal = this._generationKwargs['abortSignal'] as
+      | AbortSignal
+      | null
+      | undefined;
+    const requestSignal = mergeAbortSignals(
+      configuredSignal,
+      options?.signal,
+      transportController.signal,
+    );
+    if (requestSignal.aborted) {
+      throw createAbortError();
+    }
 
     const config: Record<string, unknown> = {
       ...this._generationKwargs,
       systemInstruction: systemPrompt,
+      abortSignal: requestSignal,
       ...(tools.length > 0 ? { tools: tools.map((t) => toolToGoogleGenAI(t)) } : {}),
     };
     applyResponseFormat(config, options?.responseFormat);
@@ -749,25 +771,21 @@ export class GoogleGenAIChatProvider implements ChatProvider {
 
       options?.onRequestSent?.();
       if (this._stream) {
-        const stream = await Promise.race([
-          models.generateContentStream(params),
-          abortPromise(options?.signal),
-        ]);
+        const stream = await models.generateContentStream(params);
         return new GoogleGenAIStreamedMessage(
           stream as AsyncIterable<Record<string, unknown>>,
           true,
-          options?.signal,
+          requestSignal,
+          transportController,
         );
       }
 
-      const response = await Promise.race([
-        models.generateContent(params),
-        abortPromise(options?.signal),
-      ]);
+      const response = await models.generateContent(params);
       return new GoogleGenAIStreamedMessage(
         response as Record<string, unknown>,
         false,
-        options?.signal,
+        requestSignal,
+        transportController,
       );
     } catch (error: unknown) {
       if (error instanceof DOMException && error.name === 'AbortError') {

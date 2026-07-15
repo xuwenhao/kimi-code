@@ -328,7 +328,7 @@ export class SessionAPIImpl implements PromisableMethods<SessionAPI> {
 
     this.session.metadata = nextMetadata;
     await this.session.writeMetadata();
-    await this.session.rpc.emitEvent({
+    this.session.emitEvent({
       type: 'session.meta.updated',
       agentId: 'main',
       title,

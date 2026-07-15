@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { CoreAPI, RPCMethods } from '@moonshot-ai/agent-core';
+import { log, type CoreAPI, type Event, type RPCMethods } from '@moonshot-ai/agent-core';
 
 import { SDKRpcClientBase } from '../src/rpc';
 import { Session } from '../src/session';
@@ -59,6 +59,37 @@ class CapturingRpc extends SDKRpcClientBase {
     } as unknown as RPCMethods<CoreAPI>;
   }
 }
+
+it('isolates synchronous and asynchronous listener failures so later listeners still receive the event', async () => {
+  const rpc = new CapturingRpc();
+  const received: Event[] = [];
+  const event = {
+    type: 'warning',
+    sessionId: 'session-listener-isolation',
+    agentId: 'main',
+    message: 'test warning',
+  } satisfies Event;
+  const logWarn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+  rpc.onEvent(() => {
+    throw new Error('listener failed');
+  });
+  rpc.onEvent(async () => {
+    throw new Error('async listener failed');
+  });
+  rpc.onEvent((input) => received.push(input));
+
+  try {
+    expect(() => {
+      rpc.receiveEvent(event);
+    }).not.toThrow();
+    expect(received).toEqual([event]);
+    await vi.waitFor(() => {
+      expect(logWarn).toHaveBeenCalledTimes(2);
+    });
+  } finally {
+    logWarn.mockRestore();
+  }
+});
 
 describe('Session.prompt input normalization', () => {
   it('passes multimodal prompt parts through to the core RPC client', async () => {

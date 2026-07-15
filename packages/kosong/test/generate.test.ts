@@ -1,3 +1,9 @@
+/**
+ * Streaming generation contracts with a provider as the only stubbed external
+ * boundary. Covers message assembly, callbacks, diagnostics, and cancellation.
+ * Run with: pnpm --filter @moonshot-ai/kosong exec vitest run test/generate.test.ts
+ */
+
 import { APIEmptyResponseError } from '#/errors';
 import { generate } from '#/generate';
 import type { Message, StreamedMessagePart, ToolCall } from '#/message';
@@ -745,6 +751,127 @@ describe('generate()', () => {
     expect(calledGenerate).toBe(false);
   });
 
+  it('rejects on abort when provider.generate never settles', async () => {
+    const controller = new AbortController();
+    let providerCalled = false;
+    const provider: ChatProvider = {
+      name: 'mock',
+      modelName: 'mock-model',
+      thinkingEffort: null,
+      generate: () => {
+        providerCalled = true;
+        return new Promise<StreamedMessage>(() => {});
+      },
+      withThinking(_effort: ThinkingEffort): ChatProvider {
+        return this;
+      },
+    };
+
+    const result = generate(provider, '', [], [], undefined, { signal: controller.signal });
+    expect(providerCalled).toBe(true);
+
+    controller.abort();
+
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('cancels a stream that provider.generate resolves after abort', async () => {
+    const controller = new AbortController();
+    let resolveProvider!: (stream: StreamedMessage) => void;
+    const providerResult = new Promise<StreamedMessage>((resolve) => {
+      resolveProvider = resolve;
+    });
+    const provider: ChatProvider = {
+      name: 'mock',
+      modelName: 'mock-model',
+      thinkingEffort: null,
+      generate: () => providerResult,
+      withThinking(_effort: ThinkingEffort): ChatProvider {
+        return this;
+      },
+    };
+    const cancel = vi.fn<() => void>();
+    const lateStream = Object.assign(createMockStream([]), { cancel });
+    const result = generate(provider, '', [], [], undefined, { signal: controller.signal });
+
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+
+    resolveProvider(lateStream);
+    await providerResult;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('ignores a late iterator result after abort while stream cleanup remains pending', async () => {
+    const controller = new AbortController();
+    let markNextStarted!: () => void;
+    const nextStarted = new Promise<void>((resolve) => {
+      markNextStarted = resolve;
+    });
+    let resolveNext!: (result: IteratorResult<StreamedMessagePart>) => void;
+    const pendingNext = new Promise<IteratorResult<StreamedMessagePart>>((resolve) => {
+      resolveNext = resolve;
+    });
+    const iterator: AsyncIterator<StreamedMessagePart> = {
+      next: () => {
+        markNextStarted();
+        return pendingNext;
+      },
+      return: vi.fn(() => new Promise<IteratorResult<StreamedMessagePart>>(() => {})),
+    };
+    const stream: StreamedMessage = {
+      id: null,
+      usage: null,
+      finishReason: null,
+      rawFinishReason: null,
+      [Symbol.asyncIterator]: () => iterator,
+    };
+    const onMessagePart = vi.fn<(part: StreamedMessagePart) => void>();
+    const result = generate(
+      createMockProvider(stream),
+      '',
+      [],
+      [],
+      { onMessagePart },
+      { signal: controller.signal },
+    );
+    await nextStarted;
+
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+
+    resolveNext({ done: false, value: { type: 'text', text: 'late output' } });
+    await pendingNext;
+    expect(onMessagePart).not.toHaveBeenCalled();
+    expect(iterator.return).toHaveBeenCalledOnce();
+  });
+
+  it('rejects on abort when an asynchronous message callback never settles', async () => {
+    const controller = new AbortController();
+    let markCallbackStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const result = generate(
+      createMockProvider(createMockStream([{ type: 'text', text: 'partial' }])),
+      '',
+      [],
+      [],
+      {
+        onMessagePart: () => {
+          markCallbackStarted();
+          return new Promise<void>(() => {});
+        },
+      },
+      { signal: controller.signal },
+    );
+    await callbackStarted;
+
+    controller.abort();
+
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
   it('signal aborted between provider.generate() and stream iteration is honored', async () => {
     const controller = new AbortController();
     let observedParts = 0;
@@ -827,9 +954,9 @@ describe('generate()', () => {
     expect(onToolCall).not.toHaveBeenCalled();
   });
 
-  it('post-await abort cancels the acquired stream before throwing AbortError', async () => {
+  it('rejects after requesting stream cancellation without waiting for cleanup', async () => {
     const controller = new AbortController();
-    const cancel = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    const cancel = vi.fn<() => Promise<void>>(() => new Promise<void>(() => {}));
 
     const stream: StreamedMessage & { cancel(): Promise<void> } = {
       cancel,
@@ -893,6 +1020,34 @@ describe('generate()', () => {
     });
 
     expect(received).toEqual(['first', 'second']);
+  });
+
+  it('dispatches every completed tool call when the first post-stream callback aborts', async () => {
+    const controller = new AbortController();
+    const stream = createMockStream([
+      { type: 'function', id: 'first', name: 'f', arguments: '{}' },
+      { type: 'function', id: 'second', name: 'g', arguments: '{}' },
+    ]);
+    const received: string[] = [];
+
+    const result = await generate(
+      createMockProvider(stream),
+      '',
+      [],
+      [],
+      {
+        onToolCall(toolCall): void {
+          received.push(toolCall.id);
+          if (toolCall.id === 'first') {
+            controller.abort();
+          }
+        },
+      },
+      { signal: controller.signal },
+    );
+
+    expect(received).toEqual(['first', 'second']);
+    expect(result.message.toolCalls.map((toolCall) => toolCall.id)).toEqual(['first', 'second']);
   });
 
   describe('finishReason propagation', () => {

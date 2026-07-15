@@ -720,6 +720,104 @@ describe('Agent context', () => {
     ]);
   });
 
+  it('keeps the latest unseen turn outcome intact before an oversized follow-up', () => {
+    const outcomeText = 'The previous turn was interrupted before it completed.';
+    context.append(
+      userMessage('old request', { kind: 'user' }),
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'partial answer' }],
+        toolCalls: [],
+      },
+      userMessage(outcomeText, { kind: 'injection', variant: 'turn_outcome' }),
+      userMessage(`follow-up ${'f'.repeat(100_000)}`, { kind: 'user' }),
+    );
+
+    const result = context.applyCompaction({
+      summary: 'summary',
+      compactedCount: context.get().length,
+      tokensBefore: estimateTokensForMessages(context.get()),
+    });
+
+    const messages = context.get();
+    const outcomes = messages.filter(
+      (message) =>
+        message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+    );
+    const outcomeIndex = messages.indexOf(outcomes[0]!);
+    const followUpIndex = messages.findIndex(
+      (message) => message.origin?.kind === 'user' && textOf(message).startsWith('follow-up '),
+    );
+    expect(outcomes).toHaveLength(1);
+    expect(textOf(outcomes[0]!)).toBe(outcomeText);
+    expect(outcomeIndex).toBeLessThan(followUpIndex);
+    expect(result.keptTurnOutcomeCount).toBe(1);
+    expect(result.keptUserMessageCount).toBe(3);
+  });
+
+  it('keeps only the latest unseen turn outcome and ignores hook assistant messages', () => {
+    context.append(
+      userMessage('request', { kind: 'user' }),
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'model answer' }],
+        toolCalls: [],
+      },
+      userMessage('older pending outcome', { kind: 'injection', variant: 'turn_outcome' }),
+      userMessage('latest pending outcome', { kind: 'injection', variant: 'turn_outcome' }),
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hook blocked without an LLM request' }],
+        toolCalls: [],
+        origin: { kind: 'hook_result', event: 'UserPromptSubmit', blocked: true },
+      },
+      userMessage('continue', { kind: 'user' }),
+    );
+
+    context.applyCompaction({
+      summary: 'summary',
+      compactedCount: context.get().length,
+      tokensBefore: estimateTokensForMessages(context.get()),
+    });
+
+    expect(
+      context
+        .get()
+        .filter(
+          (message) =>
+            message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+        )
+        .map(textOf),
+    ).toEqual(['latest pending outcome']);
+  });
+
+  it('drops a turn outcome that a later model assistant has already seen', () => {
+    context.append(
+      userMessage('request', { kind: 'user' }),
+      userMessage('seen outcome', { kind: 'injection', variant: 'turn_outcome' }),
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'model continued' }],
+        toolCalls: [],
+      },
+      userMessage('next request', { kind: 'user' }),
+    );
+
+    const result = context.applyCompaction({
+      summary: 'summary',
+      compactedCount: context.get().length,
+      tokensBefore: estimateTokensForMessages(context.get()),
+    });
+
+    expect(
+      context.get().some(
+        (message) =>
+          message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+      ),
+    ).toBe(false);
+    expect(result.keptTurnOutcomeCount).toBeUndefined();
+  });
+
   describe('notification projection', () => {
     it('does not merge a cron-fire envelope into an adjacent user message', () => {
       const cronEnvelope =

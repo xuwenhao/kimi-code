@@ -25,15 +25,17 @@ export class ReplayBuilder {
     private readonly options: ReplayBuilderOptions = {},
   ) {}
 
-  push(record: AgentReplayRecordPayload): void {
+  push(record: AgentReplayRecordPayload): AgentReplayRecord | undefined {
     if (this.captureLiveRecords || this.agent.records.restoring || this.postRestoring) {
-      if (this.frozen) return;
+      if (this.frozen) return undefined;
       const stamped: AgentReplayRecord = {
         ...record,
         time: this.agent.records.restoring?.time ?? Date.now(),
       };
       this.records.push(stamped);
+      return stamped;
     }
+    return undefined;
   }
 
   patchLast<T extends AgentReplayRecord['type']>(
@@ -42,9 +44,18 @@ export class ReplayBuilder {
   ): void {
     if (this.frozen) return;
     if (this.agent.records.restoring) {
-      const last = this.records.at(-1);
-      if (last && last.type === type) {
-        Object.assign(last, patch);
+      // A compaction remains open while unrelated config/permission/goal replay
+      // records may be appended. Locate the latest matching record rather than
+      // assuming the target is the array tail. For compactions, never rewrite a
+      // prior terminal if a malformed/duplicate terminal arrives with no open
+      // begin record.
+      const target = this.records.findLast(
+        (record) =>
+          record.type === type &&
+          (record.type !== 'compaction' || record.result === undefined),
+      );
+      if (target !== undefined) {
+        Object.assign(target, patch);
       }
     }
   }

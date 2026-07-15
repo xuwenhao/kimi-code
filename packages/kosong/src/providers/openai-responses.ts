@@ -37,6 +37,7 @@ import {
   sanitizeOpenAIResponsesCallId,
   type ToolCallIdPolicy,
 } from './tool-call-id';
+import { cancelNativeStream } from './stream-cancellation';
 
 /**
  * Normalize the Responses API status / incomplete_details into the unified
@@ -660,8 +661,10 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
   private _finishReason: FinishReason | null = null;
   private _rawFinishReason: string | null = null;
   private readonly _iter: AsyncGenerator<StreamedMessagePart>;
+  private readonly _nativeStream: unknown;
 
   constructor(response: unknown, isStream: boolean) {
+    this._nativeStream = isStream ? response : undefined;
     if (isStream) {
       this._iter = this._convertStreamResponse(response as AsyncIterable<RawObject>);
     } else {
@@ -683,6 +686,10 @@ export class OpenAIResponsesStreamedMessage implements StreamedMessage {
 
   get rawFinishReason(): string | null {
     return this._rawFinishReason;
+  }
+
+  cancel(): void {
+    cancelNativeStream(this._nativeStream);
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {

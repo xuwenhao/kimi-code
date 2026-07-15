@@ -752,6 +752,14 @@ export class StreamingUIController {
     this.host.state.ui.requestRender();
   }
 
+  failCompaction(): void {
+    const block = this._activeCompactionBlock;
+    if (block === undefined) return;
+    block.markFailed();
+    this._activeCompactionBlock = undefined;
+    this.host.state.ui.requestRender();
+  }
+
   // ---------------------------------------------------------------------------
   // Tool call grouping
   // ---------------------------------------------------------------------------

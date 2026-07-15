@@ -27,6 +27,7 @@ export interface RunTurnOptions {
   readonly contextOptions?: RecordingContextOptions | undefined;
   readonly sinkErrorMode?: SinkErrorMode | undefined;
   readonly recordStepUsage?: RunTurnInput['recordStepUsage'] | undefined;
+  readonly buildLlm?: NonNullable<RunTurnInput['buildLlm']>;
 }
 
 export interface RunTurnResult {
@@ -55,6 +56,7 @@ export async function runTurn(opts: RunTurnOptions): Promise<RunTurnResult> {
     turnId: opts.turnId ?? 'turn-1',
     signal: opts.signal ?? new AbortController().signal,
     llm,
+    buildLlm: opts.buildLlm,
     buildMessages: context.buildMessages,
     dispatchEvent: createLoopEventDispatcher({
       appendTranscriptRecord: context.appendTranscriptRecord,
@@ -94,6 +96,7 @@ export async function runTurnExpectingThrow(opts: RunTurnOptions): Promise<{
     turnId: opts.turnId ?? 'turn-1',
     signal: opts.signal ?? new AbortController().signal,
     llm,
+    buildLlm: opts.buildLlm,
     buildMessages: context.buildMessages,
     dispatchEvent: createLoopEventDispatcher({
       appendTranscriptRecord: context.appendTranscriptRecord,

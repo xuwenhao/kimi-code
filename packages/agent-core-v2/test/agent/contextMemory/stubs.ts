@@ -52,6 +52,11 @@ export function stubContextMemory(eventBus?: IEventBus): StubContextMemory {
       messages.push(...inserted);
       publishSplice(eventBus, { start, deleteCount: 0, messages: [...inserted] });
     },
+    appendTurnOutcome: (message) => {
+      const start = messages.length;
+      messages.push(message);
+      publishSplice(eventBus, { start, deleteCount: 0, messages: [message] });
+    },
     appendLoopEvent: () => {},
     closeAbandonedToolExchange: () => 0,
     clear: () => {
@@ -100,6 +105,9 @@ class StubContextMemoryService implements IAgentContextMemoryService {
   }
   append(...messages: readonly ContextMessage[]): void {
     this.impl.append(...messages);
+  }
+  appendTurnOutcome(message: ContextMessage, outcomeId: string): void {
+    this.impl.appendTurnOutcome(message, outcomeId);
   }
   clear(): void {
     this.impl.clear();

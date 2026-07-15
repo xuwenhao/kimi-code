@@ -18,12 +18,13 @@ import {
   createUserMessage,
   isImageFormatError,
 } from '@moonshot-ai/kosong';
+import { createControlledPromise, type ControlledPromise } from '@antfu/utils';
 
 import type { Agent } from '..';
 import type { GenerateOptionsWithRequestLogFields } from '../llm-request-logger';
-import type { ContextMessage } from '../context/types';
+import type { ContextMessage, TurnInputConsumption } from '../context/types';
 import { stripDynamicToolContext } from '../context/dynamic-tools';
-import { isAbortError } from '../../loop/errors';
+import type { PromptOrigin } from '../context';
 import {
   retryBackoffDelays,
   sleepForRetry,
@@ -42,7 +43,10 @@ import {
 import {
   applyCompletionBudget,
   resolveCompletionBudget,
-} from '../../utils/completion-budget';import { renderPrompt } from '../../utils/render-prompt';
+} from '../../utils/completion-budget';
+import { renderPrompt } from '../../utils/render-prompt';
+import type { AgentReplayRecord } from '../../rpc/resumed';
+import { agentRecordAppendAccepted } from '../records';
 import compactionInstructionTemplate from './compaction-instruction.md?raw';
 import type { CompactionBeginData, CompactionResult } from './types';
 import {
@@ -65,13 +69,77 @@ class CompactionTruncatedError extends Error {
   }
 }
 
+type CompactionPhase = 'running' | 'cancelling' | 'committing' | 'committed';
+
+interface ActiveCompaction {
+  readonly abortController: AbortController;
+  readonly promise: ControlledPromise;
+  blockedByTurn: boolean;
+  phase: CompactionPhase;
+  cancellation?: Promise<void>;
+  committedResult?: CompactionResult;
+  completionRecordWritten: boolean;
+  completionEventEmitted: boolean;
+  postCompactHookTriggered: boolean;
+  released: boolean;
+  postCommit?: Promise<void>;
+}
+
+type CompactionReplayRecord = Extract<AgentReplayRecord, { type: 'compaction' }>;
+
+interface RestoredCompaction {
+  readonly data: Readonly<CompactionBeginData>;
+  readonly replay: CompactionReplayRecord;
+}
+
+interface RestoredCompactionRecovery {
+  readonly active: ActiveCompaction;
+  readonly data: Readonly<CompactionBeginData>;
+  readonly result: CompactionResult;
+  started: boolean;
+}
+
+interface PostCommitOptions {
+  readonly emitCompletionEvent: boolean;
+  readonly triggerPostCompactHook: boolean;
+  readonly deferSystemPromptRefresh: boolean;
+}
+
+const LIVE_POST_COMMIT_OPTIONS: PostCommitOptions = {
+  emitCompletionEvent: true,
+  triggerPostCompactHook: true,
+  deferSystemPromptRefresh: false,
+};
+
+const RECOVERED_POST_COMMIT_OPTIONS: PostCommitOptions = {
+  // A resumed client reconstructs the completed compaction from replay. Emitting
+  // a live completion without a matching live `compaction.started` would render
+  // a second, phantom compaction row in clients.
+  emitCompletionEvent: false,
+  // Hooks are external side effects and cannot be replayed exactly once after a
+  // crash. The durable context/reminder/terminal invariants are recovered; the
+  // observational hook is deliberately not replayed.
+  triggerPostCompactHook: false,
+  // Session profile handles are restored by Session immediately after
+  // Agent.resume(). Retry the refresh at the next request boundary, when that
+  // handle is guaranteed to exist.
+  deferSystemPromptRefresh: true,
+};
+
+const POST_COMMIT_ATTEMPTS = 2;
+
 export class FullCompaction {
   protected compactionCountInTurn = 0;
-  protected compacting: {
-    abortController: AbortController;
-    promise: Promise<void>;
-    blockedByTurn: boolean;
-  } | null = null;
+  protected compacting: ActiveCompaction | null = null;
+  private restoredCompaction: RestoredCompaction | null = null;
+  private restoredCompactionRecovery: RestoredCompactionRecovery | null = null;
+  private restoreRecoverySubscribed = false;
+  private postCompactionInjectionPending = false;
+  private systemPromptRefreshPending = false;
+  private _systemPromptRefreshSnapshot: Readonly<{
+    revision: number;
+    systemPrompt: string | undefined;
+  }> = { revision: 0, systemPrompt: undefined };
   private readonly observedMaxContextTokensByModel = new Map<string, number>();
   // Token count right after the last successful compaction. While no new
   // content has been appended (tokenCountWithPending <= this value), the
@@ -157,10 +225,14 @@ export class FullCompaction {
     }
     if (this.compactionCountInTurn > this.strategy.maxCompactionPerTurn) return;
     if (this.agent.records.restoring) {
-      this.agent.replayBuilder.push({
+      const replay = this.agent.replayBuilder.push({
         type: 'compaction',
         instruction: data.instruction,
       });
+      if (replay?.type === 'compaction') {
+        this.restoredCompaction = { data, replay };
+        this.subscribeRestoreRecovery();
+      }
       return;
     }
     if (this.agent.context.history.length === 0) {
@@ -179,41 +251,139 @@ export class FullCompaction {
         'Cannot compact while a turn is active. Wait for it to finish, then retry.',
       );
     }
-    this.agent.records.logRecord({
-      type: 'full_compaction.begin',
-      ...data,
-    });
-    this.agent.emitEvent({
-      type: 'compaction.started',
-      trigger: data.source,
-      instruction: data.instruction,
-    });
     const abortController = new AbortController();
-    this.compacting = {
+    const promise = createControlledPromise<void>();
+    const reservation: NonNullable<FullCompaction['compacting']> = {
       abortController,
-      promise: this.compactionWorker(abortController.signal, data),
+      promise,
       blockedByTurn: false,
+      phase: 'running',
+      completionRecordWritten: false,
+      completionEventEmitted: false,
+      postCompactHookTriggered: false,
+      released: false,
     };
+    this.compacting = reservation;
+    void promise.catch(() => undefined);
+    try {
+      this.agent.records.logRecord({
+        type: 'full_compaction.begin',
+        ...data,
+      });
+    } catch (error) {
+      if (this.compacting === reservation) this.compacting = null;
+      abortController.abort(error);
+      promise.reject(error);
+      throw error;
+    }
+    if (this.compacting !== reservation || abortController.signal.aborted) {
+      if (this.compacting === reservation) this.compacting = null;
+      promise.resolve();
+      this.agent.turn.onCompactionFinished();
+      return;
+    }
+    try {
+      this.agent.emitEvent({
+        type: 'compaction.started',
+        trigger: data.source,
+        instruction: data.instruction,
+      });
+    } catch (error) {
+      if (this.compacting === reservation) this.compacting = null;
+      abortController.abort(error);
+      promise.reject(error);
+      this.agent.turn.onCompactionFinished();
+      throw error;
+    }
+    if (abortController.signal.aborted) {
+      if (this.compacting === reservation) this.compacting = null;
+      promise.resolve();
+      this.agent.turn.onCompactionFinished();
+      return;
+    }
+    const worker = this.compactionWorker(abortController.signal, data);
+    void worker.then(promise.resolve, promise.reject);
   }
 
-  cancel(): void {
-    this.agent.replayBuilder.patchLast('compaction', {
-      result: 'cancelled',
-    });
-    if (!this.compacting) return;
-    this.agent.records.logRecord({
-      type: 'full_compaction.cancel',
-    });
-    this.compacting.abortController.abort();
-    this.compacting = null;
+  cancel(): Promise<void> {
+    if (this.agent.records.restoring) {
+      this.restoredCompaction = null;
+      this.agent.replayBuilder.patchLast('compaction', { result: 'cancelled' });
+      return Promise.resolve();
+    }
+    const active = this.compacting;
+    if (!active) {
+      this.agent.replayBuilder.patchLast('compaction', { result: 'cancelled' });
+      return Promise.resolve();
+    }
+    // Once context application begins, cancellation would create a half-
+    // committed state by skipping prompt refresh/reinjection. From this point
+    // callers join the terminal barrier without changing the outcome.
+    if (active.phase === 'cancelling') return active.cancellation ?? active.promise;
+    if (active.phase !== 'running') return active.promise;
+    if (active.abortController.signal.aborted) return active.promise;
+    // Publish the cancellation barrier before invoking persistence callbacks:
+    // a synchronous observer may re-enter cancel(), and must join this exact
+    // operation instead of recursively appending cancellation records.
+    const cancellation = createControlledPromise<void>();
+    active.cancellation = cancellation;
+    active.phase = 'cancelling';
+    void cancellation.catch(() => undefined);
+    this.agent.replayBuilder.patchLast('compaction', { result: 'cancelled' });
+    let recordFailed = false;
+    let recordError: unknown;
+    try {
+      this.agent.records.logRecord({
+        type: 'full_compaction.cancel',
+      });
+    } catch (error) {
+      recordFailed = true;
+      recordError = error;
+    }
+    active.abortController.abort();
     this.agent.emitEvent({ type: 'compaction.cancelled' });
+    const barrier = active.promise.then(
+      () => {
+        if (recordFailed) throw recordError;
+      },
+      (error: unknown) => {
+        throw recordFailed ? recordError : error;
+      },
+    );
+    void barrier.then(cancellation.resolve, cancellation.reject);
+    return cancellation;
   }
 
-  markCompleted() {
-    this.agent.records.logRecord({
-      type: 'full_compaction.complete',
+  private cancelInBackground(): void {
+    void this.cancel().catch((error: unknown) => {
+      this.logPostCommitFailure('failed to persist compaction cancellation', error);
     });
-    this.compacting = null;
+  }
+
+  markCompleted(): void {
+    if (this.agent.records.restoring) {
+      this.restoredCompaction = null;
+      return;
+    }
+    this.writeCompletionRecord(this.compacting);
+  }
+
+  private writeCompletionRecord(active: ActiveCompaction | null): void {
+    if (active?.completionRecordWritten === true) return;
+    try {
+      this.agent.records.logRecord({
+        type: 'full_compaction.complete',
+      });
+      if (active !== null) active.completionRecordWritten = true;
+    } catch (error) {
+      // Built-in persistence implementations report which side of the append
+      // boundary failed. Retry only an explicit pre-accept rejection; unknown
+      // third-party semantics stay conservative to avoid two durable terminals.
+      if (active !== null && agentRecordAppendAccepted(error) !== false) {
+        active.completionRecordWritten = true;
+      }
+      throw error;
+    }
   }
 
   private get tokenCountWithPending(): number {
@@ -236,6 +406,19 @@ export class FullCompaction {
     this.consecutiveOverflowCompactions = 0;
   }
 
+  /**
+   * Atomically identifies the prompt text produced by the latest successful
+   * compaction refresh. Keeping the revision and text together prevents an
+   * unrelated config update between compaction and the next step from being
+   * mistaken for the prompt that compaction rendered.
+   */
+  get systemPromptRefreshSnapshot(): Readonly<{
+    revision: number;
+    systemPrompt: string | undefined;
+  }> {
+    return this._systemPromptRefreshSnapshot;
+  }
+
   async handleOverflowError(signal: AbortSignal, error: unknown) {
     this.consecutiveOverflowCompactions += 1;
     const maxAttempts = this.strategy.maxOverflowCompactionAttempts;
@@ -253,6 +436,7 @@ export class FullCompaction {
   }
 
   async beforeStep(signal: AbortSignal): Promise<void> {
+    await this.retryPendingPostCommitMaintenance();
     this.checkAutoCompaction();
     if (this.strategy.shouldBlock(this.tokenCountWithPending)) {
       await this.block(signal);
@@ -303,7 +487,7 @@ export class FullCompaction {
       active.blockedByTurn = true;
       signal.addEventListener('abort', () => {
         if (this.compacting === active) {
-          this.cancel();
+          this.cancelInBackground();
         }
       });
       this.agent.emitEvent({
@@ -318,38 +502,43 @@ export class FullCompaction {
     signal: AbortSignal,
     data: Readonly<CompactionBeginData>,
   ): Promise<void> {
+    const active = this.compacting;
     try {
       const result = await this.compactionRound(signal, data);
       if (!result) return;
-      // Stay "compacting" through reinjection: a follow-up prompt/steer that lands
-      // now is buffered (TurnFlow defers on `isCompacting`) until the
-      // post-compaction reminders are back, so the first post-compaction turn
-      // never builds a request before they are reinjected. Only after reinjection
-      // do we clear the flag, announce completion, and replay deferred input.
-      try {
-        await this.agent.refreshSystemPrompt();
-      } catch (error) {
-        this.agent.log.error('failed to refresh system prompt after compaction', { error });
-      }
-      await this.agent.injection.injectAfterCompaction();
-      // The reinjected reminders (loadable-tools manifest, goal) are part of
-      // the post-compaction floor: every compaction strips and re-appends
-      // them, so a baseline captured before this point would leave them
-      // outside the "nothing new since compaction" guard — with a large
-      // manifest checkAutoCompaction would re-trigger against a shape that
-      // cannot shrink. Raise the guard to the true floor before deferred
-      // input replays (markCompleted), so only genuinely new content counts.
-      this.lastCompactedTokenCount = this.tokenCountWithPending;
-      this.markCompleted();
-      const { contextSummary: _contextSummary, ...eventResult } = result;
-      void _contextSummary;
-      this.agent.emitEvent({ type: 'compaction.completed', result: eventResult });
-      this.triggerPostCompactHook(data, result);
+      if (active === null || this.compacting !== active) return;
+      await this.convergeCommittedCompaction(
+        active,
+        data,
+        result,
+        LIVE_POST_COMMIT_OPTIONS,
+      );
     } catch (error) {
-      if (isAbortError(error)) return;
-      const blockedByTurn = this.compacting?.blockedByTurn === true;
-      this.cancel();
-      this.agent.log.error('compaction failed', { error });
+      // applyCompaction is the commit point. Anything that throws after it must
+      // converge to the one completed terminal; treating it as cancellation is
+      // both false (the context is already replaced) and used to self-wait on
+      // active.promise from inside the worker that owns that promise.
+      if (
+        active !== null &&
+        this.compacting === active &&
+        active.phase === 'committed' &&
+        active.committedResult !== undefined
+      ) {
+        this.logPostCommitFailure('post-commit compaction work failed', error);
+        await this.convergeCommittedCompaction(
+          active,
+          data,
+          active.committedResult,
+          LIVE_POST_COMMIT_OPTIONS,
+        );
+        return;
+      }
+      // AbortError is not proof of cancellation: providers sometimes throw one
+      // on their own. The controller is the source of truth for whether this
+      // particular compaction was actually cancelled.
+      if (signal.aborted) return;
+      const blockedByTurn = active?.blockedByTurn === true;
+      this.logCompactionFailure(error);
       if (blockedByTurn) {
         throw error;
       }
@@ -360,9 +549,365 @@ export class FullCompaction {
     } finally {
       // Replay prompts/steers deferred while compaction held the context — on the
       // success path (after reinjection above), on an A1 prefix/tail cancel
-      // (`!result`), and on failure/abort. `compacting` is null by now in every
-      // path, so the replay's launch actually starts a turn instead of re-buffering.
-      this.agent.turn.onCompactionFinished();
+      // (`!result`), and on failure/abort. A cancelled worker retains its
+      // reservation through asynchronous cleanup; release that exact worker now
+      // so replay cannot overlap it and can actually start instead of re-buffering.
+      if (active !== null) this.releaseCompaction(active);
+    }
+  }
+
+  private subscribeRestoreRecovery(): void {
+    if (this.restoreRecoverySubscribed) return;
+    this.restoreRecoverySubscribed = true;
+    this.agent.records.onOpened(() => {
+      try {
+        this.prepareRestoredCompactionRecovery();
+      } catch (error) {
+        this.logPostCommitFailure('failed to prepare restored compaction recovery', error);
+      }
+    });
+  }
+
+  private prepareRestoredCompactionRecovery(): void {
+    this.scheduleRestoredPostCompactionMaintenance();
+    const restored = this.restoredCompaction;
+    this.restoredCompaction = null;
+    const result = restored?.replay.result;
+    // A begin record without context.apply_compaction is still pre-commit. It
+    // has no state to finalize and, crucially, must not be re-labelled as a
+    // cancellation just because the process exited.
+    if (restored === null || result === undefined || result === 'cancelled') return;
+    if (this.compacting !== null) {
+      this.logPostCommitFailure(
+        'cannot recover committed compaction while another compaction is active',
+        new Error('Compaction reservation collision during restore'),
+      );
+      return;
+    }
+
+    const abortController = new AbortController();
+    const promise = createControlledPromise<void>();
+    const active: ActiveCompaction = {
+      abortController,
+      promise,
+      blockedByTurn: false,
+      phase: 'committed',
+      committedResult: result,
+      completionRecordWritten: false,
+      completionEventEmitted: false,
+      postCompactHookTriggered: false,
+      released: false,
+    };
+    this.compacting = active;
+    void promise.catch(() => undefined);
+    this.restoredCompactionRecovery = {
+      active,
+      data: restored.data,
+      result,
+      started: false,
+    };
+  }
+
+  private scheduleRestoredPostCompactionMaintenance(): void {
+    const hasCompactedContext = this.agent.context.history.some(
+      (message) => message.origin?.kind === 'compaction_summary',
+    );
+    if (!hasCompactedContext) return;
+    // Even a durable `full_compaction.complete` may have been followed by a
+    // process exit before transient refresh/injection maintenance retried at
+    // the next request boundary. These flags are intentionally reconstructed
+    // from the surviving summary on every resume. The retry path deduplicates
+    // reminders that were already durable, so this closes that crash window
+    // without stacking a second copy after ordinary completed compactions.
+    this.systemPromptRefreshPending = true;
+    this.postCompactionInjectionPending = true;
+  }
+
+  /**
+   * Finish a committed compaction discovered during record replay. Agent.resume
+   * calls this only after background/cron/context/turn restore has settled. The
+   * reservation prepared in onOpened keeps TurnFlow from starting restored
+   * deferred work before that point.
+   */
+  async finishResume(): Promise<void> {
+    const recovery = this.restoredCompactionRecovery;
+    if (recovery === null) return;
+    if (!recovery.started) {
+      recovery.started = true;
+      const worker = this.recoveredCompactionWorker(
+        recovery.active,
+        recovery.data,
+        recovery.result,
+      );
+      void worker.then(recovery.active.promise.resolve, recovery.active.promise.reject);
+    }
+    await recovery.active.promise;
+    if (this.restoredCompactionRecovery === recovery) {
+      this.restoredCompactionRecovery = null;
+    }
+  }
+
+  private async recoveredCompactionWorker(
+    active: ActiveCompaction,
+    data: Readonly<CompactionBeginData>,
+    result: CompactionResult,
+  ): Promise<void> {
+    try {
+      await this.convergeCommittedCompaction(
+        active,
+        data,
+        result,
+        RECOVERED_POST_COMMIT_OPTIONS,
+      );
+    } catch (error) {
+      // convergeCommittedCompaction isolates every stage, but keep the recovery
+      // worker fail-open so an unexpected diagnostic failure cannot strand the
+      // restored agent in `isCompacting` forever.
+      this.logPostCommitFailure('restored compaction convergence failed', error);
+      await this.ensureCompletionRecord(active);
+    } finally {
+      this.releaseCompaction(active);
+    }
+  }
+
+  private convergeCommittedCompaction(
+    active: ActiveCompaction,
+    data: Readonly<CompactionBeginData>,
+    result: CompactionResult,
+    options: PostCommitOptions,
+  ): Promise<void> {
+    if (active.postCommit !== undefined) return active.postCommit;
+    // Defer the body by one microtask so the joinable promise is published
+    // before any synchronous persistence callback can re-enter cancellation.
+    const postCommit = Promise.resolve().then(async () => {
+      if (options.deferSystemPromptRefresh) {
+        this.systemPromptRefreshPending = true;
+      } else {
+        await this.refreshSystemPromptAfterCompaction();
+      }
+      await this.injectAfterCompactionWithRetry();
+      this.capturePostCompactionTokenFloor();
+      await this.ensureCompletionRecord(active);
+      this.emitCompletionOnce(active, result, options.emitCompletionEvent);
+      if (options.triggerPostCompactHook) {
+        this.triggerPostCompactHookOnce(active, data, result);
+      }
+      // Keep the reservation through synchronous completion observers, then
+      // release and replay deferred work before those observers' promises
+      // resume on the next microtask.
+      this.releaseCompaction(active);
+    });
+    active.postCommit = postCommit;
+    return postCommit;
+  }
+
+  private async retryPendingPostCommitMaintenance(): Promise<void> {
+    if (this.systemPromptRefreshPending) {
+      await this.refreshSystemPromptAfterCompaction();
+    }
+    if (this.postCompactionInjectionPending) {
+      await this.injectAfterCompactionWithRetry();
+      this.capturePostCompactionTokenFloor();
+    }
+  }
+
+  private async refreshSystemPromptAfterCompaction(): Promise<void> {
+    this.systemPromptRefreshPending = true;
+    for (let attempt = 1; attempt <= POST_COMMIT_ATTEMPTS; attempt += 1) {
+      try {
+        const systemPrompt = await this.agent.refreshSystemPrompt();
+        if (systemPrompt !== undefined) {
+          this._systemPromptRefreshSnapshot = {
+            revision: this._systemPromptRefreshSnapshot.revision + 1,
+            systemPrompt,
+          };
+        }
+        this.systemPromptRefreshPending = false;
+        return;
+      } catch (error) {
+        this.logPostCommitFailure(
+          `failed to refresh system prompt after compaction (attempt ${String(attempt)})`,
+          error,
+        );
+      }
+    }
+  }
+
+  private async injectAfterCompactionWithRetry(): Promise<void> {
+    this.postCompactionInjectionPending = true;
+    for (let attempt = 1; attempt <= POST_COMMIT_ATTEMPTS; attempt += 1) {
+      try {
+        await this.injectAfterCompactionIdempotently();
+        this.postCompactionInjectionPending = false;
+        return;
+      } catch (error) {
+        this.logPostCommitFailure(
+          `failed to inject post-compaction reminders (attempt ${String(attempt)})`,
+          error,
+        );
+        // DynamicInjector advances its cursor before appendSystemReminder. If
+        // persistence throws before accepting that append, the cursor would
+        // otherwise make the retry look successful while permanently skipping
+        // the missing reminder. Reset lifecycle cursors; exact durable reminders
+        // are still consumed by injectAfterCompactionIdempotently on the retry.
+        this.agent.injection.onContextCompacted();
+      }
+    }
+  }
+
+  /**
+   * Re-running InjectionManager after a crash is necessary, but doing so
+   * blindly duplicates any reminder records that made it to disk before the
+   * crash. Interpose only on the manager's append boundary and consume exact
+   * origin+content matches already present after the latest summary. Missing
+   * reminders still use ContextMemory's normal append path, so persistence,
+   * replay and injector bookkeeping stay aligned.
+   */
+  private async injectAfterCompactionIdempotently(): Promise<void> {
+    const context = this.agent.context;
+    const existing = this.postCompactionReminderCounts();
+    // Kept unbound so the exact original property can be restored in finally;
+    // calls below always provide ContextMemory explicitly.
+    // oxlint-disable-next-line typescript-eslint/unbound-method
+    const original = context.appendSystemReminder;
+    const wrapper = (
+      content: string,
+      origin: PromptOrigin,
+      consumedTurnInput?: TurnInputConsumption,
+      materializedTurnOutcomeId?: string,
+    ): void => {
+      const signature = systemReminderSignature(content, origin);
+      const remaining = existing.get(signature) ?? 0;
+      if (remaining > 0) {
+        existing.set(signature, remaining - 1);
+        return;
+      }
+      original.call(
+        context,
+        content,
+        origin,
+        consumedTurnInput,
+        materializedTurnOutcomeId,
+      );
+    };
+    const mutableContext = context as unknown as {
+      appendSystemReminder(
+        content: string,
+        origin: PromptOrigin,
+        consumedTurnInput?: TurnInputConsumption,
+        materializedTurnOutcomeId?: string,
+      ): void;
+    };
+    mutableContext.appendSystemReminder = wrapper;
+    try {
+      await this.agent.injection.injectAfterCompaction();
+    } finally {
+      // Restore only our own interposition. If a test/host deliberately replaced
+      // the method while injection awaited, do not overwrite that newer owner.
+      if (mutableContext.appendSystemReminder === wrapper) {
+        mutableContext.appendSystemReminder = original;
+      }
+    }
+  }
+
+  private postCompactionReminderCounts(): Map<string, number> {
+    const history = this.agent.context.history;
+    const summaryIndex = history.findLastIndex(
+      (message) => message.origin?.kind === 'compaction_summary',
+    );
+    const counts = new Map<string, number>();
+    for (const message of history.slice(summaryIndex + 1)) {
+      const origin = message.origin;
+      if (origin === undefined || message.role !== 'user') continue;
+      if (message.content.length !== 1 || message.content[0]?.type !== 'text') continue;
+      const content = unwrapSystemReminder(message.content[0].text);
+      if (content === undefined) continue;
+      const signature = systemReminderSignature(content, origin);
+      counts.set(signature, (counts.get(signature) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  private capturePostCompactionTokenFloor(): void {
+    try {
+      // Reinjected reminders are part of the minimal post-compaction floor. A
+      // lower baseline can immediately re-trigger a compaction that cannot make
+      // the context any smaller.
+      this.lastCompactedTokenCount = this.tokenCountWithPending;
+    } catch (error) {
+      this.logPostCommitFailure('failed to capture post-compaction token floor', error);
+    }
+  }
+
+  private async ensureCompletionRecord(active: ActiveCompaction): Promise<void> {
+    try {
+      // Preserve the synchronous production path so persistence observers see
+      // the reservation released in the same stack, while still accepting an
+      // async fault-injected replacement in tests/hosts.
+      const completion = (this.markCompleted as () => unknown)();
+      if (isPromiseLike(completion)) await completion;
+      return;
+    } catch (error) {
+      this.logPostCommitFailure('failed to mark compaction completed', error);
+    }
+    // A spy may throw before entering markCompleted. Bypass that replaceable
+    // surface once; the per-reservation write guard still guarantees one record
+    // when the first call accepted the record and then threw.
+    if (!active.completionRecordWritten) {
+      try {
+        this.writeCompletionRecord(active);
+      } catch (error) {
+        this.logPostCommitFailure('failed to persist compaction completion fallback', error);
+      }
+    }
+  }
+
+  private emitCompletionOnce(
+    active: ActiveCompaction,
+    result: CompactionResult,
+    enabled: boolean,
+  ): void {
+    if (!enabled || active.completionEventEmitted) return;
+    active.completionEventEmitted = true;
+    const { contextSummary: _contextSummary, ...eventResult } = result;
+    void _contextSummary;
+    this.agent.emitEvent({ type: 'compaction.completed', result: eventResult });
+  }
+
+  private triggerPostCompactHookOnce(
+    active: ActiveCompaction,
+    data: Readonly<CompactionBeginData>,
+    result: CompactionResult,
+  ): void {
+    if (active.postCompactHookTriggered) return;
+    active.postCompactHookTriggered = true;
+    try {
+      this.triggerPostCompactHook(data, result);
+    } catch (error) {
+      this.logPostCommitFailure('failed to trigger post-compaction hook', error);
+    }
+  }
+
+  private releaseCompaction(active: ActiveCompaction): void {
+    if (active.released) return;
+    active.released = true;
+    if (this.compacting === active) this.compacting = null;
+    this.agent.turn.onCompactionFinished();
+  }
+
+  private logCompactionFailure(error: unknown): void {
+    try {
+      this.agent.log.error('compaction failed', { error });
+    } catch {
+      // Diagnostics must not alter the compaction terminal state.
+    }
+  }
+
+  private logPostCommitFailure(message: string, error: unknown): void {
+    try {
+      this.agent.log.error(message, { error });
+    } catch {
+      // Diagnostics must not alter the compaction terminal state.
     }
   }
 
@@ -544,6 +1089,11 @@ export class FullCompaction {
         }
       }
 
+      // A provider may ignore AbortSignal and resolve after cancellation. Do
+      // not record its usage or let its stale summary rebuild context while a
+      // concurrently arriving prompt is waiting behind the cancellation
+      // reservation.
+      signal.throwIfAborted();
       if (usage !== null) {
         this.agent.usage.record(model, usage);
       }
@@ -552,7 +1102,7 @@ export class FullCompaction {
       for (let i = 0; i < originalHistory.length; i++) {
         if (newHistory[i] !== originalHistory[i]) {
           // The compacted prefix changed under us (e.g. undo). Bail.
-          this.cancel();
+          this.cancelInBackground();
           return undefined;
         }
       }
@@ -565,19 +1115,33 @@ export class FullCompaction {
       // covers originalHistory) nor kept, so it would silently vanish. Cancel and
       // let a later clean-boundary compaction handle it.
       if (newHistory.slice(originalHistory.length).some((message) => !isRealUserInput(message))) {
-        this.cancel();
+        this.cancelInBackground();
         return undefined;
       }
 
       const rawSummary = this.postProcessSummary(summary ?? '');
       const contextSummary = buildCompactionSummaryText(rawSummary);
-      const result = this.agent.context.applyCompaction({
-        summary: rawSummary,
-        contextSummary,
-        compactedCount: originalHistory.length,
-        tokensBefore,
-        droppedCount: droppedCount === 0 ? undefined : droppedCount,
-      });
+      signal.throwIfAborted();
+      const active = this.compacting;
+      if (!active || active.abortController.signal !== signal) return undefined;
+      active.phase = 'committing';
+      let result: CompactionResult;
+      try {
+        result = this.agent.context.applyCompaction({
+          summary: rawSummary,
+          contextSummary,
+          compactedCount: originalHistory.length,
+          tokensBefore,
+          droppedCount: droppedCount === 0 ? undefined : droppedCount,
+        });
+      } catch (error) {
+        if (this.compacting === active) active.phase = 'running';
+        throw error;
+      }
+      if (this.compacting === active) {
+        active.committedResult = result;
+        active.phase = 'committed';
+      }
       // Loaded dynamic tool schemas are deliberately NOT rebuilt: compaction
       // discards the loaded set entirely (the boundary announcement re-lists
       // every loadable name, and the model re-selects what it still needs).
@@ -591,20 +1155,26 @@ export class FullCompaction {
       // record written below keeps its persisted camelCase field names
       // (consumed by external projectors). The two channels intentionally
       // diverge — don't rename the record side to match.
-      this.agent.telemetry.track('compaction_finished', {
-        source: data.source,
-        tokens_before: result.tokensBefore,
-        tokens_after: result.tokensAfter,
-        duration_ms: Date.now() - startedAt,
-        compacted_count: result.compactedCount,
-        dropped_count: result.droppedCount,
-        retry_count: retryCount,
-        round: 1,
-        thinking_effort: this.agent.config.thinkingEffort,
-        ...(usage === null
-          ? {}
-          : { input_tokens: inputTotal(usage), output_tokens: usage.output }),
-      });
+      try {
+        this.agent.telemetry.track('compaction_finished', {
+          source: data.source,
+          tokens_before: result.tokensBefore,
+          tokens_after: result.tokensAfter,
+          duration_ms: Date.now() - startedAt,
+          compacted_count: result.compactedCount,
+          dropped_count: result.droppedCount,
+          retry_count: retryCount,
+          round: 1,
+          thinking_effort: this.agent.config.thinkingEffort,
+          ...(usage === null
+            ? {}
+            : { input_tokens: inputTotal(usage), output_tokens: usage.output }),
+        });
+      } catch (error) {
+        // Telemetry is observational. Once context application committed, a
+        // broken sink must not divert the state machine away from completion.
+        this.logPostCommitFailure('failed to record compaction telemetry', error);
+      }
       // Baseline the "nothing new since compaction" guard on the live counter
       // (== result.tokensAfter here, since nothing has been appended since
       // applyCompaction). compactionWorker raises it once more after
@@ -613,7 +1183,13 @@ export class FullCompaction {
       this.lastCompactedTokenCount = this.tokenCountWithPending;
       return result;
     } catch (error) {
-      if (isAbortError(error)) return undefined;
+      if (
+        this.compacting?.phase === 'committed' &&
+        this.compacting.committedResult !== undefined
+      ) {
+        throw error;
+      }
+      if (signal.aborted) return undefined;
       this.agent.telemetry.track('compaction_failed', {
         source: data.source,
         tokens_before: tokensBefore,
@@ -662,6 +1238,29 @@ export class FullCompaction {
       },
     });
   }
+}
+
+function systemReminderSignature(content: string, origin: PromptOrigin): string {
+  return JSON.stringify([
+    origin,
+    `<system-reminder>\n${content.trim()}\n</system-reminder>`,
+  ]);
+}
+
+function unwrapSystemReminder(text: string): string | undefined {
+  const prefix = '<system-reminder>\n';
+  const suffix = '\n</system-reminder>';
+  if (!text.startsWith(prefix) || !text.endsWith(suffix)) return undefined;
+  return text.slice(prefix.length, -suffix.length);
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' || typeof value === 'function') &&
+    value !== null &&
+    'then' in value &&
+    typeof value.then === 'function'
+  );
 }
 
 const MAX_COMPACTION_OVERFLOW_SHRINK_ATTEMPTS = 3;

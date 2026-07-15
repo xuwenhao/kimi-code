@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   onUnexpectedError,
@@ -41,6 +41,21 @@ describe('onUnexpectedError + setUnexpectedErrorHandler', () => {
     });
 
     expect(() => onUnexpectedError(new Error('original'))).not.toThrow();
+  });
+
+  it('does not propagate when the handler and console fallback both throw', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {
+      throw new Error('console failed');
+    });
+    setUnexpectedErrorHandler(() => {
+      throw new Error('handler failed');
+    });
+
+    try {
+      expect(() => onUnexpectedError(new Error('original'))).not.toThrow();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('resetUnexpectedErrorHandler restores the module default', () => {

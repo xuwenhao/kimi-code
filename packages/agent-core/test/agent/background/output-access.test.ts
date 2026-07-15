@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import type { Writable } from 'node:stream';
 import { join } from 'pathe';
 
+import { createControlledPromise } from '@antfu/utils';
 import type { KaosProcess } from '@moonshot-ai/kaos';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -43,7 +44,11 @@ describe('BackgroundManager — readOutput / getOutputSnapshot', () => {
     persistence = fixture.persistence!;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Include tasks whose status flipped to terminal just before their final
+    // persistence completed. Active-only listing would hide them and let the
+    // temporary directory be removed underneath the queued write.
+    await Promise.all(manager.list(false).map((task) => manager.wait(task.taskId)));
     rmSync(sessionDir, { recursive: true, force: true });
   });
 
@@ -130,5 +135,58 @@ describe('BackgroundManager — readOutput / getOutputSnapshot', () => {
     await waitForOutput(manager, taskId, 'ddddd');
 
     expect(await manager.readOutput(taskId, 5)).toBe('ddddd');
+  });
+
+  it('wait exposes a completed process only after queued output reaches output.log', async () => {
+    const outputWriteStarted = createControlledPromise<void>();
+    const releaseOutputWrite = createControlledPromise<void>();
+    const processDisposed = createControlledPromise<void>();
+    const events: string[] = [];
+    const appendTaskOutput = persistence.appendTaskOutput.bind(persistence);
+    const writeTask = persistence.writeTask.bind(persistence);
+
+    vi.spyOn(persistence, 'appendTaskOutput').mockImplementation(async (taskId, chunk) => {
+      events.push('output write started');
+      outputWriteStarted.resolve();
+      await releaseOutputWrite;
+      await appendTaskOutput(taskId, chunk);
+      events.push('output write finished');
+    });
+    vi.spyOn(persistence, 'writeTask').mockImplementation(async (info) => {
+      if (info.status !== 'completed') return;
+      events.push('terminal write started');
+      await writeTask(info);
+    });
+
+    const proc = immediateProcess(0, 'persisted before wait\n');
+    vi.mocked(proc.dispose).mockImplementation(async () => {
+      processDisposed.resolve();
+    });
+    const taskId = registerProcess(manager, proc, 'echo', 'demo');
+    let waitReturned = false;
+    const waitResult = manager.wait(taskId).then((info) => {
+      waitReturned = true;
+      return info;
+    });
+
+    await Promise.all([outputWriteStarted, processDisposed]);
+    // Cross one event-loop boundary after the process streams drained and the
+    // process was disposed, giving lifecycle finalization a chance to run
+    // without relying on wall-clock time.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const statusWhileOutputWriteBlocked = manager.getTask(taskId)?.status;
+    const waitReturnedWhileOutputWriteBlocked = waitReturned;
+    releaseOutputWrite.resolve();
+
+    await expect(waitResult).resolves.toMatchObject({ status: 'completed' });
+    expect(statusWhileOutputWriteBlocked).toBe('running');
+    expect(waitReturnedWhileOutputWriteBlocked).toBe(false);
+    expect(events).toEqual([
+      'output write started',
+      'output write finished',
+      'terminal write started',
+    ]);
+    await expect(manager.readOutput(taskId)).resolves.toBe('persisted before wait\n');
+    await expect(persistence.readTask(taskId)).resolves.toMatchObject({ status: 'completed' });
   });
 });

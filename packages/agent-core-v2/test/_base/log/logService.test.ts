@@ -91,6 +91,34 @@ describe('BoundLogger', () => {
     expect(sink.entries.map((e) => e.msg)).not.toContain('proxy payload');
   });
 
+  it('does not let throwing Error accessors escape into caller flow', () => {
+    const hostile = new Error('placeholder');
+    Object.defineProperty(hostile, 'message', {
+      get() {
+        throw new Error('message getter failed');
+      },
+    });
+    Object.defineProperty(hostile, 'stack', {
+      get() {
+        throw new Error('stack getter failed');
+      },
+    });
+
+    expect(() => logger.error('hostile error', hostile)).not.toThrow();
+    expect(sink.entries.map((e) => e.msg)).not.toContain('hostile error');
+  });
+
+  it('does not let a throwing writer escape into caller flow', () => {
+    const brokenWriter = {
+      write: () => {
+        throw new Error('sink failed');
+      },
+    };
+    const brokenLogger = new BoundLogger(brokenWriter, { level: 'info' });
+
+    expect(() => brokenLogger.warn('diagnostic only')).not.toThrow();
+  });
+
   it('merges object payload into ctx', () => {
     const debugLogger = new BoundLogger(sink, { level: 'debug' });
     debugLogger.info('with ctx', { requestId: 'r1', count: 2 });
@@ -111,6 +139,24 @@ describe('BoundLogger', () => {
     const leaf = logger.child({ a: 1 }).child({ b: 2 });
     leaf.info('evt');
     expect(sink.entries[0]?.ctx).toEqual({ a: 1, b: 2 });
+  });
+
+  it('creates a usable child when binding accessors throw', () => {
+    const hostileContext = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error('binding ownKeys failed');
+        },
+      },
+    );
+
+    let child!: ReturnType<BoundLogger['child']>;
+    expect(() => {
+      child = logger.child(hostileContext);
+    }).not.toThrow();
+    expect(() => child.warn('child survived')).not.toThrow();
+    expect(sink.entries.at(-1)?.msg).toBe('child survived');
   });
 });
 

@@ -8,6 +8,8 @@
  *     "Compaction complete (X → Y tokens)"
  *   - `markCanceled()` on `compaction.cancelled` → solid warning bullet +
  *     "Compaction cancelled"
+ *   - `markFailed()` when the compaction error event arrives without a
+ *     terminal event → solid error bullet + "Compaction failed"
  *
  * Bullet animation mirrors `ToolCallComponent` (500ms blink) so the user
  * reads the same "work in progress" signal across the UI.
@@ -31,6 +33,7 @@ export class CompactionComponent extends Container {
   private blinkTimer: ReturnType<typeof setInterval> | null = null;
   private done = false;
   private canceled = false;
+  private failed = false;
   private tokensBefore: number | undefined;
   private tokensAfter: number | undefined;
   private summary: string | undefined;
@@ -87,7 +90,7 @@ export class CompactionComponent extends Container {
   }
 
   markDone(tokensBefore?: number, tokensAfter?: number, summary?: string): void {
-    if (this.done || this.canceled) return;
+    if (this.done || this.canceled || this.failed) return;
     this.done = true;
     this.tokensBefore = tokensBefore;
     this.tokensAfter = tokensAfter;
@@ -101,8 +104,16 @@ export class CompactionComponent extends Container {
   }
 
   markCanceled(): void {
-    if (this.done || this.canceled) return;
+    if (this.done || this.canceled || this.failed) return;
     this.canceled = true;
+    this.stopBlink();
+    this.headerText.setText(this.buildHeader());
+    this.ui?.requestRender();
+  }
+
+  markFailed(): void {
+    if (this.done || this.canceled || this.failed) return;
+    this.failed = true;
     this.stopBlink();
     this.headerText.setText(this.buildHeader());
     this.ui?.requestRender();
@@ -162,6 +173,11 @@ export class CompactionComponent extends Container {
     if (this.canceled) {
       const bullet = currentTheme.fg('warning', STATUS_BULLET);
       const label = currentTheme.boldFg('warning', 'Compaction cancelled');
+      return `${bullet}${label}`;
+    }
+    if (this.failed) {
+      const bullet = currentTheme.fg('error', STATUS_BULLET);
+      const label = currentTheme.boldFg('error', 'Compaction failed');
       return `${bullet}${label}`;
     }
     const bullet = this.blinkOn ? currentTheme.fg('text', STATUS_BULLET) : '  ';

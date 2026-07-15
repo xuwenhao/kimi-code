@@ -1,13 +1,15 @@
 import { APIStatusError } from '#/app/llmProtocol/errors';
 import { type Message, type ToolCall } from '#/app/llmProtocol/message';
 import { emptyUsage } from '#/app/llmProtocol/usage';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { IAgentProfileService } from '#/index';
 import { IAgentLLMRequesterService, type LLMStreamTiming } from '#/agent/llmRequester/llmRequester';
 import { IAgentGoalService } from '#/agent/goal/goal';
 import { IAgentContextProjectorService } from '#/agent/contextProjector/contextProjector';
+import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IAgentLoopService, type Turn } from '#/agent/loop/loop';
+import { TurnModel, turnOutcome } from '#/agent/loop/turnOps';
 import { ContinuationStepRequest, MessageStepRequest } from '#/agent/loop/stepRequest';
 import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
 import type { ExecutableTool } from '#/tool/toolContract';
@@ -15,6 +17,8 @@ import { IAgentToolRegistryService } from '#/agent/toolRegistry/toolRegistry';
 import { IAgentUsageService } from '#/agent/usage/usage';
 import { IEventBus } from '#/app/event/eventBus';
 import { userCancellationReason } from '#/_base/utils/abort';
+import { ILogService } from '#/_base/log/log';
+import { IWireService } from '#/wire/wire';
 
 import {
   agentService,
@@ -24,9 +28,20 @@ import {
   type TestAgentOptions,
 } from '../../harness';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
+import { stubLog } from '../../_base/log/stubs';
 import { stubToolExecutor } from './stubs';
 
 type GenerateFn = NonNullable<TestAgentOptions['generate']>;
+
+function throwingDiagnosticLog(): {
+  readonly log: ILogService;
+  readonly warn: ReturnType<typeof vi.fn>;
+} {
+  const warn = vi.fn(() => {
+    throw new Error('diagnostic sink failed');
+  });
+  return { log: { ...stubLog(), warn }, warn };
+}
 
 describe('Agent loop', () => {
   let ctx: TestAgentContext;
@@ -119,6 +134,7 @@ describe('Agent loop', () => {
       [emit] agent.activity.updated      { "lifecycle": "ready", "turn": { "turnId": 0, "origin": { "kind": "user" }, "phase": "running", "step": 1, "ending": false, "pendingApprovals": [], "activeToolCalls": [], "since": "<time>" }, "background": [] }
       [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "blocked" } }, "time": "<time>" }
       [wire] context.append_loop_event   { "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "filtered", "usage": { "inputOther": 3, "output": 5, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "filtered", "rawFinishReason": "filtered" }, "time": "<time>" }
+      [wire] turn.outcome                { "outcomeId": "<uuid-3>", "turnId": 0, "content": "The previous turn ended before producing a final response.\\n\\nError: The model provider blocked the response due to its safety policy.\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.", "time": "<time>" }
       [emit] agent.activity.updated      { "lifecycle": "ready", "lastTurn": { "turnId": 0, "reason": "failed", "at": "<time>" }, "background": [] }
       [emit] context.spliced             { "start": 2, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe previous turn ended before producing a final response.\\n\\nError: The model provider blocked the response due to its safety policy.\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } } ] }
       [emit] turn.ended                  { "turnId": 0, "reason": "failed", "error": { "code": "provider.filtered", "message": "Provider safety policy blocked the response.", "name": "ProviderFilteredError", "details": { "finishReason": "filtered" }, "retryable": false } }
@@ -329,6 +345,70 @@ describe('Agent loop', () => {
     expect(followUpContext).not.toContain('internal-cache.example.test');
   });
 
+  it('keeps one outcome identity when the next turn starts during terminal activity publication', async () => {
+    await ctx.dispose();
+    const histories: Message[][] = [];
+    let calls = 0;
+    const generate: GenerateFn = async (_provider, _system, _tools, history) => {
+      histories.push(structuredClone(history));
+      calls += 1;
+      if (calls === 1) {
+        throw new APIStatusError(500, 'first turn failed', 'reentrant-outcome');
+      }
+      return {
+        id: 'reentrant-follow-up-response',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Recovered without duplication.' }],
+          toolCalls: [],
+        },
+        usage: emptyUsage(),
+        finishReason: 'completed',
+        rawFinishReason: 'stop',
+      };
+    };
+    ctx = createTestAgent({
+      generate,
+      initialConfig: { loopControl: { maxRetriesPerStep: 1 } },
+    });
+    loop = ctx.get(IAgentLoopService);
+    profile = ctx.get(IAgentProfileService);
+    profile.update({ activeToolNames: [] });
+
+    let reentrantTurn: Promise<Turn> | undefined;
+    const subscription = ctx.get(IEventBus).subscribe('agent.activity.updated', (event) => {
+      if (
+        reentrantTurn !== undefined ||
+        event.turn !== undefined ||
+        event.lastTurn?.reason !== 'failed'
+      ) {
+        return;
+      }
+      reentrantTurn = loop
+        .enqueue(nextTurnMessage('Continue from the reentrant observer.'))
+        .assigned.then((assignment) => assignment.turn);
+    });
+
+    const firstEnded = ctx.once('turn.ended');
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Fail before the observer.' }] });
+    await firstEnded;
+    const followUp = await reentrantTurn;
+    expect(followUp).toBeDefined();
+    await followUp!.result;
+    subscription.dispose();
+
+    const outcomeMessages = ctx.context.get().filter(
+      (message) =>
+        message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+    );
+    expect(outcomeMessages).toHaveLength(1);
+    expect(histories[1]!.map(textContent)).toEqual([
+      'Fail before the observer.',
+      expect.stringContaining('API request failed with HTTP 500.'),
+      'Continue from the reentrant observer.',
+    ]);
+  });
+
   it('records a model-visible reminder when the user cancels an active turn', async () => {
     let stepStarted!: () => void;
     const started = new Promise<void>((resolve) => {
@@ -350,8 +430,22 @@ describe('Agent loop', () => {
 
     const turn = (await loop.enqueue(nextTurnMessage('Wait for cancellation.')).assigned).turn;
     await started;
-    loop.cancel(turn.id);
+    expect(loop.cancel(turn.id)).toBe(true);
+    expect(loop.cancel(turn.id)).toBe(true);
     await expect(turn.result).resolves.toMatchObject({ type: 'cancelled' });
+
+    expect(
+      ctx.allEvents.filter(
+        (event) =>
+          event.event === 'turn.cancel' && JSON.stringify(event.args).includes('outcomeId'),
+      ),
+    ).toHaveLength(1);
+    expect(
+      ctx.contextData().history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+      ),
+    ).toHaveLength(1);
 
     expect(ctx.contextData().history.at(-1)).toMatchObject({
       role: 'user',
@@ -371,7 +465,212 @@ describe('Agent loop', () => {
     });
   });
 
-  it('ends a cancelled turn and pumps the queue when its diagnostic cannot be rendered', async () => {
+  it('tombstones pending turn outcomes when context is cleared or undone', () => {
+    const wire = ctx.get(IWireService);
+    const context = ctx.get(IAgentContextMemoryService);
+    wire.dispatch(turnOutcome({ outcomeId: 'clear-outcome', turnId: 10, content: 'clear me' }));
+
+    // A crash may leave only the intent, before either the old prompt or the
+    // reminder reached context. Clear must still persist its tombstone.
+    context.clear();
+    expect(wire.getModel(TurnModel).pendingOutcomes).toEqual([]);
+
+    context.append({
+      role: 'user',
+      content: [{ type: 'text', text: 'undo me' }],
+      toolCalls: [],
+      origin: { kind: 'user' },
+    });
+    wire.dispatch(turnOutcome({ outcomeId: 'undo-outcome', turnId: 11, content: 'undo me too' }));
+
+    context.undo(1);
+    expect(wire.getModel(TurnModel).pendingOutcomes).toEqual([]);
+  });
+
+  it('does not recreate a cancelled-turn outcome after context clear tombstones it', async () => {
+    let stepStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      stepStarted = resolve;
+    });
+    loop.hooks.onWillBeginStep.register('test-clear-cancelled-outcome', async (hookCtx, next) => {
+      stepStarted();
+      await new Promise<void>((_, reject) => {
+        hookCtx.signal.addEventListener(
+          'abort',
+          () => {
+            reject(hookCtx.signal.reason);
+          },
+          { once: true },
+        );
+      });
+      await next();
+    });
+
+    const turn = (await loop.enqueue(nextTurnMessage('Clear this cancelled turn.')).assigned).turn;
+    await started;
+    expect(loop.cancel(turn.id)).toBe(true);
+    ctx.get(IAgentContextMemoryService).clear();
+    await expect(turn.result).resolves.toMatchObject({ type: 'cancelled' });
+
+    expect(ctx.get(IWireService).getModel(TurnModel).pendingOutcomes).toEqual([]);
+    expect(
+      ctx.context.get().filter(
+        (message) =>
+          message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('blocks a new turn when an older outcome reminder fails before acceptance', async () => {
+    const wire = ctx.get(IWireService);
+    const context = ctx.get(IAgentContextMemoryService);
+    const append = vi
+      .spyOn(context, 'appendTurnOutcome')
+      .mockImplementationOnce(() => {
+        throw new Error('outcome append failed before acceptance');
+      });
+    wire.dispatch(
+      turnOutcome({
+        outcomeId: 'preaccept-outcome',
+        turnId: 10,
+        content: 'Older turn failed before the follow-up.',
+      }),
+    );
+
+    expect(() => loop.enqueue(nextTurnMessage('Must not reach the model.'))).toThrow(
+      'outcome append failed before acceptance',
+    );
+
+    expect(ctx.llmCalls).toHaveLength(0);
+    expect(loop.status()).toMatchObject({ state: 'idle', pendingTurnIds: [] });
+    expect(wire.getModel(TurnModel).pendingOutcomes).toHaveLength(1);
+
+    ctx.mockNextResponse({ type: 'text', text: 'Continued after the barrier retry.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue after retry.' }] });
+    await ctx.untilTurnEnd();
+
+    expect(append).toHaveBeenCalledTimes(2);
+    expect(wire.getModel(TurnModel).pendingOutcomes).toEqual([]);
+    expect(ctx.llmCalls).toHaveLength(1);
+    expect(ctx.llmCalls[0]!.history.map(textContent)).toEqual([
+      '<system-reminder>\nOlder turn failed before the follow-up.\n</system-reminder>',
+      'Continue after retry.',
+    ]);
+  });
+
+  it('keeps the terminal result and drains later turns when one queued turn fails its outcome barrier', async () => {
+    const context = ctx.get(IAgentContextMemoryService);
+    const appendFailure = new Error('outcome append failed before acceptance');
+    const append = vi
+      .spyOn(context, 'appendTurnOutcome')
+      .mockImplementationOnce(() => {
+        throw appendFailure;
+      })
+      .mockImplementationOnce(() => {
+        throw appendFailure;
+      });
+    const firstStepStarted = deferred();
+    const releaseFirstStep = deferred();
+    loop.hooks.onWillBeginStep.register('test-queued-start-failure', async (hookCtx, next) => {
+      if (hookCtx.turnId === 0) {
+        firstStepStarted.resolve();
+        await releaseFirstStep.promise;
+      }
+      await next();
+    });
+    ctx.mockNextProviderResponse({
+      parts: [{ type: 'text', text: 'blocked' }],
+      finishReason: 'filtered',
+    });
+    ctx.mockNextResponse({ type: 'text', text: 'third turn completed' });
+
+    const first = (await loop.enqueue(nextTurnMessage('first')).assigned).turn;
+    await firstStepStarted.promise;
+    const second = (await loop.enqueue(nextTurnMessage('second')).assigned).turn;
+    const third = (await loop.enqueue(nextTurnMessage('third')).assigned).turn;
+    releaseFirstStep.resolve();
+
+    await expect(first.result).resolves.toMatchObject({
+      type: 'failed',
+      error: { code: 'provider.filtered' },
+    });
+    await expect(second.result).resolves.toEqual({
+      type: 'failed',
+      error: appendFailure,
+      steps: 0,
+    });
+    await expect(third.result).resolves.toMatchObject({ type: 'completed' });
+    expect(append).toHaveBeenCalledTimes(3);
+    expect(ctx.llmCalls).toHaveLength(2);
+    expect(ctx.llmCalls[1]!.history.map(textContent)).toEqual([
+      'first',
+      'blocked',
+      expect.stringContaining('model provider blocked the response'),
+      'third',
+    ]);
+    expect(loop.status()).toEqual({
+      state: 'idle',
+      activeTurnId: undefined,
+      pendingTurnIds: [],
+      hasPendingRequests: false,
+    });
+  });
+
+  it('continues without duplicating an accepted outcome when its observer and diagnostic logger throw', async () => {
+    await ctx.dispose();
+    const diagnosticLog = throwingDiagnosticLog();
+    ctx = createTestAgent(agentService(ILogService, diagnosticLog.log));
+    loop = ctx.get(IAgentLoopService);
+    const wire = ctx.get(IWireService);
+    const context = ctx.get(IAgentContextMemoryService);
+    const originalAppend = context.appendTurnOutcome.bind(context);
+    const append = vi
+      .spyOn(context, 'appendTurnOutcome')
+      .mockImplementationOnce((message, outcomeId) => {
+        originalAppend(message, outcomeId);
+        throw new Error('outcome observer failed after acceptance');
+      });
+    wire.dispatch(
+      turnOutcome({
+        outcomeId: 'postaccept-outcome',
+        turnId: 11,
+        content: 'Accepted outcome must appear exactly once.',
+      }),
+    );
+    ctx.mockNextResponse({ type: 'text', text: 'Follow-up completed.' });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue once.' }] });
+    await ctx.untilTurnEnd();
+
+    expect(ctx.allEvents).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'completed' }),
+      }),
+    );
+    expect(diagnosticLog.warn).toHaveBeenCalledWith(
+      'turn outcome reminder committed with observer failure',
+      expect.objectContaining({ turnId: 11 }),
+    );
+    expect(append).toHaveBeenCalledOnce();
+    expect(wire.getModel(TurnModel).pendingOutcomes).toEqual([]);
+    expect(
+      ctx.context
+        .get()
+        .filter((message) => textContent(message).includes('Accepted outcome must appear')),
+    ).toHaveLength(1);
+    expect(ctx.llmCalls[0]!.history.map(textContent)).toEqual([
+      '<system-reminder>\nAccepted outcome must appear exactly once.\n</system-reminder>',
+      'Continue once.',
+    ]);
+    await ctx.expectResumeMatches();
+  });
+
+  it('ends a cancelled turn and pumps the queue when rendering and diagnostic logging throw', async () => {
+    await ctx.dispose();
+    const diagnosticLog = throwingDiagnosticLog();
+    ctx = createTestAgent(agentService(ILogService, diagnosticLog.log));
+    loop = ctx.get(IAgentLoopService);
     let stepStarted!: () => void;
     const started = new Promise<void>((resolve) => {
       stepStarted = resolve;
@@ -396,6 +695,10 @@ describe('Agent loop', () => {
 
     await expect(first.result).resolves.toMatchObject({ type: 'cancelled' });
     await expect(second.result).resolves.toMatchObject({ type: 'completed' });
+    expect(diagnosticLog.warn).toHaveBeenCalledWith(
+      'failed to render turn cancellation outcome',
+      expect.objectContaining({ turnId: 0 }),
+    );
     expect(
       ctx.allEvents
         .filter((event) => event.type === '[rpc]' && event.event === 'turn.ended')
@@ -817,6 +1120,18 @@ describe('Agent loop', () => {
     expect(active.state).toBe('cancelled');
     expect(queued.state).toBe('cancelled');
     expect(ctx.llmCalls).toHaveLength(0);
+    expect(
+      ctx.allEvents.filter(
+        (event) =>
+          event.event === 'turn.cancel' && JSON.stringify(event.args).includes('outcomeId'),
+      ),
+    ).toHaveLength(1);
+    expect(
+      ctx.contextData().history.filter(
+        (message) =>
+          message.origin?.kind === 'injection' && message.origin.variant === 'turn_outcome',
+      ),
+    ).toHaveLength(1);
     expect(() => loop.enqueue(nextTurnMessage('rejected'))).toThrow();
   });
 
@@ -1071,6 +1386,13 @@ function nextTurnMessage(text: string): MessageStepRequest {
   );
 }
 
+function textContent(message: Pick<Message, 'content'>): string {
+  return message.content
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('');
+}
+
 function createTimingRequester(): IAgentLLMRequesterService {
   const timing: LLMStreamTiming = {
     firstTokenLatencyMs: 100,
@@ -1083,6 +1405,7 @@ function createTimingRequester(): IAgentLLMRequesterService {
 
   return {
     _serviceBrand: undefined,
+    refreshTurnSystemPrompt: vi.fn(),
     async request(_overrides, onPart = () => {}) {
       await onPart({ type: 'text', text: 'answer' });
       return {
@@ -1175,12 +1498,9 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
 
 function cancellationReasonWithHostileMessage(): Error {
   const reason = new Error('hostile cancellation diagnostic');
-  let reads = 0;
   Object.defineProperty(reason, 'message', {
     configurable: true,
     get() {
-      reads += 1;
-      if (reads === 1) return 'deadline reached';
       throw new Error('message getter failed');
     },
   });

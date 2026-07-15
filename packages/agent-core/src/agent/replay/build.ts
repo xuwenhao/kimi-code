@@ -15,6 +15,10 @@ export async function buildReplay(
     type: 'sub',
     replay: { range },
   });
-  await agent.resume({ rewriteMigratedRecords: false });
+  // A replay projection is not a resumable runtime. Rebuild state only; do not
+  // run Agent.resume's background reconciliation, pending-turn launch, or
+  // compaction recovery, and keep record-open callbacks parked so they cannot
+  // append observability/recovery records to the source being projected.
+  await agent.records.replayReadOnly({ rewriteMigratedRecords: false });
   return agent.replayBuilder.buildResult();
 }

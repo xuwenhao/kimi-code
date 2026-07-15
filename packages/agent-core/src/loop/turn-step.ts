@@ -52,6 +52,8 @@ export interface ExecuteLoopStepDeps {
   readonly buildMessagesMediaStripped?: LoopMessageBuilder | undefined;
   readonly dispatchEvent: LoopEventDispatcher;
   readonly llm: LLM;
+  /** Re-evaluated after beforeStep so refreshed request config reaches this step. */
+  readonly buildLlm?: (() => LLM) | undefined;
   readonly tools?: readonly ExecutableTool[] | undefined;
   /**
    * Per-step tool table builder; wins over the static `tools` snapshot.
@@ -70,6 +72,8 @@ export interface ExecuteLoopStepDeps {
 }
 
 export async function executeLoopStep(deps: ExecuteLoopStepDeps): Promise<{
+  /** The exact LLM instance used for this step after the post-beforeStep rebuild. */
+  readonly llm: LLM;
   readonly usage: TokenUsage;
   readonly stopReason: LoopStepStopReason;
   /**
@@ -96,7 +100,8 @@ export async function executeLoopStep(deps: ExecuteLoopStepDeps): Promise<{
     buildMessagesMediaDegraded,
     buildMessagesMediaStripped,
     dispatchEvent,
-    llm,
+    llm: initialLlm,
+    buildLlm,
     tools,
     buildTools,
     describeMissingTool,
@@ -112,7 +117,7 @@ export async function executeLoopStep(deps: ExecuteLoopStepDeps): Promise<{
       turnId,
       stepNumber: currentStep,
       signal,
-      llm,
+      llm: initialLlm,
     });
     if (beforeStep?.block === true) {
       throw new Error(beforeStep.reason ?? `Step ${String(currentStep)} was blocked`);
@@ -120,6 +125,8 @@ export async function executeLoopStep(deps: ExecuteLoopStepDeps): Promise<{
   }
 
   signal.throwIfAborted();
+
+  const llm = buildLlm?.() ?? initialLlm;
 
   // Resolve the tool table AFTER beforeStep so it reflects the same state as
   // the messages built below (beforeStep can run compaction, which discards
@@ -434,6 +441,7 @@ export async function executeLoopStep(deps: ExecuteLoopStepDeps): Promise<{
   }
 
   return {
+    llm,
     usage,
     stopReason:
       stopTurnAfterStep && effectiveStopReason === 'tool_use' ? 'end_turn' : effectiveStopReason,

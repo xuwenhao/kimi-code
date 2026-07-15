@@ -172,7 +172,17 @@ export interface SessionSummary {
 
 export interface PromptPayload {
   readonly input: readonly ContentPart[];
+  /**
+   * Optional caller correlation echoed by the owning `turn.started` event.
+   * Ordinary SDK callers may omit it.
+   */
+  readonly promptId?: string;
 }
+
+/** Synchronous admission acknowledgement for an agent prompt. */
+export type PromptResult =
+  | { readonly kind: 'started'; readonly turnId: number }
+  | { readonly kind: 'deferred'; readonly deferredPromptId: string };
 export interface RunShellCommandPayload {
   readonly command: string;
   /**
@@ -198,9 +208,19 @@ export interface CancelShellCommandPayload {
 }
 export interface SteerPayload {
   readonly input: readonly ContentPart[];
+  /** Only steer when this exact turn is still the current active turn. */
+  readonly expectedTurnId?: number;
+  /** Only steer the logical prompt with this stable caller correlation. */
+  readonly expectedPromptId?: string;
+  /** Reject unless an active or compaction-deferred logical prompt owns the steer. */
+  readonly requireActive?: boolean;
 }
 export interface CancelPayload {
   readonly turnId?: number;
+  /** Cancel only the logical prompt with this stable caller correlation. */
+  readonly expectedPromptId?: string;
+  /** Reject unless an active or compaction-deferred logical prompt owns the cancellation. */
+  readonly requireActive?: boolean;
 }
 export interface SetThinkingPayload {
   readonly effort: string;
@@ -386,7 +406,7 @@ export interface GetCronTasksResult {
 }
 
 export interface AgentAPI {
-  prompt: (payload: PromptPayload) => void;
+  prompt: (payload: PromptPayload) => PromptResult;
   runShellCommand: (payload: RunShellCommandPayload) => Promise<ShellCommandResult>;
   cancelShellCommand: (payload: CancelShellCommandPayload) => void;
   steer: (payload: SteerPayload) => void;
@@ -403,7 +423,7 @@ export interface AgentAPI {
   exitSwarm: (payload: EmptyPayload) => void;
   getSwarmMode: (payload: EmptyPayload) => boolean;
   beginCompaction: (payload: BeginCompactionPayload) => void;
-  cancelCompaction: (payload: EmptyPayload) => void;
+  cancelCompaction: (payload: EmptyPayload) => Promise<void>;
   registerTool: (payload: RegisterToolPayload) => void;
   unregisterTool: (payload: UnregisterToolPayload) => void;
   setActiveTools: (payload: SetActiveToolsPayload) => void;

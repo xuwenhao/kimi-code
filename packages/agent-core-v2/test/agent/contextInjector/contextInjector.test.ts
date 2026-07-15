@@ -311,4 +311,25 @@ describe('AgentContextInjectorService', () => {
       { kind: 'injection', variant: 'per_turn_test' },
     ]);
   });
+
+  it('does not duplicate a surviving injection when post-compaction work retries', async () => {
+    let calls = 0;
+    injector(ix).register('retry_test', () => {
+      calls += 1;
+      return 'retry-safe reminder';
+    });
+
+    await injector(ix).injectAfterCompaction();
+    await injector(ix).injectAfterCompaction();
+
+    expect(calls).toBe(2);
+    expect(
+      context
+        .get()
+        .filter(
+          (message) =>
+            message.origin?.kind === 'injection' && message.origin.variant === 'retry_test',
+        ),
+    ).toHaveLength(1);
+  });
 });

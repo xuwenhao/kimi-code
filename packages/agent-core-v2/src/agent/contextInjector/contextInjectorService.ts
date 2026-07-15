@@ -6,7 +6,7 @@
  * those positions after `wire` restoration. Bound at Agent scope.
  */
 
-import { Disposable, toDisposable } from "#/_base/di/lifecycle";
+import { Disposable, toDisposable } from '#/_base/di/lifecycle';
 import { InstantiationType } from '#/_base/di/extensions';
 import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
 
@@ -43,7 +43,7 @@ export class AgentContextInjectorService extends Disposable implements IAgentCon
     this._register(
       loopService.hooks.onWillBeginStep.register('context-injector', async (_ctx, next) => {
         await next();
-        await this.inject();
+        await this.inject(false);
       }),
     );
     this._register(
@@ -82,10 +82,10 @@ export class AgentContextInjectorService extends Disposable implements IAgentCon
 
   async injectAfterCompaction(): Promise<void> {
     this.isNewTurn = true;
-    await this.inject();
+    await this.inject(true);
   }
 
-  private async inject(): Promise<void> {
+  private async inject(deduplicate = false): Promise<void> {
     const isNewTurn = this.isNewTurn;
     this.isNewTurn = false;
     for (const entry of this.entries) {
@@ -97,6 +97,7 @@ export class AgentContextInjectorService extends Disposable implements IAgentCon
       });
       if (!this.entries.has(entry)) continue;
       if (content === undefined) continue;
+      if (deduplicate && injectedPositions.length > 0) continue;
       const origin = { kind: 'injection' as const, variant: entry.name };
       if (typeof content === 'string') {
         if (content.trim().length === 0) continue;

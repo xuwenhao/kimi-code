@@ -23,6 +23,7 @@ const apiMock = vi.hoisted(() => ({
   exportSession: vi.fn(),
   updateSession: vi.fn(),
   submitPrompt: vi.fn(),
+  steerPrompts: vi.fn(),
   respondQuestion: vi.fn(),
   respondApproval: vi.fn(),
   dismissQuestion: vi.fn(),
@@ -286,6 +287,128 @@ describe('useWorkspaceState — abortCurrentPrompt', () => {
 
     expect(apiMock.abortPrompt).not.toHaveBeenCalled();
     expect(apiMock.abortSession).toHaveBeenCalledWith('sess_1');
+  });
+});
+
+describe('useWorkspaceState — steer and Stop transaction', () => {
+  beforeEach(() => {
+    apiMock.submitPrompt.mockReset();
+    apiMock.steerPrompts.mockReset();
+    apiMock.abortPrompt.mockReset();
+    apiMock.abortSession.mockReset();
+  });
+
+  it('stops queued B without reporting the steer rejection caused by cancelling A+B', async () => {
+    let rejectSteer!: (reason: unknown) => void;
+    let resolvePromptAbort!: (result: { aborted: boolean }) => void;
+    apiMock.submitPrompt.mockResolvedValue({
+      promptId: 'prompt_b',
+      userMessageId: 'message_b',
+      status: 'queued',
+    });
+    apiMock.steerPrompts.mockReturnValue(
+      new Promise((_, reject) => {
+        rejectSteer = reject;
+      }),
+    );
+    const steerCancelled = new DaemonApiError({
+      code: 50000,
+      msg: 'steer cancelled with its active turn',
+      requestId: 'req_steer',
+    });
+    apiMock.abortPrompt.mockImplementation(() => {
+      rejectSteer(steerCancelled);
+      return new Promise((resolve) => {
+        resolvePromptAbort = resolve;
+      });
+    });
+    apiMock.abortSession.mockResolvedValue({ aborted: true });
+    const state = createState();
+    state.promptIdBySession = { sess_1: 'prompt_a' };
+    const deps = createDeps();
+    const workspace = useWorkspaceState(state, deps);
+
+    const steering = workspace.steerPrompt('follow up B');
+    await vi.waitFor(() => {
+      expect(apiMock.steerPrompts).toHaveBeenCalledWith('sess_1', ['prompt_b']);
+    });
+
+    // The prompt.submitted WS event for queued B is allowed to replace A's
+    // cached id. With the daemon's steer reservation, abort(B) linearizes as
+    // cancelling both the active target A and selected queued prompt B.
+    state.promptIdBySession = { sess_1: 'prompt_b' };
+    const stopping = workspace.abortCurrentPrompt();
+    await vi.waitFor(() => {
+      // Session cancellation must not wait behind a slow abort(B) response.
+      expect(apiMock.abortSession).toHaveBeenCalledWith('sess_1');
+    });
+    resolvePromptAbort({ aborted: true });
+    await stopping;
+    await steering;
+
+    expect(apiMock.abortPrompt).toHaveBeenCalledWith('sess_1', 'prompt_b');
+    expect(apiMock.abortSession).toHaveBeenCalledWith('sess_1');
+    expect(deps.pushOperationFailure).not.toHaveBeenCalled();
+  });
+
+  it('cancels A and accepted B when Stop wins before the steer submit response', async () => {
+    let resolveSubmit!: (result: {
+      promptId: string;
+      userMessageId: string;
+      status: 'queued';
+    }) => void;
+    apiMock.submitPrompt.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSubmit = resolve;
+      }),
+    );
+    apiMock.abortPrompt.mockResolvedValue({ aborted: true });
+    apiMock.abortSession.mockResolvedValue({ aborted: true });
+    const state = createState();
+    state.promptIdBySession = { sess_1: 'prompt_a' };
+    const deps = createDeps();
+    const workspace = useWorkspaceState(state, deps);
+
+    const steering = workspace.steerPrompt('follow up B');
+    await vi.waitFor(() => {
+      expect(apiMock.submitPrompt).toHaveBeenCalledOnce();
+    });
+
+    // The WS prompt.submitted event is allowed to overtake the HTTP response.
+    // Stop must not treat a successful queued-only abort(B) as sufficient:
+    // session abort cancels A, then the steer path aborts B again once its
+    // accepted response arrives and never attempts prompts:steer.
+    state.promptIdBySession = { sess_1: 'prompt_b' };
+    await workspace.abortCurrentPrompt();
+    resolveSubmit({
+      promptId: 'prompt_b',
+      userMessageId: 'message_b',
+      status: 'queued',
+    });
+    await steering;
+
+    expect(apiMock.abortPrompt).toHaveBeenCalledWith('sess_1', 'prompt_b');
+    expect(apiMock.abortSession).toHaveBeenCalledWith('sess_1');
+    expect(apiMock.steerPrompts).not.toHaveBeenCalled();
+    expect(deps.pushOperationFailure).not.toHaveBeenCalled();
+  });
+
+  it('reports an unexpected steer failure instead of assuming queued B started', async () => {
+    const error = new Error('steer transport failed');
+    apiMock.submitPrompt.mockResolvedValue({
+      promptId: 'prompt_b',
+      userMessageId: 'message_b',
+      status: 'queued',
+    });
+    apiMock.steerPrompts.mockRejectedValue(error);
+    const deps = createDeps();
+    const workspace = useWorkspaceState(createState(), deps);
+
+    await workspace.steerPrompt('follow up B');
+
+    expect(deps.pushOperationFailure).toHaveBeenCalledWith('steer', error, {
+      sessionId: 'sess_1',
+    });
   });
 });
 

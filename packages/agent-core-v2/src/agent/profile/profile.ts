@@ -100,7 +100,7 @@ export interface IAgentProfileService {
   getModel(): string;
   useProfile(profile: ResolvedAgentProfile, context: SystemPromptContext): void;
   applyProfile(profile: ResolvedAgentProfile, options?: ApplyProfileOptions): Promise<void>;
-  refreshSystemPrompt(): Promise<void>;
+  refreshSystemPrompt(): Promise<string | undefined>;
   getAgentsMdWarning(): string | undefined;
   data(): ProfileData;
   getEffectiveThinkingLevel(): ThinkingEffort;

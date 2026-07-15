@@ -89,7 +89,13 @@ export class BoundLogger extends Disposable implements ILogger {
   }
 
   child(ctx: LogContext): ILogger {
-    return new BoundLogger(this.writer, this.levelState, { ...this.bound, ...ctx });
+    try {
+      return new BoundLogger(this.writer, this.levelState, { ...this.bound, ...ctx });
+    } catch {
+      // A hostile binding object must not make logger creation a business
+      // failure. Keep the parent's bindings and return a usable child.
+      return new BoundLogger(this.writer, this.levelState, this.bound);
+    }
   }
 
   error(message: string, payload?: LogPayload): void {
@@ -110,23 +116,28 @@ export class BoundLogger extends Disposable implements ILogger {
     message: string,
     payload?: LogPayload,
   ): void {
-    if (!levelEnabled(level, this.levelState.level)) return;
-    const extracted = extractPayload(payload);
-    if (extracted === undefined) return;
-    const payloadCtx = extracted.ctx;
-    const error = extracted.error;
-    const ctx =
-      payloadCtx !== undefined || Object.keys(this.bound).length > 0
-        ? { ...payloadCtx, ...this.bound }
-        : undefined;
-    const entry: LogEntry = {
-      t: Date.now(),
-      level,
-      msg: message,
-      ...(ctx !== undefined ? { ctx } : {}),
-      ...(error !== undefined ? { error } : {}),
-    };
-    this.writer.write(entry);
+    try {
+      if (!levelEnabled(level, this.levelState.level)) return;
+      const extracted = extractPayload(payload);
+      if (extracted === undefined) return;
+      const payloadCtx = extracted.ctx;
+      const error = extracted.error;
+      const ctx =
+        payloadCtx !== undefined || Object.keys(this.bound).length > 0
+          ? { ...payloadCtx, ...this.bound }
+          : undefined;
+      const entry: LogEntry = {
+        t: Date.now(),
+        level,
+        msg: message,
+        ...(ctx !== undefined ? { ctx } : {}),
+        ...(error !== undefined ? { error } : {}),
+      };
+      this.writer.write(entry);
+    } catch {
+      // Logging is observational. Hostile payload accessors, entry construction,
+      // and broken sinks must never change the caller's control flow.
+    }
   }
 }
 

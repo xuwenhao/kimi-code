@@ -8,6 +8,7 @@ import type {
   Session,
   ToolCall,
 } from '@moonshot-ai/kimi-code-sdk';
+import { extractImageCompressionCaptions } from '@moonshot-ai/kimi-code-sdk';
 
 import { ToolCallComponent } from '../components/messages/tool-call';
 import { currentTheme } from '../theme';
@@ -334,8 +335,16 @@ export class SessionReplayRenderer {
     }
 
     this.advanceTurn(context);
+    const content =
+      message.origin?.kind === 'user'
+        ? message.content.map((part) =>
+            part.type === 'text'
+              ? { ...part, text: extractImageCompressionCaptions(part.text).text }
+              : part,
+          )
+        : message.content;
     this.host.appendTranscriptEntry(
-      replayEntry(context, 'user', contentPartsToText(message.content), 'plain'),
+      replayEntry(context, 'user', contentPartsToText(content), 'plain'),
     );
   }
 

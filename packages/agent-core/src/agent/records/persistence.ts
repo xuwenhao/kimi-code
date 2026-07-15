@@ -3,6 +3,7 @@ import { mkdir, open } from 'node:fs/promises';
 import { dirname } from 'pathe';
 
 import { syncDir } from '../../utils/fs';
+import { markAgentRecordAppendError } from './append-error';
 import type { BlobStore } from './blobref';
 import { type AgentRecord, type AgentRecordPersistence } from './types';
 
@@ -33,7 +34,13 @@ export class InMemoryAgentRecordPersistence implements AgentRecordPersistence {
 
   append(input: AgentRecord): void {
     this.records.push(input);
-    this.options.onRecord?.(input);
+    try {
+      this.options.onRecord?.(input);
+    } catch (error) {
+      // The in-memory record is already visible. Preserve that acceptance fact
+      // when a fault-injection/observer callback fails afterward.
+      throw markAgentRecordAppendError(error, true);
+    }
   }
 
   rewrite(records: readonly AgentRecord[]): void {
@@ -97,7 +104,13 @@ export class FileSystemAgentRecordPersistence implements AgentRecordPersistence 
   }
 
   append(input: AgentRecord): void {
-    this.throwIfError();
+    try {
+      this.throwIfError();
+    } catch (error) {
+      // A latched filesystem failure rejects new records before they enter the
+      // pending queue, so a caller may safely retry if the sink later recovers.
+      throw markAgentRecordAppendError(error, false);
+    }
     this.pendingRecords.push(input);
     this.scheduleFlush();
   }

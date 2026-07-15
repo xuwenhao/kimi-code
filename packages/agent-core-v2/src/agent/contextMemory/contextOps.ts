@@ -135,7 +135,10 @@ const contextMessageSchema = z.custom<ContextMessage>();
 const loopRecordedEventSchema = z.custom<LoopRecordedEvent>();
 
 export const contextAppendMessage = ContextModel.defineOp('context.append_message', {
-  schema: z.object({ message: contextMessageSchema }),
+  schema: z.object({
+    message: contextMessageSchema,
+    materializedTurnOutcomeId: z.string().optional(),
+  }),
   apply: (state, p) => foldAppendMessage(state, p.message) as ContextMessage[],
 });
 
@@ -154,6 +157,7 @@ const contextCompactionBaseShape = {
   tokensAfter: z.number().optional(),
   keptUserMessageCount: z.number().optional(),
   keptHeadUserMessageCount: z.number().optional(),
+  keptTurnOutcomeCount: z.number().optional(),
   droppedCount: z.number().optional(),
   legacyTail: z.boolean().optional(),
 };
@@ -217,6 +221,7 @@ export function readContextCompactionShapeInput(
     tokensAfter: readOptionalNumber(fields, 'tokensAfter'),
     keptUserMessageCount,
     keptHeadUserMessageCount: readOptionalNumber(fields, 'keptHeadUserMessageCount'),
+    keptTurnOutcomeCount: readOptionalNumber(fields, 'keptTurnOutcomeCount'),
     droppedCount: readOptionalNumber(fields, 'droppedCount'),
     legacyTail: readOptionalBoolean(fields, 'legacyTail') ?? keptUserMessageCount === undefined,
   };

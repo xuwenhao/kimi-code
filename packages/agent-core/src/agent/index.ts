@@ -104,6 +104,14 @@ export interface AgentOptions {
   readonly systemPromptContextProvider?: (() => Promise<PreparedSystemPromptContext>) | undefined;
 }
 
+export interface AgentResumeOptions extends AgentRecordsReplayOptions {
+  /**
+   * Session integration point: restore runtime-only handles after durable state
+   * is rebuilt, but before replayed prompts/steers are allowed to start work.
+   */
+  readonly beforePendingWorkResume?: (() => void | Promise<void>) | undefined;
+}
+
 export class Agent {
   readonly type: AgentType;
   private _kaos: Kaos;
@@ -162,6 +170,7 @@ export class Agent {
   private additionalDirs: readonly string[];
   private activeProfile?: ResolvedAgentProfile;
   private brandHome?: string;
+  private eventStreamClosed = false;
   private readonly systemPromptContextProvider?: (() => Promise<PreparedSystemPromptContext>) | undefined;
 
   constructor(options: AgentOptions) {
@@ -343,20 +352,20 @@ export class Agent {
    * compaction so the post-compaction turns do not keep a snapshot captured
    * at session bootstrap. Invalidates the prompt-cache prefix by design.
    */
-  async refreshSystemPrompt(): Promise<void> {
-    if (this.activeProfile === undefined) return;
+  async refreshSystemPrompt(): Promise<string | undefined> {
+    if (this.activeProfile === undefined) return undefined;
     const context = this.systemPromptContextProvider === undefined
       ? await prepareSystemPromptContext(this.kaos, this.brandHome, {
           additionalDirs: this.additionalDirs,
         })
       : await this.systemPromptContextProvider();
-    this.updateSystemPromptFromProfile(this.activeProfile, context);
+    return this.updateSystemPromptFromProfile(this.activeProfile, context);
   }
 
   private updateSystemPromptFromProfile(
     profile: ResolvedAgentProfile,
     context?: PreparedSystemPromptContext,
-  ): void {
+  ): string {
     const systemPrompt = profile.systemPrompt({
       osEnv: this.kaos.osEnv,
       cwd: this.config.cwd,
@@ -366,18 +375,28 @@ export class Agent {
       additionalDirsInfo: context?.additionalDirsInfo,
     });
     this.config.update({ profileName: profile.name, systemPrompt });
+    return systemPrompt;
   }
 
-  async resume(options?: AgentRecordsReplayOptions): Promise<{ warning?: string }> {
+  async resume(options: AgentResumeOptions = {}): Promise<{ warning?: string }> {
     const result = await this.records.replay(options);
     try {
       this.replayBuilder.postRestoring = true;
       this.goal.normalizeAfterReplay();
+      // Runtime profile/config handles must be ready before reconciliation can
+      // emit a background/cron steer or recovered admissions can launch. This
+      // hook may perform async default-profile bootstrap for migrated wires.
+      await options.beforePendingWorkResume?.();
       await this.background.loadFromDisk();
       await this.background.reconcile();
       await this.cron?.loadFromDisk();
       this.context.finishResume();
       this.turn.finishResume();
+      // A crash may leave a compaction durably committed but missing its
+      // refresh/reinjection/terminal tail. Records replay installs a reservation
+      // synchronously so pending turn inputs stay parked; converge it only after
+      // background, cron, context, and turn state are fully reconstructed.
+      await this.fullCompaction.finishResume();
     } finally {
       this.replayBuilder.postRestoring = false;
     }
@@ -387,25 +406,51 @@ export class Agent {
   get rpcMethods(): PromisableMethods<AgentAPI> {
     return {
       prompt: (payload) => {
-        this.turn.prompt(payload.input);
+        const result = this.turn.submitPrompt(payload.input, undefined, payload.promptId);
+        if (result.kind === 'busy') {
+          throw new KimiError(result.error.code, result.error.message, {
+            details: result.error.details,
+          });
+        }
+        return result;
       },
       runShellCommand: (payload) => this.tools.runShellCommand(payload.command, payload.commandId),
       cancelShellCommand: (payload) => this.tools.cancelShellCommand(payload.commandId),
       steer: (payload) => {
         this.telemetry.track('input_steer', { parts: payload.input.length });
-        this.turn.steer(payload.input);
+        this.turn.steer(
+          payload.input,
+          undefined,
+          payload.expectedTurnId,
+          payload.expectedPromptId,
+          payload.requireActive,
+        );
       },
       cancel: async (payload) => {
-        const waitForTurn =
-          this.turn.hasActiveTurn &&
-          (payload.turnId === undefined || payload.turnId === this.turn.currentId)
-            ? this.turn.waitForCurrentTurn()
-            : undefined;
+        this.turn.assertCancellationTarget(
+          payload.turnId,
+          payload.expectedPromptId,
+          payload.requireActive,
+        );
+        // Capture the worker before aborting it. A goal worker owns every
+        // continuation turn id it allocated, not only its latest id; using the
+        // same predicate as TurnFlow.cancel keeps this RPC a true terminal
+        // barrier even when a delayed request carries an earlier id.
+        const waitForTurn = this.turn.isActiveTurn(payload.turnId)
+          ? this.turn.waitForCurrentTurn()
+          : undefined;
         if (this.turn.hasActiveTurn) {
           this.telemetry.track('cancel', { from: 'streaming' });
         }
-        this.turn.cancel(payload.turnId);
-        await waitForTurn;
+        const waitForSubagents = this.turn.cancel(payload.turnId, undefined, {
+          expectedPromptId: payload.expectedPromptId,
+          requireActive: payload.requireActive,
+        });
+        const settlements = await Promise.allSettled([waitForTurn, waitForSubagents]);
+        const rejected = settlements.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (rejected !== undefined) throw rejected.reason;
       },
       undoHistory: (payload) => {
         this.context.undo(payload.count);
@@ -476,7 +521,7 @@ export class Agent {
         if (this.fullCompaction.isCompacting) {
           this.telemetry.track('cancel', { from: 'compacting' });
         }
-        this.fullCompaction.cancel();
+        return this.fullCompaction.cancel();
       },
       registerTool: (payload) => {
         this.tools.registerUserTool(payload);
@@ -551,8 +596,31 @@ export class Agent {
   }
 
   emitEvent(event: AgentEvent): void {
-    if (this.records.restoring) return;
-    void this.rpc?.emitEvent?.(event);
+    if (this.records.restoring || this.turn?.isClosed || this.eventStreamClosed) return;
+    try {
+      const delivery = this.rpc?.emitEvent?.(event);
+      if (delivery !== undefined) {
+        void Promise.resolve(delivery).catch((error: unknown) => {
+          this.reportEventDeliveryFailure(event.type, error);
+        });
+      }
+    } catch (error) {
+      this.reportEventDeliveryFailure(event.type, error);
+    }
+  }
+
+  private reportEventDeliveryFailure(eventType: AgentEvent['type'], error: unknown): void {
+    try {
+      this.log.warn('agent event delivery failed', { eventType, error });
+    } catch {
+      // Event observers are outside engine control flow. A broken diagnostic
+      // sink must not turn an already-isolated delivery failure into one.
+    }
+  }
+
+  /** Permanently detach this Agent from its owning session's outbound event stream. */
+  closeEventStream(): void {
+    this.eventStreamClosed = true;
   }
 
   emitStatusUpdated(includeThinkingEffort = false): void {

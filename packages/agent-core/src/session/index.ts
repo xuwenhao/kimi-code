@@ -6,7 +6,7 @@ import type { SessionWarning } from '@moonshot-ai/protocol';
 import { ErrorCodes, KimiError } from '#/errors';
 import { getRootLogger, log } from '#/logging/logger';
 import type { Logger, SessionLogHandle } from '#/logging/types';
-import type { KimiConfig, SDKSessionRPC } from '#/rpc';
+import type { AgentEvent, KimiConfig, SDKSessionRPC } from '#/rpc';
 import { proxyWithExtraPayload } from '#/rpc/types';
 
 import { Agent, type AgentOptions, type AgentType } from '../agent';
@@ -55,7 +55,7 @@ import { sessionMediaOriginalsDir } from '../tools/support/image-originals';
 import type { ToolServices } from '../tools/support/services';
 import { FlagResolver, type ExperimentalFlagResolver } from '../flags';
 import { ImageLimits } from '../tools/support/image-limits';
-import { abortError } from '../utils/abort';
+import { abortable, abortError } from '../utils/abort';
 
 export interface SessionOptions {
   readonly kaos: Kaos;
@@ -113,12 +113,14 @@ interface ResumedAgent {
 }
 
 type AgentEntry = Agent | Promise<ResumedAgent>;
+type SessionAgentEvent = AgentEvent & { readonly agentId: string };
 
 export interface CreateAgentOptions {
   readonly profile?: ResolvedAgentProfile;
   readonly parentAgentId?: string;
   readonly swarmItem?: string;
   readonly persistMetadata?: boolean;
+  readonly signal?: AbortSignal;
 }
 
 export interface SessionMeta {
@@ -193,6 +195,13 @@ export class Session {
   private agentsMdWarning: string | undefined;
   private printSteerDeadline: number | undefined;
   private printSteerTurns = 0;
+  private lifecycleState: 'open' | 'closing' | 'closed' = 'open';
+  private closePromise: Promise<void> | null = null;
+  private readonly pendingAgentOperations = new Set<Promise<unknown>>();
+  private readonly pendingSessionStartOperations = new Set<Promise<void>>();
+  private readonly provisionalAgents = new Set<Agent>();
+  private readonly lifecycleAbortController = new AbortController();
+  private sessionEventStreamClosed = false;
 
   constructor(public readonly options: SessionOptions) {
     // Attach the per-session log sink up front so the constructor's
@@ -308,26 +317,41 @@ export class Session {
     return this.persistenceKaos.withCwd(cwd);
   }
 
-  async createMain() {
+  createMain(): Promise<Agent> {
+    this.assertOpen();
+    return this.trackPendingAgentOperation(this.createMainInternal());
+  }
+
+  private async createMainInternal(): Promise<Agent> {
     const { agent } = await this.createAgent({ type: 'main' }, {
       profile: DEFAULT_AGENT_PROFILES['agent'],
     });
+    this.assertOpen();
     if (this.options.drainAgentTasksOnStop) {
       agent.printDrainAgentTasksOnStop = true;
     }
     await this.triggerSessionStart('startup');
+    this.assertOpen();
     return agent;
   }
 
-  async resume(): Promise<{ warning?: string }> {
+  resume(): Promise<{ warning?: string }> {
+    this.assertOpen();
+    return this.trackPendingAgentOperation(this.resumeInternal());
+  }
+
+  private async resumeInternal(): Promise<{ warning?: string }> {
     await this.skillsReady;
+    this.assertOpen();
     this.log.info('session resume', { app_version: this.options.appVersion });
     const { agents } = await this.readMetadata();
+    this.assertOpen();
     this.agents.clear();
     // Only the main agent is needed to reopen the session; subagents replay
     // lazily when an RPC or Agent(resume=...) call asks for their state.
     const { warning } =
       agents['main'] === undefined ? { warning: undefined } : await this.resumeAgent('main');
+    this.assertOpen();
     // A session migrated from an external tool ships a wire without the
     // `config.update` bootstrap events a natively-created agent writes, so the
     // main agent comes back with an empty system prompt and no tools. Apply the
@@ -337,21 +361,63 @@ export class Session {
     const profile = DEFAULT_AGENT_PROFILES['agent'];
     if (main !== undefined && profile !== undefined && main.config.systemPrompt === '') {
       await this.bootstrapAgentProfile(main, profile);
+      this.assertOpen();
     }
     await this.triggerSessionStart('resume');
+    this.assertOpen();
     return { warning };
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return this.startClose(false);
+  }
+
+  closeForReload(): Promise<void> {
+    return this.startClose(true);
+  }
+
+  private startClose(forReload: boolean): Promise<void> {
+    if (this.closePromise !== null) return this.closePromise;
+    this.lifecycleState = 'closing';
+    this.lifecycleAbortController.abort(abortError('Session closed'));
+    let resolveClose!: () => void;
+    let rejectClose!: (reason: unknown) => void;
+    const close = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    this.closePromise = close;
+    void this.performClose(forReload).then(
+      () => {
+        this.lifecycleState = 'closed';
+        resolveClose();
+      },
+      (error: unknown) => {
+        this.lifecycleState = 'closed';
+        rejectClose(error);
+      },
+    );
+    return close;
+  }
+
+  private async performClose(forReload: boolean): Promise<void> {
     try {
+      // SessionStart is an ordering barrier, not merely best-effort setup:
+      // SessionEnd must never overtake an already-started hook. Real hook
+      // processes observe lifecycleAbortController and settle promptly; the
+      // unbounded join also preserves ordering if an external hook boundary
+      // ignores cancellation.
+      await this.settlePendingSessionStartOperationsOnClose();
+      await this.settlePendingAgentOperationsOnClose();
       await Promise.allSettled(
         Array.from(this.readyAgents(), async (agent) => agent.cron?.stop()),
       );
       await this.cancelActiveTurnsOnClose();
-      await this.stopBackgroundTasksOnExit();
+      if (!forReload) await this.stopBackgroundTasksOnExit();
       await this.flushMetadata();
-      await this.triggerSessionEnd('exit');
+      if (!forReload) await this.triggerSessionEnd('exit');
     } finally {
+      this.closeAgentEventStreams();
       try {
         await this.mcp.shutdown();
       } finally {
@@ -360,18 +426,34 @@ export class Session {
     }
   }
 
-  async closeForReload(): Promise<void> {
-    try {
-      await Promise.allSettled(
-        Array.from(this.readyAgents(), async (agent) => agent.cron?.stop()),
-      );
-      await this.flushMetadata();
-    } finally {
-      try {
-        await this.mcp.shutdown();
-      } finally {
-        await this.logHandle?.close();
-      }
+  private async settlePendingSessionStartOperationsOnClose(): Promise<void> {
+    while (this.pendingSessionStartOperations.size > 0) {
+      await Promise.allSettled(this.pendingSessionStartOperations);
+    }
+  }
+
+  private async settlePendingAgentOperationsOnClose(): Promise<void> {
+    const pending = new Set<Promise<unknown>>(this.pendingAgentOperations);
+    for (const entry of this.agents.values()) {
+      if (entry instanceof Promise) pending.add(entry);
+    }
+
+    for (const agent of this.provisionalAgents) {
+      agent.closeEventStream();
+      pending.add(agent.cron?.stop() ?? Promise.resolve());
+      pending.add(agent.turn.shutdown(abortError('Session closed')));
+    }
+    if (pending.size === 0) return;
+
+    const settled = await waitForSettlementOrTimeout(
+      Promise.allSettled(pending),
+      ACTIVE_TURN_CLOSE_TIMEOUT_MS,
+    );
+    if (!settled) {
+      this.reportWarning('timed out waiting for pending agent setup during session close', {
+        pendingCount: pending.size,
+        timeoutMs: ACTIVE_TURN_CLOSE_TIMEOUT_MS,
+      });
     }
   }
 
@@ -383,6 +465,11 @@ export class Session {
       cancellations.push(this.cancelAgentTurnOnClose(entry));
     }
     await Promise.allSettled(cancellations);
+  }
+
+  private closeAgentEventStreams(): void {
+    this.sessionEventStreamClosed = true;
+    for (const agent of this.readyAgents()) agent.closeEventStream();
   }
 
   private activeBackgroundAgentIds(): Set<string> {
@@ -398,24 +485,10 @@ export class Session {
   }
 
   private async cancelAgentTurnOnClose(agent: Agent): Promise<void> {
-    if (!agent.turn.hasActiveTurn) return;
-
-    let waitForTurn: Promise<unknown>;
-    try {
-      waitForTurn = agent.turn.waitForCurrentTurn();
-    } catch (error: unknown) {
-      this.log.debug('active turn wait unavailable during session close', {
-        agentType: agent.type,
-        agentHomedir: agent.homedir,
-        error,
-      });
-      return;
-    }
-
-    agent.turn.cancel(undefined, abortError('Session closed'));
-    const settled = await waitForSettlementOrTimeout(waitForTurn, ACTIVE_TURN_CLOSE_TIMEOUT_MS);
+    const shutdown = agent.turn.shutdown(abortError('Session closed'));
+    const settled = await waitForSettlementOrTimeout(shutdown, ACTIVE_TURN_CLOSE_TIMEOUT_MS);
     if (!settled) {
-      this.log.warn('timed out waiting for active turn to cancel during session close', {
+      this.reportWarning('timed out waiting for agent work to stop during session close', {
         agentType: agent.type,
         agentHomedir: agent.homedir,
         timeoutMs: ACTIVE_TURN_CLOSE_TIMEOUT_MS,
@@ -592,37 +665,94 @@ export class Session {
     config: Partial<AgentOptions>,
     options: CreateAgentOptions = {},
   ): Promise<{ readonly id: string; readonly agent: Agent }> {
-    await this.skillsReady;
+    this.assertOpen();
+    return this.trackPendingAgentOperation(this.createAgentInternal(config, options));
+  }
+
+  private trackPendingAgentOperation<T>(operation: Promise<T>): Promise<T> {
+    this.pendingAgentOperations.add(operation);
+    void operation.then(
+      () => this.pendingAgentOperations.delete(operation),
+      () => this.pendingAgentOperations.delete(operation),
+    );
+    return operation;
+  }
+
+  private async createAgentInternal(
+    config: Partial<AgentOptions>,
+    options: CreateAgentOptions,
+  ): Promise<{ readonly id: string; readonly agent: Agent }> {
+    if (options.signal === undefined) {
+      await this.skillsReady;
+    } else {
+      await abortable(this.skillsReady, options.signal);
+    }
+    this.assertOpen();
     const type = config.type ?? 'main';
     const id = type === 'main' ? 'main' : this.nextGeneratedAgentId();
     const homedir = config.homedir ?? join(this.options.homedir, 'agents', id);
     const parentAgentId = options.parentAgentId ?? null;
     const agent = this.instantiateAgent(id, homedir, type, config, parentAgentId);
-    if (options.profile) {
-      await this.bootstrapAgentProfile(agent, options.profile);
-    }
+    this.provisionalAgents.add(agent);
+    try {
+      if (options.profile) {
+        const bootstrap = this.bootstrapAgentProfile(agent, options.profile);
+        if (options.signal === undefined) {
+          await bootstrap;
+        } else {
+          await abortable(bootstrap, options.signal);
+        }
+        this.assertOpen();
+      }
 
-    this.agents.set(id, agent);
-    if (options.persistMetadata !== false) {
-      this.metadata.agents[id] = {
-        homedir,
-        type,
-        parentAgentId,
-        swarmItem: options.swarmItem,
-      };
-      void this.writeMetadata();
-    }
+      this.assertOpen();
+      this.agents.set(id, agent);
+      this.provisionalAgents.delete(agent);
+      if (options.persistMetadata !== false) {
+        this.metadata.agents[id] = {
+          homedir,
+          type,
+          parentAgentId,
+          swarmItem: options.swarmItem,
+        };
+        void this.writeMetadata();
+      }
 
-    return { id, agent };
+      return { id, agent };
+    } catch (error) {
+      await this.disposeProvisionalAgent(agent);
+      throw error;
+    }
   }
 
   async ensureAgentResumed(id: string): Promise<Agent> {
+    this.assertOpen();
     const entry = this.agents.get(id);
-    if (entry !== undefined) return (await this.resolveAgentEntry(entry)).agent;
+    if (entry !== undefined) {
+      const agent = (await this.resolveAgentEntry(entry)).agent;
+      this.assertOpen();
+      return agent;
+    }
     if (this.metadata.agents[id] === undefined) {
       throw new KimiError(ErrorCodes.AGENT_NOT_FOUND, `Agent "${id}" was not found`);
     }
-    return (await this.resumeAgent(id)).agent;
+    const agent = (await this.resumeAgent(id)).agent;
+    this.assertOpen();
+    return agent;
+  }
+
+  private assertOpen(): void {
+    if (this.lifecycleState === 'open') return;
+    throw new KimiError(ErrorCodes.SESSION_CLOSED, 'Session is closing or already closed');
+  }
+
+  private async disposeProvisionalAgent(agent: Agent): Promise<void> {
+    this.provisionalAgents.delete(agent);
+    agent.closeEventStream();
+    await Promise.allSettled([
+      agent.cron?.stop(),
+      agent.turn.shutdown(abortError('Session closed')),
+    ]);
   }
 
   /**
@@ -639,6 +769,7 @@ export class Session {
       this.options.kimiHomeDir,
       { additionalDirs: this.additionalDirs },
     );
+    this.assertOpen();
     agent.useProfile(profile, context, this.options.kimiHomeDir);
     const { agentsMdWarning } = context;
     if (agentsMdWarning !== undefined) {
@@ -852,7 +983,7 @@ export class Session {
   private emitInitialMcpLoadError(error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
     this.log.error('mcp initial load failed', error);
-    void this.rpc.emitEvent({
+    this.emitEvent({
       type: 'error',
       agentId: 'main',
       ...makeErrorPayload(ErrorCodes.MCP_STARTUP_FAILED, message),
@@ -862,7 +993,7 @@ export class Session {
   private onMcpServerStatusChange(entry: McpServerEntry): void {
     // Always surface server-level status changes to clients so the TUI/SDK
     // can keep its dashboard in sync, even before the main agent exists.
-    void this.rpc.emitEvent({
+    this.emitEvent({
       type: 'mcp.server.status',
       agentId: 'main',
       server: {
@@ -873,6 +1004,34 @@ export class Session {
         error: entry.error,
       },
     });
+  }
+
+  /** Deliver a session-scoped event without letting an external observer steer engine control flow. */
+  emitEvent(event: SessionAgentEvent): void {
+    if (this.sessionEventStreamClosed) return;
+    try {
+      const delivery = this.rpc.emitEvent(event);
+      if (delivery !== undefined) {
+        void Promise.resolve(delivery).catch((error: unknown) => {
+          this.reportEventDeliveryFailure(event.type, error);
+        });
+      }
+    } catch (error) {
+      this.reportEventDeliveryFailure(event.type, error);
+    }
+  }
+
+  private reportEventDeliveryFailure(eventType: AgentEvent['type'], error: unknown): void {
+    this.reportWarning('session event delivery failed', { eventType, error });
+  }
+
+  private reportWarning(message: string, payload: unknown): void {
+    try {
+      this.log.warn(message, payload);
+    } catch {
+      // Diagnostic sinks are outside session control flow. They must not turn
+      // event delivery or bounded close-timeout reporting into a failure.
+    }
   }
 
   private refreshAgentBuiltinTools(): void {
@@ -962,6 +1121,7 @@ export class Session {
     id: string,
     stack: readonly string[] = [],
   ): Promise<ResumedAgent> {
+    this.assertOpen();
     if (stack.includes(id)) {
       throw new KimiError(
         ErrorCodes.SESSION_STATE_INVALID,
@@ -982,6 +1142,7 @@ export class Session {
     stack: readonly string[] = [],
   ): Promise<ResumedAgent> {
     await this.skillsReady;
+    this.assertOpen();
     const meta = this.metadata.agents[id];
     if (meta === undefined) {
       throw new KimiError(ErrorCodes.SESSION_STATE_INVALID, `Session agent "${id}" is missing`);
@@ -992,20 +1153,39 @@ export class Session {
       parentAgentId === null
         ? undefined
         : await this.resumeAgent(parentAgentId, [...stack, id]);
+    this.assertOpen();
 
+    let agent: Agent | undefined;
     try {
-      const agent = this.instantiateAgent(
+      const resumedAgent = this.instantiateAgent(
         id,
         join(this.options.homedir, 'agents', id),
         meta.type,
         {},
         parentAgentId,
       );
-      const result = await agent.resume();
-      this.restoreAgentProfileHandle(agent, meta, parent?.agent);
-      this.agents.set(id, agent);
-      return { agent, warning: parent?.warning ?? result.warning };
+      agent = resumedAgent;
+      this.provisionalAgents.add(resumedAgent);
+      const result = await resumedAgent.resume({
+        beforePendingWorkResume: async () => {
+          this.assertOpen();
+          if (resumedAgent.config.systemPrompt === '' && meta.type === 'main') {
+            const defaultProfile = DEFAULT_AGENT_PROFILES['agent'];
+            if (defaultProfile !== undefined) {
+              await this.bootstrapAgentProfile(resumedAgent, defaultProfile);
+              this.assertOpen();
+              return;
+            }
+          }
+          this.restoreAgentProfileHandle(resumedAgent, meta, parent?.agent);
+        },
+      });
+      this.assertOpen();
+      this.agents.set(id, resumedAgent);
+      this.provisionalAgents.delete(resumedAgent);
+      return { agent: resumedAgent, warning: parent?.warning ?? result.warning };
     } catch (error) {
+      if (agent !== undefined) await this.disposeProvisionalAgent(agent);
       const entry = this.agents.get(id);
       if (entry instanceof Promise) {
         this.agents.delete(id);
@@ -1059,11 +1239,26 @@ export class Session {
     return agent;
   }
 
-  private async triggerSessionStart(source: 'startup' | 'resume'): Promise<void> {
-    await this.hookEngine.trigger('SessionStart', {
-      matcherValue: source,
-      inputData: { source },
-    });
+  private triggerSessionStart(source: 'startup' | 'resume'): Promise<void> {
+    // Reserve the close barrier before invoking HookEngine. Deferring invocation
+    // by one microtask also makes a close immediately following createMain /
+    // resume authoritative: the hook sees an already-aborted signal and never
+    // escapes the lifecycle barrier.
+    const operation = Promise.resolve()
+      .then(() =>
+        this.hookEngine.trigger('SessionStart', {
+          matcherValue: source,
+          inputData: { source },
+          signal: this.lifecycleAbortController.signal,
+        }),
+      )
+      .then(() => undefined);
+    this.pendingSessionStartOperations.add(operation);
+    void operation.then(
+      () => this.pendingSessionStartOperations.delete(operation),
+      () => this.pendingSessionStartOperations.delete(operation),
+    );
+    return operation;
   }
 
   private async triggerSessionEnd(reason: 'exit'): Promise<void> {

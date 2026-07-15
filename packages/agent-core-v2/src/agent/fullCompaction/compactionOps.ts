@@ -2,29 +2,30 @@
  * `fullCompaction` domain (L4) — wire Model (`CompactionModel`) and the
  * `full_compaction.begin` (`fullCompactionBegin`) / `full_compaction.cancel`
  * (`fullCompactionCancel`) / `full_compaction.complete`
- * (`fullCompactionComplete`) Ops that mirror the full-compaction lifecycle into
- * a persisted, replayable phase, plus the `compaction.*` edge events
+ * (`fullCompactionComplete`) Ops that mirror the full-compaction lifecycle
+ * into a persisted, replayable phase, plus the `compaction.*` edge events
  * (`started` / `blocked` / `cancelled` / `completed`) declared on `DomainEventMap`
  * (`compaction.started` is derived from the `full_compaction.begin` Op's
  * `toEvent`; the rest publish directly from the service).
  *
- * The Model is intentionally phase-only — `{ phase }` (initial `idle`). The
- * richer per-compaction data is NOT resume state: `instruction` is only needed
- * by the live worker (which does not survive a restart) and by telemetry, so it
- * rides the `begin` payload (and is persisted on the record for audit) but is
- * not stored in the Model; result numbers are consumed live by the
- * `compaction.completed` signal and their durable effect (the summary message
- * plus compaction metrics) already lives in `contextMemory`. The live
- * `complete` payload is empty to match the v1 wire shape; legacy logs may still
- * carry result numbers, and `apply` accepts and ignores them while collapsing
- * to `idle`. Each `apply` returns the same reference on a no-op so the wire's
- * reference-equality gate stays quiet; it carries no non-determinism.
+ * The Model is intentionally phase-only — `{ phase }` (initial `idle`). A
+ * `context.apply_compaction` cross-reducer advances a running compaction to
+ * `committed`, making the context replacement the durable commit point. The
+ * richer per-compaction data is not resume state: `instruction` is only needed
+ * by the live worker and telemetry, while the committed summary and accounting
+ * already live in `contextMemory`. A pre-commit failure uses the existing
+ * `full_compaction.complete` record type with `outcome: 'failed'`, preserving
+ * the v1 wire vocabulary while distinguishing it from a successful terminal;
+ * legacy complete records omit that field and remain successful. Older records
+ * may also carry result numbers, which `apply` ignores. Each reducer returns the
+ * same reference on a no-op so the wire's reference-equality gate stays quiet
+ * and carries no non-determinism.
  *
  * The runtime orchestration — `ActiveCompaction`, its `AbortController`, and
  * the in-flight worker promise — stays OUT of the Model (live-only service
- * members): none of it can be resumed, and a session never restores mid-flight.
- * A `running` phase stranded by a crash is reset to `idle` by the service's
- * `wire.hooks.onDidRestore` hook (mirroring `goal`'s post-replay normalization).
+ * members): none of it can be resumed. The service's `wire.hooks.onDidRestore`
+ * hook fails a stranded pre-commit run and converges a committed run before
+ * returning the Agent to `idle`.
  *
  * The `compaction.*` events publish to `IEventBus` (`compaction.started` via the
  * `begin` Op's `toEvent`; the rest directly from the service); they are
@@ -61,15 +62,22 @@ export interface CompactionCompletedEvent {
   readonly result: CompactionResult;
 }
 
-export type CompactionPhase = 'idle' | 'running' | 'cancelled' | 'completed';
+export type CompactionPhase = 'idle' | 'running' | 'committed';
 
 export interface CompactionState {
   readonly phase: CompactionPhase;
 }
 
-export const CompactionModel = defineModel<CompactionState>('fullCompaction', () => ({
-  phase: 'idle',
-}));
+export const CompactionModel = defineModel<CompactionState>(
+  'fullCompaction',
+  () => ({ phase: 'idle' }),
+  {
+    reducers: {
+      'context.apply_compaction': (state) =>
+        state.phase === 'running' ? { phase: 'committed' } : state,
+    },
+  },
+);
 
 declare module '#/app/event/eventBus' {
   interface DomainEventMap {
@@ -104,6 +112,10 @@ export const fullCompactionCancel = CompactionModel.defineOp('full_compaction.ca
 });
 
 export const fullCompactionComplete = CompactionModel.defineOp('full_compaction.complete', {
-  schema: z.object({}),
+  schema: z.object({ outcome: z.literal('failed').optional() }),
   apply: (s) => (s.phase === 'idle' ? s : { phase: 'idle' }),
 });
+
+export function fullCompactionFail(): ReturnType<typeof fullCompactionComplete> {
+  return fullCompactionComplete({ outcome: 'failed' });
+}

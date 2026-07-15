@@ -22,8 +22,8 @@
  *   - `context.apply_compaction`  → keep the full history, append the user-role
  *                                   summary marker, recover `foldedLength` from
  *                                   the recorded kept-count fields
- *   - `context.undo`              → remove tail messages (skip injections, stop
- *                                   at compaction summaries / clear floor)
+ *   - `context.undo`              → remove the target prompt and its full tail,
+ *                                   stopping at compaction summaries / clear floor
  *   - `context.clear`             → keep prior transcript entries but reset the
  *                                   folded view
  */
@@ -34,9 +34,9 @@ import type { WireRecord } from '#/wire/record';
 import {
   COMPACT_USER_MESSAGE_MAX_TOKENS,
   collectCompactableUserMessages,
-  isRealUserInput,
   selectRecentUserMessages,
 } from './compactionHandoff';
+import { computeUndoCut, isFullyUndoable } from './contextOps';
 import type { LoopRecordedEvent } from './loopEventFold';
 import type { ContextMessage } from './types';
 
@@ -172,18 +172,16 @@ export function createContextTranscriptReducer(): ContextTranscriptReducer {
 
   const applyUndo = (count: number): void => {
     if (count <= 0) return;
-    let removedUserCount = 0;
-    for (let i = transcript.length - 1; i >= clearFloor; i--) {
-      const message = transcript[i]!.message;
-      if (message.origin?.kind === 'injection') continue;
-      if (message.origin?.kind === 'compaction_summary') break;
-      transcript.splice(i, 1);
-      foldedLength = Math.max(0, foldedLength - 1);
-      if (isRealUserInput(message)) {
-        removedUserCount++;
-        if (removedUserCount >= count) break;
-      }
-    }
+    const visibleEntries = transcript.slice(clearFloor);
+    const cut = computeUndoCut(
+      visibleEntries.map((entry) => entry.message),
+      count,
+    );
+    if (!isFullyUndoable(cut, count)) return;
+    const cutIndex = clearFloor + cut.cutIndex;
+    const removedLength = transcript.length - cutIndex;
+    transcript.splice(cutIndex);
+    foldedLength = Math.max(0, foldedLength - removedLength);
     resetOpenState();
   };
 
@@ -258,9 +256,14 @@ function recoverFoldedLength(
 ): number {
   const keptUserMessageCount = readNumber(record, 'keptUserMessageCount');
   const keptHeadUserMessageCount = readNumber(record, 'keptHeadUserMessageCount');
+  const keptTurnOutcomeCount = readNumber(record, 'keptTurnOutcomeCount') ?? 0;
   const compactedCount = readNumber(record, 'compactedCount');
   if (keptUserMessageCount !== undefined) {
-    return keptUserMessageCount + (keptHeadUserMessageCount === undefined ? 1 : 2);
+    return (
+      keptUserMessageCount +
+      keptTurnOutcomeCount +
+      (keptHeadUserMessageCount === undefined ? 1 : 2)
+    );
   }
   if (compactedCount !== undefined && compactedCount < foldedLength) {
     return 1 + (foldedLength - compactedCount);

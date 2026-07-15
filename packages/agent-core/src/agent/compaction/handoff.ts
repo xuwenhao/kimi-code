@@ -100,18 +100,48 @@ export function isCompactionSummaryMessage(message: MessageLike): boolean {
   return message.origin?.kind === 'compaction_summary';
 }
 
+function isTurnOutcomeReminder(message: MessageLike): boolean {
+  return (
+    message.role === 'user' &&
+    message.origin?.kind === 'injection' &&
+    message.origin.variant === 'turn_outcome'
+  );
+}
+
 /**
- * Keep only genuine user input (real user prompts and user-slash skill
- * activations). See `compactionUserMessageDisposition` for the full keep/drop
- * policy and the rationale for each origin.
+ * Keep genuine user input plus the latest abnormal-turn reminder that has not
+ * yet been followed by an assistant message. See
+ * `compactionUserMessageDisposition` for the baseline keep/drop policy.
  */
 export function isRealUserInput(message: MessageLike): boolean {
   return message.role === 'user' && compactionUserMessageDisposition(message.origin) === 'keep';
 }
 
 export function collectCompactableUserMessages<T extends MessageLike>(messages: readonly T[]): T[] {
+  let latestAssistantIndex = -1;
+  let latestTurnOutcomeIndex = -1;
+  for (const [index, message] of messages.entries()) {
+    // Only a provider-produced assistant message proves that a model request
+    // crossed this point. A hook block also uses role=assistant, but no request
+    // was sent and therefore must not retire an unseen outcome reminder.
+    if (message.role === 'assistant' && message.origin === undefined) {
+      latestAssistantIndex = index;
+    }
+    if (isTurnOutcomeReminder(message)) {
+      latestTurnOutcomeIndex = index;
+    }
+  }
+  // An abnormal-turn reminder is pending model input until a later assistant
+  // message proves that the model has seen it. Preserve only that latest unseen
+  // reminder across compaction; older/stale outcomes and all other injections
+  // remain ephemeral. Keep this separate from isRealUserInput so undo still
+  // counts only genuine user prompts.
+  const unseenTurnOutcomeIndex =
+    latestTurnOutcomeIndex > latestAssistantIndex ? latestTurnOutcomeIndex : -1;
   return messages.filter(
-    (message) => isRealUserInput(message) && !isCompactionSummaryMessage(message),
+    (message, index) =>
+      (isRealUserInput(message) && !isCompactionSummaryMessage(message)) ||
+      index === unseenTurnOutcomeIndex,
   );
 }
 
@@ -259,6 +289,11 @@ export function selectCompactionUserMessages<T extends MessageLike>(
   maxTokens: number = COMPACT_USER_MESSAGE_MAX_TOKENS,
   headTokens: number = COMPACT_USER_MESSAGE_HEAD_TOKENS,
 ): CompactionUserSelection<T> {
+  // `collectCompactableUserMessages` contributes at most one unseen outcome.
+  // Treat it as a protected control message: a giant follow-up prompt must not
+  // consume the entire tail budget and silently elide the interruption/error
+  // context that gives that follow-up its meaning.
+  const protectedOutcome = messages.findLast(isTurnOutcomeReminder);
   let totalTokens = 0;
   for (const message of messages) {
     totalTokens += estimateTokensForMessage(message);
@@ -317,6 +352,25 @@ export function selectCompactionUserMessages<T extends MessageLike>(
     }
     head.push(truncateUserMessage(message, headRemaining));
     break;
+  }
+
+  if (
+    protectedOutcome !== undefined &&
+    !head.includes(protectedOutcome) &&
+    !tail.includes(protectedOutcome)
+  ) {
+    // A boundary truncation retains origin metadata, so first remove any
+    // partial clone of the outcome. Keep the full reminder outside the regular
+    // budget: it is bounded diagnostic control text, not arbitrary user data.
+    const truncatedInHead = head.some(isTurnOutcomeReminder);
+    for (let i = head.length - 1; i >= 0; i--) {
+      if (isTurnOutcomeReminder(head[i]!)) head.splice(i, 1);
+    }
+    for (let i = tail.length - 1; i >= 0; i--) {
+      if (isTurnOutcomeReminder(tail[i]!)) tail.splice(i, 1);
+    }
+    if (truncatedInHead) head.push(protectedOutcome);
+    else tail.unshift(protectedOutcome);
   }
 
   let keptTokens = 0;

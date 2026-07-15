@@ -44,6 +44,7 @@ export type FinishReason =
 
 export interface StreamedMessage {
   [Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart>;
+  cancel?(): void;
   readonly id: string | null;
   readonly usage: TokenUsage | null;
   readonly finishReason: FinishReason | null;

@@ -62,6 +62,12 @@ export interface RunTurnInput {
   readonly dispatchEvent: LoopEventDispatcher;
   readonly tools?: readonly ExecutableTool[] | undefined;
   /**
+   * Rebuilds provider/system-prompt state after `beforeStep`. Hosts that can
+   * refresh runtime config at that boundary should provide this instead of
+   * relying on the turn-start `llm` snapshot.
+   */
+  readonly buildLlm?: (() => LLM) | undefined;
+  /**
    * Per-step tool table builder. When present it wins over `tools` and is
    * re-invoked before every step, so a tool loaded mid-turn (select_tools
    * schema injection) is dispatchable on the very next step and runtime tool
@@ -96,6 +102,7 @@ export async function runTurn(input: RunTurnInput): Promise<TurnResult> {
     buildMessagesMediaStripped,
     dispatchEvent,
     tools,
+    buildLlm,
     buildTools,
     describeMissingTool,
     hooks,
@@ -154,6 +161,7 @@ export async function runTurn(input: RunTurnInput): Promise<TurnResult> {
         buildMessagesMediaStripped,
         dispatchEvent,
         llm,
+        buildLlm,
         tools,
         // Passed through unresolved: the step evaluates it AFTER beforeStep,
         // next to buildMessages, so the tool table and the request messages
@@ -184,7 +192,7 @@ export async function runTurn(input: RunTurnInput): Promise<TurnResult> {
         usage: stepResult.usage,
         stopReason: terminalStopReason,
         signal,
-        llm,
+        llm: stepResult.llm,
       });
       if (continuation?.continue !== true) {
         break;

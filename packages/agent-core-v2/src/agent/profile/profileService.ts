@@ -239,18 +239,20 @@ export class AgentProfileService implements IAgentProfileService {
     this.publishAgentsMdWarning();
   }
 
-  async refreshSystemPrompt(): Promise<void> {
+  async refreshSystemPrompt(): Promise<string | undefined> {
     const profile = this.resolveActiveProfile();
-    if (profile === undefined) return;
+    if (profile === undefined) return undefined;
 
     const context = await this.buildSystemPromptContext(this.cwd);
+    const systemPrompt = profile.systemPrompt(context);
     this.activeProfile = profile;
     this.update({
       profileName: profile.name,
-      systemPrompt: profile.systemPrompt(context),
+      systemPrompt,
     });
     this.cacheAgentsMdWarning(context);
     this.publishAgentsMdWarning();
+    return systemPrompt;
   }
 
   getAgentsMdWarning(): string | undefined {

@@ -7,6 +7,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { renderNotificationXml } from '../../src/agent/context/notification-xml';
 import { project } from '../../src/agent/context/projector';
 import type { ContextMessage } from '../../src/agent/context/types';
+import { InMemoryAgentRecordPersistence, type AgentRecord } from '../../src/agent/records';
+import { ErrorCodes } from '../../src/errors';
+import type { Logger } from '../../src/logging';
 import { buildImageCompressionCaption } from '../../src/tools/support/image-compress';
 import { estimateTokensForMessages } from '../../src/utils/tokens';
 import { createFakeKaos } from '../tools/fixtures/fake-kaos';
@@ -1613,5 +1616,221 @@ describe('strictMessages duplicate tool call ids', () => {
     const strictResults = strict.filter((message) => message.role === 'tool');
     expect(strictResults).toHaveLength(1);
     expect(textOf(strictResults[0]!)).toBe('result 1');
+  });
+});
+
+describe('context persistence observer re-entry', () => {
+  function reentrantContext() {
+    let armed = false;
+    let nestedMutation: () => void = () => {};
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record: AgentRecord) => {
+        if (!armed || record.type !== 'context.append_message') return;
+        armed = false;
+        nestedMutation();
+      },
+    });
+    const ctx = testAgent({ persistence });
+    ctx.configure();
+    return {
+      ctx,
+      persistence,
+      arm(mutation: () => void) {
+        nestedMutation = mutation;
+        armed = true;
+      },
+    };
+  }
+
+  it('rejects a nested clear while preserving the accepted outer append', async () => {
+    const { ctx, persistence, arm } = reentrantContext();
+    arm(() => {
+      ctx.agent.context.clear();
+    });
+
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'outer' }]);
+
+    expect(ctx.compactHistory()).toEqual([{ role: 'user', text: 'outer' }]);
+    expect(persistence.records.some((record) => record.type === 'context.clear')).toBe(false);
+    await ctx.expectResumeMatches();
+  });
+
+  it('rejects a nested undo while preserving both accepted appends', async () => {
+    const { ctx, persistence, arm } = reentrantContext();
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'earlier' }]);
+    arm(() => {
+      ctx.agent.context.undo(1);
+    });
+
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'outer' }]);
+
+    expect(ctx.compactHistory()).toEqual([
+      { role: 'user', text: 'earlier' },
+      { role: 'user', text: 'outer' },
+    ]);
+    expect(persistence.records.some((record) => record.type === 'context.undo')).toBe(false);
+    await ctx.expectResumeMatches();
+  });
+
+  it('rejects a nested compaction while preserving the accepted outer append', async () => {
+    const { ctx, persistence, arm } = reentrantContext();
+    arm(() =>
+      ctx.agent.context.applyCompaction({
+        summary: 'nested summary',
+        compactedCount: 0,
+        tokensBefore: 0,
+      }),
+    );
+
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'outer' }]);
+
+    expect(ctx.compactHistory()).toEqual([{ role: 'user', text: 'outer' }]);
+    expect(
+      persistence.records.some((record) => record.type === 'context.apply_compaction'),
+    ).toBe(false);
+    await ctx.expectResumeMatches();
+  });
+
+  it('rejects a nested append while preserving the accepted outer append order', async () => {
+    const { ctx, persistence, arm } = reentrantContext();
+    arm(() => {
+      ctx.agent.context.appendUserMessage([{ type: 'text', text: 'nested' }]);
+    });
+
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'outer' }]);
+
+    expect(ctx.compactHistory()).toEqual([{ role: 'user', text: 'outer' }]);
+    expect(
+      persistence.records.filter((record) => record.type === 'context.append_message'),
+    ).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+
+  it('rejects a swarm reminder pop inside an accepted append observer', async () => {
+    let armed = false;
+    let nestedError: unknown;
+    let ctx!: ReturnType<typeof testAgent>;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (!armed || record.type !== 'context.append_message') return;
+        armed = false;
+        try {
+          ctx.agent.swarmMode.exit();
+        } catch (error) {
+          nestedError = error;
+          throw error;
+        }
+      },
+    });
+    ctx = testAgent({ persistence });
+    ctx.configure();
+    await ctx.rpc.enterSwarm({ trigger: 'manual' });
+    armed = true;
+
+    ctx.agent.context.appendUserMessage([{ type: 'text', text: 'outer' }]);
+
+    expect(nestedError).toMatchObject({ code: ErrorCodes.SESSION_STATE_INVALID });
+    expect(ctx.agent.swarmMode.isActive).toBe(false);
+    expect(ctx.agent.context.history.map((message) => message.origin)).toEqual([
+      { kind: 'injection', variant: 'swarm_mode' },
+      { kind: 'user' },
+    ]);
+    const outerIndex = persistence.records.findIndex(
+      (record) =>
+        record.type === 'context.append_message' &&
+        record.message.origin?.kind === 'user',
+    );
+    const exitIndex = persistence.records.findIndex((record) => record.type === 'swarm_mode.exit');
+    expect(outerIndex).toBeGreaterThanOrEqual(0);
+    expect(exitIndex).toBeGreaterThan(outerIndex);
+    await ctx.expectResumeMatches();
+  });
+
+  it('keeps an accepted append successful when its diagnostic logger throws', async () => {
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type === 'context.append_message') {
+          throw new Error('observer failed after acceptance');
+        }
+      },
+    });
+    const warn = vi.fn(() => {
+      throw new Error('warning sink failed');
+    });
+    const recursiveError = vi.fn(() => {
+      throw new Error('must not recursively log');
+    });
+    let logger!: Logger;
+    logger = {
+      error: recursiveError,
+      warn,
+      info: vi.fn(),
+      debug: vi.fn(),
+      createChild: () => logger,
+    };
+    const ctx = testAgent({ persistence, log: logger });
+    ctx.configure();
+
+    expect(() => {
+      ctx.agent.context.appendUserMessage([{ type: 'text', text: 'accepted once' }]);
+    }).not.toThrow();
+
+    expect(ctx.compactHistory()).toEqual([{ role: 'user', text: 'accepted once' }]);
+    expect(
+      persistence.records.filter((record) => record.type === 'context.append_message'),
+    ).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(recursiveError).not.toHaveBeenCalled();
+    await ctx.expectResumeMatches();
+  });
+
+  it('closes an unresolved tool call when its diagnostic logger throws', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    let logger!: Logger;
+    logger = {
+      error: vi.fn(),
+      warn: vi.fn(() => {
+        throw new Error('warning sink failed');
+      }),
+      info: vi.fn(),
+      debug: vi.fn(),
+      createChild: () => logger,
+    };
+    const ctx = testAgent({ persistence, log: logger });
+    ctx.configure();
+    ctx.agent.context.appendLoopEvent({
+      type: 'step.begin',
+      uuid: 'dangling-step',
+      turnId: 'turn-1',
+      step: 1,
+    });
+    ctx.agent.context.appendLoopEvent({
+      type: 'tool.call',
+      uuid: 'dangling-call-event',
+      turnId: 'turn-1',
+      step: 1,
+      stepUuid: 'dangling-step',
+      toolCallId: 'dangling-call',
+      name: 'Run',
+      args: {},
+    });
+
+    expect(() => {
+      ctx.agent.context.appendLoopEvent({
+        type: 'step.begin',
+        uuid: 'next-step',
+        turnId: 'turn-1',
+        step: 2,
+      });
+    }).not.toThrow();
+
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_loop_event' && record.event.type === 'step.begin',
+      ),
+    ).toHaveLength(2);
+    expect(ctx.agent.context.history.filter((message) => message.role === 'tool')).toHaveLength(1);
+    await ctx.expectResumeMatches();
   });
 });

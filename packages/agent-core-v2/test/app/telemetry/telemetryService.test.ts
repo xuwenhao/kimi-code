@@ -174,6 +174,55 @@ describe('TelemetryService (error isolation)', () => {
     expect(good.events).toEqual([{ event: 'evt', properties: {} }]);
   });
 
+  it('a throwing withContext appender does not prevent creating a usable child', () => {
+    const bad: ITelemetryAppender = {
+      track() {},
+      withContext() {
+        throw new Error('context fork failed');
+      },
+    };
+    const good = new CapturingAppender();
+    const svc = telemetryWithAppenders(bad, good);
+
+    let child!: ReturnType<TelemetryService['withContext']>;
+    expect(() => {
+      child = svc.withContext({ turnId: 't1' });
+    }).not.toThrow();
+    child.track('turn.started');
+
+    expect(good.events).toEqual([
+      { event: 'turn.started', properties: { turnId: 't1' } },
+    ]);
+  });
+
+  it('a throwing setContext appender does not prevent later appenders or local context', () => {
+    const bad: ITelemetryAppender = {
+      track() {},
+      setContext() {
+        throw new Error('context update failed');
+      },
+    };
+    let observedPatch: TelemetryProperties | undefined;
+    const goodEvents: { event: string; properties?: TelemetryProperties }[] = [];
+    const good: ITelemetryAppender = {
+      track(event, properties) {
+        goodEvents.push({ event, properties });
+      },
+      setContext(patch) {
+        observedPatch = patch;
+      },
+    };
+    const svc = telemetryWithAppenders(bad, good);
+
+    expect(() => svc.setContext({ sessionId: 's1' })).not.toThrow();
+    svc.track('session.updated');
+
+    expect(observedPatch).toEqual({ sessionId: 's1' });
+    expect(goodEvents).toEqual([
+      { event: 'session.updated', properties: { sessionId: 's1' } },
+    ]);
+  });
+
   it('flush tolerates a rejecting appender and still flushes the rest', async () => {
     const bad: ITelemetryAppender = {
       track() {},

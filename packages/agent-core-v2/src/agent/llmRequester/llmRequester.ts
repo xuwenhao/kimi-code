@@ -59,6 +59,14 @@ export interface LLMRequestOverrides {
 export interface IAgentLLMRequesterService {
   readonly _serviceBrand: undefined;
 
+  /**
+   * Replace only the system-prompt field of a turn's request snapshot after
+   * full compaction re-renders the active profile. Model/provider/thinking
+   * choices remain frozen for the turn, and ordinary config updates still
+   * take effect only on a later turn.
+   */
+  refreshTurnSystemPrompt(turnId: number, systemPrompt: string): void;
+
   request(
     overrides?: LLMRequestOverrides,
     onPart?: LLMRequestPartHandler,

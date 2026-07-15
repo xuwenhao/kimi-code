@@ -241,6 +241,10 @@ class FakeContextMemory implements IAgentContextMemoryService {
     this.appended.push(...messages);
   }
 
+  appendTurnOutcome(message: ContextMessage): void {
+    this.appended.push(message);
+  }
+
   appendLoopEvent(_event: LoopRecordedEvent): void {
     throw new Error('unused in this suite');
   }

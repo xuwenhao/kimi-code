@@ -1,4 +1,4 @@
-import { createDecorator } from "#/_base/di/instantiation";
+import { createDecorator } from '#/_base/di/instantiation';
 
 import type { UndoCut } from './contextOps';
 import type { LoopRecordedEvent } from './loopEventFold';
@@ -12,6 +12,7 @@ export interface ContextCompactionInput {
   readonly tokensAfter?: number;
   readonly keptUserMessageCount?: number;
   readonly keptHeadUserMessageCount?: number;
+  readonly keptTurnOutcomeCount?: number;
   readonly droppedCount?: number;
 }
 
@@ -23,6 +24,7 @@ export interface ContextCompactionResult {
   tokensAfter: number;
   keptUserMessageCount: number;
   keptHeadUserMessageCount?: number;
+  keptTurnOutcomeCount?: number;
   droppedCount?: number;
 }
 
@@ -32,6 +34,8 @@ export interface IAgentContextMemoryService {
   get(): readonly ContextMessage[];
 
   append(...messages: readonly ContextMessage[]): void;
+
+  appendTurnOutcome(message: ContextMessage, outcomeId: string): void;
 
   appendLoopEvent(event: LoopRecordedEvent): void;
 

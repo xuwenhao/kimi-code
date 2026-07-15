@@ -1,3 +1,10 @@
+/**
+ * `llmProtocol` domain (L0) — streams and assembles one provider response.
+ *
+ * Owns abort-aware provider, iterator, and streamed-part callback boundaries
+ * with best-effort cleanup while preserving post-stream tool-call dispatch.
+ */
+
 import { APIEmptyResponseError } from './errors';
 import {
   isContentPart,
@@ -49,16 +56,20 @@ export async function generate(
     : tools;
 
   options?.onRequestStart?.();
-  const stream = await provider.generate(systemPrompt, wireTools, history, options);
+  const stream = await waitForAbort(
+    provider.generate(systemPrompt, wireTools, history, options),
+    options?.signal,
+    { onLateResolve: requestCancellation },
+  );
 
-  await throwIfAborted(options?.signal, stream);
+  throwIfAborted(options?.signal, stream);
 
   let serverDecodeMs = 0;
   let clientConsumeMs = 0;
   let firstPartAt: number | undefined;
   let lastResumeAt = 0;
 
-  for await (const part of stream) {
+  for await (const part of iterateWithAbort(stream, options?.signal)) {
     const arrivedAt = Date.now();
     if (firstPartAt === undefined) {
       firstPartAt = arrivedAt;
@@ -67,11 +78,11 @@ export async function generate(
     }
 
     try {
-      await throwIfAborted(options?.signal, stream);
+      throwIfAborted(options?.signal);
 
       if (callbacks?.onMessagePart !== undefined) {
-        await callbacks.onMessagePart(deepCopyPart(part));
-        await throwIfAborted(options?.signal, stream);
+        await waitForAbort(callbacks.onMessagePart(deepCopyPart(part)), options?.signal);
+        throwIfAborted(options?.signal);
       }
 
       if (
@@ -104,7 +115,7 @@ export async function generate(
     }
   }
 
-  await throwIfAborted(options?.signal, stream);
+  throwIfAborted(options?.signal, stream);
   if (firstPartAt !== undefined) {
     serverDecodeMs += Date.now() - lastResumeAt;
   }
@@ -146,9 +157,9 @@ export async function generate(
     );
   }
 
-  if (callbacks?.onToolCall !== undefined) {
+  if (callbacks?.onToolCall !== undefined && message.toolCalls.length > 0) {
+    throwIfAborted(options?.signal, stream);
     for (const toolCall of message.toolCalls) {
-      await throwIfAborted(options?.signal, stream);
       await callbacks.onToolCall(toolCall);
     }
   }
@@ -162,34 +173,144 @@ export async function generate(
   };
 }
 
-type CancelableStream = StreamedMessage & {
+type CancelableTarget = {
   cancel?: () => unknown;
   return?: () => unknown;
 };
 
 function throwAbortError(): never {
-  throw new DOMException('The operation was aborted.', 'AbortError');
+  throw createAbortError();
 }
 
-async function cancelStream(stream: StreamedMessage): Promise<void> {
-  const cancelable = stream as CancelableStream;
+function requestCancellation(target: unknown): void {
+  if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
+    return;
+  }
+  const cancelable = target as CancelableTarget;
+  invokeCancellation(cancelable, 'cancel');
+  invokeCancellation(cancelable, 'return');
+}
 
+function invokeCancellation(target: CancelableTarget, method: keyof CancelableTarget): void {
   try {
-    await cancelable.cancel?.();
-  } catch {}
-
-  try {
-    await cancelable.return?.();
+    const cleanup = target[method]?.();
+    void Promise.resolve(cleanup).catch(() => {});
   } catch {}
 }
 
-async function throwIfAborted(signal?: AbortSignal, stream?: StreamedMessage): Promise<void> {
+interface AbortWaitOptions<T> {
+  readonly onAbort?: () => void;
+  readonly onLateResolve?: (value: T) => void;
+}
+
+function waitForAbort<T>(
+  value: T | PromiseLike<T>,
+  signal?: AbortSignal,
+  options?: AbortWaitOptions<T>,
+): Promise<T> {
+  const promise = Promise.resolve(value);
+  if (signal === undefined) {
+    return promise;
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const removeAbortListener = (): void => {
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      removeAbortListener();
+      try {
+        options?.onAbort?.();
+      } catch {}
+      reject(createAbortError());
+    };
+
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    void promise.then(
+      (result) => {
+        if (settled) {
+          try {
+            options?.onLateResolve?.(result);
+          } catch {}
+          return;
+        }
+        settled = true;
+        removeAbortListener();
+        resolve(result);
+      },
+      (error: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        removeAbortListener();
+        reject(error);
+      },
+    );
+  });
+}
+
+async function* iterateWithAbort(
+  stream: StreamedMessage,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamedMessagePart> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let completed = false;
+  let cancellationRequested = false;
+  const cancel = (): void => {
+    if (cancellationRequested) {
+      return;
+    }
+    cancellationRequested = true;
+    invokeCancellation(stream as CancelableTarget, 'cancel');
+    invokeCancellation(iterator as CancelableTarget, 'return');
+  };
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        cancel();
+        throwAbortError();
+      }
+      const next = await waitForAbort(iterator.next(), signal, { onAbort: cancel });
+      if (signal?.aborted) {
+        cancel();
+        throwAbortError();
+      }
+      if (next.done === true) {
+        completed = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    if (!completed) {
+      cancel();
+    }
+  }
+}
+
+function createAbortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal, stream?: StreamedMessage): void {
   if (!signal?.aborted) {
     return;
   }
 
   if (stream !== undefined) {
-    await cancelStream(stream);
+    requestCancellation(stream);
   }
 
   throwAbortError();

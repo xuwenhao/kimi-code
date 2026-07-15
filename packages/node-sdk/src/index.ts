@@ -79,6 +79,7 @@ export {
   buildUnsupportedImageNotice,
   compressImageForModel,
   compressBase64ForModel,
+  extractImageCompressionCaptions,
   gateImageFormatParts,
   isModelAcceptedImageMime,
   normalizeImageMime,

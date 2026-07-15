@@ -15,8 +15,10 @@
  *   - resume parity via expectResumeMatches (the TUI replay data source)
  */
 
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 
+import type { AgentRecord } from '../../src/agent';
+import { InMemoryAgentRecordPersistence } from '../../src/agent/records';
 import { buildImageCompressionCaption } from '../../src/tools/support/image-compress';
 import { testAgent } from './harness/agent';
 
@@ -168,5 +170,185 @@ it('smoke: a prompt without images is completely untouched', async () => {
     .join('');
   expect(userText).toBe('plain hello');
 
+  await ctx.expectResumeMatches();
+});
+
+it.each(['none', 'clear', 'compaction'] as const)(
+  'recovers a multi-caption prompt exactly once after its first child record (%s)',
+  async (destructiveRecord) => {
+    const pendingProvider = new Promise<never>(() => undefined);
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => pendingProvider });
+    original.configure();
+
+    await original.rpc.prompt({
+      input: [
+        { type: 'text', text: CAPTION },
+        { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+        { type: 'text', text: SECOND_CAPTION },
+        { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+        { type: 'text', text: 'CRASH-PREFIX-IMAGE-PROMPT' },
+      ],
+    });
+
+    const firstChildIndex = persistence.records.findIndex(
+      (record) =>
+        record.type === 'context.append_message' &&
+        record.turnInputPart?.index === 0,
+    );
+    expect(firstChildIndex).toBeGreaterThanOrEqual(0);
+    const prefix = structuredClone(persistence.records.slice(0, firstChildIndex + 1));
+    const crashed = new InMemoryAgentRecordPersistence(prefix);
+    if (destructiveRecord === 'clear') {
+      crashed.append({ type: 'context.clear', time: Date.now() });
+    } else if (destructiveRecord === 'compaction') {
+      crashed.append({
+        type: 'context.apply_compaction',
+        summary: 'CRASH-PREFIX-SUMMARY',
+        contextSummary: 'CRASH-PREFIX-SUMMARY',
+        compactedCount: 1,
+        tokensBefore: 10,
+        tokensAfter: 5,
+        keptUserMessageCount: 0,
+        droppedCount: 1,
+        time: Date.now(),
+      });
+    }
+
+    const resumed = testAgent({ persistence: crashed });
+    resumed.configure();
+    resumed.mockNextResponse({ type: 'text', text: 'Recovered image prompt.' });
+    await resumed.agent.resume();
+    await resumed.agent.turn.waitForCurrentTurn();
+
+    const texts = resumed.agent.context.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(texts.match(/\/tmp\/originals\/shot\.png/g)).toHaveLength(1);
+    expect(texts.match(/\/tmp\/originals\/photo\.jpg/g)).toHaveLength(1);
+    expect(texts.match(/CRASH-PREFIX-IMAGE-PROMPT/g)).toHaveLength(1);
+  },
+);
+
+it('rolls back an orphan caption when cancellation is accepted from its record observer', async () => {
+  let original!: ReturnType<typeof testAgent>;
+  let cancellation: Promise<void> | undefined;
+  const persistence = new InMemoryAgentRecordPersistence([], {
+    onRecord: (record) => {
+      if (
+        cancellation === undefined &&
+        record.type === 'context.append_message' &&
+        record.turnInputPart?.index === 0
+      ) {
+        cancellation = original.agent.turn.cancel(0);
+      }
+    },
+  });
+  original = testAgent({ persistence });
+  original.configure();
+
+  await original.rpc.prompt({
+    input: [
+      { type: 'text', text: CAPTION },
+      { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+      { type: 'text', text: SECOND_CAPTION },
+      { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+      { type: 'text', text: 'CANCELLED-IMAGE-PROMPT' },
+    ],
+  });
+  await original.untilTurnEnd();
+  await cancellation;
+
+  const cancel = persistence.records.find(
+    (record) => record.type === 'turn.cancel' && record.cancelledTurnInputs !== undefined,
+  );
+  expect(cancel).toBeDefined();
+  const cancelIndex = persistence.records.indexOf(cancel!);
+  const generate = vi.fn();
+  const resumed = testAgent({
+    persistence: new InMemoryAgentRecordPersistence(
+      structuredClone(persistence.records.slice(0, cancelIndex + 1)),
+    ),
+    generate,
+  });
+  await resumed.agent.resume();
+
+  const texts = resumed.agent.context.history
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n');
+  expect(texts).not.toContain('/tmp/originals/shot.png');
+  expect(texts).not.toContain('/tmp/originals/photo.jpg');
+  expect(texts).not.toContain('CANCELLED-IMAGE-PROMPT');
+  expect(texts.match(/The user interrupted the previous turn/g)).toHaveLength(1);
+  expect(generate).not.toHaveBeenCalled();
+});
+
+it('keeps the whole expansion when cancellation observes its accepted final record', async () => {
+  let ctx!: ReturnType<typeof testAgent>;
+  let cancellation: Promise<void> | undefined;
+  const persistence = new InMemoryAgentRecordPersistence([], {
+    onRecord: (record) => {
+      if (
+        cancellation === undefined &&
+        record.type === 'context.append_message' &&
+        record.turnInputPart?.index === 2
+      ) {
+        cancellation = ctx.agent.turn.cancel(0);
+      }
+    },
+  });
+  ctx = testAgent({ persistence });
+  ctx.configure();
+
+  await ctx.rpc.prompt({
+    input: [
+      { type: 'text', text: CAPTION },
+      { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+      { type: 'text', text: SECOND_CAPTION },
+      { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+      { type: 'text', text: 'FINAL-RECORD-IMAGE-PROMPT' },
+    ],
+  });
+  await ctx.untilTurnEnd();
+  await cancellation;
+
+  const cancelRecord = persistence.records.find((record) => record.type === 'turn.cancel');
+  expect(cancelRecord?.type === 'turn.cancel' ? cancelRecord.cancelledTurnInputs : undefined).toBeUndefined();
+  const texts = ctx.agent.context.history
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n');
+  expect(texts.match(/\/tmp\/originals\/shot\.png/g)).toHaveLength(1);
+  expect(texts.match(/\/tmp\/originals\/photo\.jpg/g)).toHaveLength(1);
+  expect(texts.match(/FINAL-RECORD-IMAGE-PROMPT/g)).toHaveLength(1);
+  await ctx.expectResumeMatches();
+});
+
+it('undo removes the hidden caption children of every removed image prompt', async () => {
+  const ctx = testAgent();
+  ctx.configure();
+  for (const [prompt, response] of [
+    ['FIRST-IMAGE-PROMPT', 'first response'],
+    ['SECOND-IMAGE-PROMPT', 'second response'],
+  ] as const) {
+    ctx.mockNextResponse({ type: 'text', text: response });
+    await ctx.rpc.prompt({
+      input: [
+        { type: 'text', text: CAPTION },
+        { type: 'image_url', imageUrl: { url: IMAGE_URL } },
+        { type: 'text', text: prompt },
+      ],
+    });
+    await ctx.untilTurnEnd();
+  }
+
+  ctx.agent.context.undo(2);
+
+  expect(ctx.agent.context.history).toEqual([]);
   await ctx.expectResumeMatches();
 });

@@ -55,7 +55,14 @@ export class TelemetryService implements ITelemetryService {
 
   withContext(patch: TelemetryContextPatch): ITelemetryService {
     const child = new TelemetryService();
-    child.appenders = this.appenders.map((appender) => appender.withContext?.(patch) ?? appender);
+    child.appenders = this.appenders.map((appender) => {
+      try {
+        return appender.withContext?.(patch) ?? appender;
+      } catch (error) {
+        onUnexpectedError(error);
+        return appender;
+      }
+    });
     child.context = { ...this.context, ...patch };
     child.enabled = this.enabled;
     return child;
@@ -64,7 +71,11 @@ export class TelemetryService implements ITelemetryService {
   setContext(patch: TelemetryContextPatch): void {
     this.context = { ...this.context, ...patch };
     for (const appender of this.appenders) {
-      appender.setContext?.(patch);
+      try {
+        appender.setContext?.(patch);
+      } catch (error) {
+        onUnexpectedError(error);
+      }
     }
   }
 

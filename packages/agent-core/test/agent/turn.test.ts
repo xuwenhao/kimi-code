@@ -19,26 +19,35 @@ import {
   APIStatusError,
   APITimeoutError,
   ChatProviderError,
+  generate as generateWithProvider,
   type ChatProvider,
   type Message,
   type ModelCapability,
+  type StreamedMessage,
+  type StreamedMessagePart,
   type ToolCall,
 } from '@moonshot-ai/kosong';
 import { describe, expect, it, vi } from 'vitest';
 
 import { HookEngine } from '../../src/session/hooks';
 import { abortError } from '../../src/utils/abort';
-import type { AgentOptions, AgentRecord, AgentRecordPersistence } from '../../src/agent';
+import { Agent, type AgentOptions, type AgentRecord, type AgentRecordPersistence } from '../../src/agent';
 import { ProcessBackgroundTask } from '../../src/agent/background';
-import { InMemoryAgentRecordPersistence } from '../../src/agent/records';
+import {
+  InMemoryAgentRecordPersistence,
+  markAgentRecordAppendError,
+} from '../../src/agent/records';
 import { ErrorCodes, KimiError } from '../../src/errors';
+import type { SDKAgentRPC } from '../../src/rpc';
 import type { Logger, LogPayload } from '../../src/logging';
 import type {
   QueuedSubagentRunResult,
   QueuedSubagentTask,
   SessionSubagentHost,
 } from '../../src/session/subagent-host';
+import { buildImageCompressionCaption } from '../../src/tools/support/image-compress';
 import { recordingTelemetry, type TelemetryRecord } from '../fixtures/telemetry';
+import { testKaos } from '../fixtures/test-kaos';
 import { createFakeKaos } from '../tools/fixtures/fake-kaos';
 import {
   createCommandKaos,
@@ -73,7 +82,84 @@ function captureLogs(): { logger: Logger; entries: CapturedLogEntry[] } {
   return { logger, entries };
 }
 
+function throwingWarnLogger(): Logger {
+  const logger: Logger = {
+    error: () => undefined,
+    warn: () => {
+      throw new Error('diagnostic sink failed');
+    },
+    info: () => undefined,
+    debug: () => undefined,
+    createChild: () => logger,
+  };
+  return logger;
+}
+
+function throwingErrorLogger(): Logger {
+  const logger: Logger = {
+    error: () => {
+      throw new Error('diagnostic sink failed');
+    },
+    warn: () => undefined,
+    info: () => undefined,
+    debug: () => undefined,
+    createChild: () => logger,
+  };
+  return logger;
+}
+
 describe('Agent turn flow', () => {
+  it('isolates synchronous and asynchronous event transport failures', async () => {
+    const { logger, entries } = captureLogs();
+    let deliveryCount = 0;
+    const agent = new Agent({
+      type: 'sub',
+      kaos: testKaos,
+      log: logger,
+      rpc: {
+        emitEvent: () => {
+          deliveryCount += 1;
+          if (deliveryCount === 1) throw new Error('synchronous observer failure');
+          return Promise.reject(new Error('asynchronous observer failure'));
+        },
+      } as unknown as SDKAgentRPC,
+    });
+
+    try {
+      expect(() => {
+        agent.emitEvent({ type: 'warning', message: 'first event' });
+      }).not.toThrow();
+      expect(() => {
+        agent.emitEvent({ type: 'warning', message: 'second event' });
+      }).not.toThrow();
+      await vi.waitFor(() => {
+        expect(entries.filter((entry) => entry.message === 'agent event delivery failed')).toHaveLength(2);
+      });
+
+      const brokenLogger = {
+        ...logger,
+        warn: () => {
+          throw new Error('diagnostic sink failed');
+        },
+      } satisfies Logger;
+      const agentWithBrokenLogger = new Agent({
+        type: 'sub',
+        kaos: testKaos,
+        log: brokenLogger,
+        rpc: {
+          emitEvent: () => {
+            throw new Error('observer failed with broken logger');
+          },
+        } as unknown as SDKAgentRPC,
+      });
+      expect(() => {
+        agentWithBrokenLogger.emitEvent({ type: 'warning', message: 'isolated event' });
+      }).not.toThrow();
+    } finally {
+      await agent.cron?.stop();
+    }
+  });
+
   it('degrades older history media and retries when the provider rejects the request body as too large', async () => {
     let attempts = 0;
     const histories: Message[][] = [];
@@ -569,7 +655,7 @@ describe('Agent turn flow', () => {
     // A programmatic abort (e.g. a subagent deadline timeout) carries a plain
     // AbortError as its reason, not a UserCancellationError, so telemetry must
     // not report it as a user cancellation.
-    ctx.agent.turn.cancel(0, abortError());
+    void ctx.agent.turn.cancel(0, abortError());
     await ctx.untilTurnEnd();
 
     const interrupted = records.find((candidate) => candidate.event === 'turn_interrupted');
@@ -831,15 +917,16 @@ describe('Agent turn flow', () => {
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Trigger generate failure' }] });
 
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
-      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Trigger generate failure" } ], "origin": { "kind": "user" }, "time": "<time>" }
+      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Trigger generate failure" } ], "origin": { "kind": "user" }, "admissionId": "<uuid-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started                { "turnId": 0, "origin": { "kind": "user" } }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Trigger generate failure" } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
-      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Trigger generate failure" } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "prompt", "id": "<uuid-1>", "turnId": 0 }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-2>", "turnId": "0", "step": 1 }, "time": "<time>" }
+      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-2>" }
       [wire] llm.tools_snapshot          { "hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "tools": [], "time": "<time>" }
       [wire] llm.request                 { "kind": "loop", "provider": "kimi", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "messageCount": 1, "turnStep": "0.1", "time": "<time>" }
       [emit] turn.step.interrupted       { "turnId": 0, "step": 1, "reason": "error", "message": "Unexpected generate call #1" }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe previous turn ended before producing a final response.\\n\\nError: Unexpected generate call #1\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "time": "<time>" }
+      [wire] turn.outcome                { "outcomeId": "<uuid-3>", "turnId": 0, "content": "The previous turn ended before producing a final response.\\n\\nError: Unexpected generate call #1\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.", "time": "<time>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe previous turn ended before producing a final response.\\n\\nError: Unexpected generate call #1\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "materializedTurnOutcomeId": "<uuid-3>", "time": "<time>" }
       [emit] turn.ended                  { "turnId": 0, "reason": "failed", "error": { "code": "internal", "message": "Unexpected generate call #1", "name": "Error", "retryable": false, "details": { "turnId": 0 } } }
     `);
     expect(ctx.newEvents()).toMatchInlineSnapshot(
@@ -909,6 +996,52 @@ describe('Agent turn flow', () => {
     await ctx.expectResumeMatches();
   });
 
+  it('places an admitted steer before the failure reminder and later follow-up', async () => {
+    const providerStarted = createControlledPromise<void>();
+    const failProvider = createControlledPromise<never>();
+    const histories: Message[][] = [];
+    let calls = 0;
+    const generate: GenerateFn = async (_provider, _system, _tools, history) => {
+      histories.push(structuredClone(history));
+      calls += 1;
+      if (calls === 1) {
+        providerStarted.resolve();
+        return failProvider;
+      }
+      return textResult('Follow-up completed.');
+    };
+    const ctx = testAgent({ generate, ...singleAttemptAgentOptions() });
+    ctx.configure();
+
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'FAILURE-OWNER-A' }],
+      promptId: 'prompt-failure-owner-a',
+    });
+    await providerStarted;
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'FAILURE-STEER-B' }],
+      expectedPromptId: 'prompt-failure-owner-a',
+      requireActive: true,
+    });
+    failProvider.reject(new APIStatusError(500, 'provider failed', 'req-failure-owner'));
+    await ctx.untilTurnEnd();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FAILURE-FOLLOWUP-C' }] });
+    await ctx.untilTurnEnd();
+
+    const followupText = histories[1]!
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    const steerIndex = followupText.indexOf('FAILURE-STEER-B');
+    const reminderIndex = followupText.indexOf('The previous turn ended');
+    const followupIndex = followupText.indexOf('FAILURE-FOLLOWUP-C');
+    expect(steerIndex).toBeGreaterThanOrEqual(0);
+    expect(steerIndex).toBeLessThan(reminderIndex);
+    expect(reminderIndex).toBeLessThan(followupIndex);
+  });
+
   it('records a model-visible reminder when the user cancels an active turn', async () => {
     const ctx = testAgent({ generate: abortableGenerate });
     ctx.configure();
@@ -938,86 +1071,288 @@ describe('Agent turn flow', () => {
     await ctx.expectResumeMatches();
   });
 
-  it('keeps cancel pending while the aborted provider request is still settling', async () => {
+  it('returns from cancel with a reminder when provider.generate ignores abort', async () => {
     const providerStarted = createControlledPromise<void>();
-    const abortObserved = createControlledPromise<void>();
-    const finishCancellation = createControlledPromise<void>();
-    const generate: GenerateFn = async (
-      _chat,
-      _systemPrompt,
-      _tools,
-      _history,
-      _callbacks,
+    const provider: ChatProvider = {
+      name: 'uncooperative',
+      modelName: 'mock-model',
+      thinkingEffort: null,
+      generate: () => {
+        providerStarted.resolve();
+        return new Promise<StreamedMessage>(() => {});
+      },
+      withThinking() {
+        return this;
+      },
+    };
+    const generate: GenerateFn = (
+      _configuredProvider,
+      systemPrompt,
+      tools,
+      history,
+      callbacks,
       options,
     ) => {
-      providerStarted.resolve();
-      options?.signal?.addEventListener(
-        'abort',
-        () => {
-          abortObserved.resolve();
-        },
-        { once: true },
+      return generateWithProvider(
+        provider,
+        systemPrompt,
+        tools,
+        history,
+        callbacks,
+        options,
       );
-      await abortObserved;
-      await finishCancellation;
-      throw abortError();
     };
     const ctx = testAgent({ generate });
     ctx.configure();
 
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Wait for cancellation.' }] });
     await providerStarted;
-    const cancel = ctx.rpc.cancel({ turnId: 0 });
-    await abortObserved;
+    await ctx.rpc.cancel({ turnId: 0 });
 
-    expect(
-      await Promise.race([
-        cancel.then(() => 'resolved' as const),
-        Promise.resolve('pending' as const),
-      ]),
-    ).toBe('pending');
-
-    finishCancellation.resolve();
-    await cancel;
+    expect(ctx.agent.context.history.at(-1)).toMatchObject({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: expect.stringContaining('The user interrupted the previous turn'),
+        },
+      ],
+      origin: { kind: 'injection', variant: 'turn_outcome' },
+    });
   });
 
-  it('places the cancellation reminder before a follow-up submitted after cancel resolves', async () => {
-    const histories: Message[][] = [];
-    const firstRequestStarted = createControlledPromise<void>();
-    let calls = 0;
+  it('cancels the same active worker after a goal advances to a continuation turn', async () => {
+    const continuationStarted = createControlledPromise<void>();
+    let callCount = 0;
+    let continuationSignalAborted = false;
     const generate: GenerateFn = async (
-      _chat,
+      _provider,
       _systemPrompt,
       _tools,
-      history,
+      _history,
       _callbacks,
       options,
     ) => {
-      histories.push(structuredClone(history));
-      calls += 1;
-      if (calls === 1) {
-        firstRequestStarted.resolve();
-        await new Promise<void>((_resolve, reject) => {
-          options?.signal?.addEventListener(
-            'abort',
-            () => {
-              reject(options.signal?.reason ?? abortError());
-            },
-            { once: true },
-          );
-        });
+      callCount += 1;
+      if (callCount === 1) return textResult('Finished the first slice.');
+
+      continuationStarted.resolve();
+      return new Promise((_resolve, reject) => {
+        const onAbort = (): void => {
+          continuationSignalAborted = true;
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure();
+    await ctx.agent.goal.createGoal({ objective: 'Complete several slices' });
+
+    const promptDispatch = ctx.rpc.prompt({ input: [{ type: 'text', text: 'Start the goal.' }] });
+    const workerSettlement = ctx.agent.turn.waitForCurrentTurn();
+    const controller = new AbortController();
+    const signalledWait = ctx.agent.turn.waitForCurrentTurn(controller.signal).then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await promptDispatch;
+    await continuationStarted;
+    expect(ctx.agent.turn.currentId).toBe(1);
+
+    controller.abort(abortError('Caller stopped waiting'));
+    const abortedCurrentContinuation = continuationSignalAborted;
+    if (!abortedCurrentContinuation) {
+      void ctx.agent.turn.cancel(undefined, abortError('Test cleanup'));
+    }
+
+    const waitResult = await signalledWait;
+    expect(waitResult.status).toBe('rejected');
+    if (waitResult.status === 'rejected') {
+      expect(waitResult.error).toMatchObject({ name: 'AbortError' });
+    }
+    await expect(workerSettlement).resolves.toMatchObject({
+      event: { type: 'turn.ended', turnId: 1, reason: 'cancelled' },
+    });
+    expect(abortedCurrentContinuation).toBe(true);
+  });
+
+  it('accepts an earlier turn id owned by the active goal worker', async () => {
+    const continuationStarted = createControlledPromise<void>();
+    const goalPauseStarted = createControlledPromise<void>();
+    const releaseGoalPause = createControlledPromise<void>();
+    let callCount = 0;
+    let continuationAborted = false;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      callCount += 1;
+      if (callCount === 1) return textResult('Finished the first slice.');
+
+      continuationStarted.resolve();
+      return new Promise((_resolve, reject) => {
+        const onAbort = (): void => {
+          continuationAborted = true;
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure();
+    await ctx.agent.goal.createGoal({ objective: 'Complete several slices' });
+    vi.spyOn(ctx.agent.goal, 'pauseOnInterrupt').mockImplementation(async () => {
+      goalPauseStarted.resolve();
+      await releaseGoalPause;
+      return null;
+    });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Start the goal.' }] });
+    const workerSettlement = ctx.agent.turn.waitForCurrentTurn();
+    await continuationStarted;
+    expect(ctx.agent.turn.currentId).toBe(1);
+
+    let cancelResolved = false;
+    const cancelSettlement = ctx.rpc.cancel({ turnId: 0 }).then(() => {
+      cancelResolved = true;
+    });
+    await goalPauseStarted;
+    await Promise.resolve();
+
+    expect(cancelResolved).toBe(false);
+    releaseGoalPause.resolve();
+    await cancelSettlement;
+
+    await expect(workerSettlement).resolves.toMatchObject({
+      event: { type: 'turn.ended', turnId: 1, reason: 'cancelled' },
+    });
+    expect(continuationAborted).toBe(true);
+  });
+
+  it('does not let an earlier worker turn id cancel a replacement worker', async () => {
+    const firstStarted = createControlledPromise<void>();
+    const releaseFirst = createControlledPromise<void>();
+    const replacementStarted = createControlledPromise<void>();
+    let callCount = 0;
+    let replacementAborted = false;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      callCount += 1;
+      if (callCount === 1) {
+        firstStarted.resolve();
+        await releaseFirst;
+        return textResult('First worker finished.');
       }
-      return textResult('Continued.');
+
+      replacementStarted.resolve();
+      return new Promise((_resolve, reject) => {
+        const onAbort = (): void => {
+          replacementAborted = true;
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Run the first worker.' }] });
+    const firstSettlement = ctx.agent.turn.waitForCurrentTurn();
+    await firstStarted;
+    releaseFirst.resolve();
+    await firstSettlement;
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Run its replacement.' }] });
+    const replacementSettlement = ctx.agent.turn.waitForCurrentTurn();
+    await replacementStarted;
+    expect(ctx.agent.turn.currentId).toBe(1);
+
+    await ctx.rpc.cancel({ turnId: 0 });
+
+    expect(replacementAborted).toBe(false);
+    void ctx.agent.turn.cancel(1, abortError('Test cleanup'));
+    await expect(replacementSettlement).resolves.toMatchObject({
+      event: { type: 'turn.ended', turnId: 1, reason: 'cancelled' },
+    });
+  });
+
+  it('excludes a late iterator result from the follow-up context after cancel resolves', async () => {
+    const histories: Message[][] = [];
+    const firstNextStarted = createControlledPromise<void>();
+    const firstNext = createControlledPromise<IteratorResult<StreamedMessagePart>>();
+    const secondNextStarted = createControlledPromise<void>();
+    const secondNext = createControlledPromise<IteratorResult<StreamedMessagePart>>();
+    const firstIterator: AsyncIterator<StreamedMessagePart> = {
+      next: () => {
+        firstNextStarted.resolve();
+        return firstNext;
+      },
+      // Cleanup is intentionally uncooperative too: cancel must not await it.
+      return: vi.fn(() => new Promise<IteratorResult<StreamedMessagePart>>(() => {})),
+    };
+    let secondIteration = 0;
+    const secondIterator: AsyncIterator<StreamedMessagePart> = {
+      next: () => {
+        secondIteration += 1;
+        if (secondIteration === 1) {
+          secondNextStarted.resolve();
+          return secondNext;
+        }
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+    let calls = 0;
+    const provider: ChatProvider = {
+      name: 'late-stream',
+      modelName: 'mock-model',
+      thinkingEffort: null,
+      generate: async (_systemPrompt, _tools, history) => {
+        histories.push(structuredClone(history));
+        calls += 1;
+        return streamFromIterator(calls === 1 ? firstIterator : secondIterator);
+      },
+      withThinking() {
+        return this;
+      },
+    };
+    const generate: GenerateFn = (
+      _configuredProvider,
+      systemPrompt,
+      tools,
+      history,
+      callbacks,
+      options,
+    ) => {
+      return generateWithProvider(provider, systemPrompt, tools, history, callbacks, options);
     };
     const ctx = testAgent({ generate });
     ctx.configure();
 
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Start work, then wait.' }] });
-    await firstRequestStarted;
+    await firstNextStarted;
     await ctx.rpc.cancel({});
-    await ctx.untilTurnEnd();
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
-    await ctx.untilTurnEnd();
+    await secondNextStarted;
+    const followUpEnded = ctx.once('turn.ended');
+
+    firstNext.resolve({ done: false, value: { type: 'text', text: 'late output' } });
+    await firstNext;
+    secondNext.resolve({ done: false, value: { type: 'text', text: 'Continued.' } });
+    await followUpEnded;
 
     expect(histories[1]).toEqual([
       {
@@ -1050,14 +1385,14 @@ describe('Agent turn flow', () => {
     await ctx.expectResumeMatches();
   });
 
-  it('still ends a cancelled turn when its diagnostic cannot be rendered', async () => {
-    const ctx = testAgent({ generate: abortableGenerate });
+  it('still ends a cancelled turn after a diagnostic double fault', async () => {
+    const ctx = testAgent({ generate: abortableGenerate, log: throwingWarnLogger() });
     ctx.configure();
     const stepStarted = ctx.once('turn.step.started');
 
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Wait for cancellation.' }] });
     await stepStarted;
-    ctx.agent.turn.cancel(0, cancellationReasonWithHostileMessage());
+    const cancellation = ctx.agent.turn.cancel(0, cancellationReasonWithHostileMessage());
 
     expect(await ctx.untilTurnEnd()).toContainEqual(
       expect.objectContaining({
@@ -1066,6 +1401,7 @@ describe('Agent turn flow', () => {
         args: expect.objectContaining({ turnId: 0, reason: 'cancelled' }),
       }),
     );
+    await cancellation;
     await ctx.expectResumeMatches();
   });
 
@@ -1303,10 +1639,11 @@ describe('Agent turn flow', () => {
 
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
       [wire] metadata                 { "protocol_version": "<protocol-version>", "created_at": "<time>" }
-      [wire] turn.prompt              { "input": [ { "type": "text", "text": "Hello without login" } ], "origin": { "kind": "user" }, "time": "<time>" }
+      [wire] turn.prompt              { "input": [ { "type": "text", "text": "Hello without login" } ], "origin": { "kind": "user" }, "admissionId": "<uuid-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started             { "turnId": 0, "origin": { "kind": "user" } }
-      [wire] context.append_message   { "message": { "role": "user", "content": [ { "type": "text", "text": "Hello without login" } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_message   { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe previous turn ended before producing a final response.\\n\\nError: No model is configured.\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "time": "<time>" }
+      [wire] context.append_message   { "message": { "role": "user", "content": [ { "type": "text", "text": "Hello without login" } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "prompt", "id": "<uuid-1>", "turnId": 0 }, "time": "<time>" }
+      [wire] turn.outcome             { "outcomeId": "<uuid-2>", "turnId": 0, "content": "The previous turn ended before producing a final response.\\n\\nError: No model is configured.\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.", "time": "<time>" }
+      [wire] context.append_message   { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe previous turn ended before producing a final response.\\n\\nError: No model is configured.\\n\\nThe preceding user request may still be unfinished. Treat the next user message as a follow-up.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "materializedTurnOutcomeId": "<uuid-2>", "time": "<time>" }
       [emit] turn.ended               { "turnId": 0, "reason": "failed", "error": { "code": "model.not_configured", "message": "LLM not set, send \\"/login\\" to login", "name": "KimiError", "details": { "turnId": 0 }, "retryable": false } }
     `);
     expect(ctx.newEvents()).toMatchInlineSnapshot(
@@ -1506,6 +1843,51 @@ describe('Agent turn flow', () => {
     `);
   });
 
+  it('orders an admitted steer before a follow-up when UserPromptSubmit later blocks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-user-prompt-steer-'));
+    const marker = join(dir, 'started');
+    const script = [
+      "const fs=require('node:fs');",
+      `if (fs.existsSync(${JSON.stringify(marker)})) process.exit(0);`,
+      `fs.writeFileSync(${JSON.stringify(marker)}, 'started');`,
+      "setTimeout(() => { process.stderr.write('blocked by hook'); process.exit(2); }, 150);",
+    ].join('');
+    const hookEngine = new HookEngine([
+      {
+        event: 'UserPromptSubmit',
+        command: `node -e ${JSON.stringify(script)}`,
+        timeout: 5,
+      },
+    ]);
+    const ctx = testAgent({ hookEngine });
+    ctx.configure();
+
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'HOOK-OWNER-A' }],
+      promptId: 'prompt-hook-owner-a',
+    });
+    await waitForFile(marker);
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'HOOK-STEER-B' }],
+      expectedPromptId: 'prompt-hook-owner-a',
+      requireActive: true,
+    });
+    await ctx.untilTurnEnd();
+
+    ctx.mockNextResponse({ type: 'text', text: 'Follow-up handled.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'HOOK-FOLLOWUP-C' }] });
+    await ctx.untilTurnEnd();
+
+    const followupText = ctx.llmCalls[0]!.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(followupText.indexOf('HOOK-STEER-B')).toBeLessThan(
+      followupText.indexOf('HOOK-FOLLOWUP-C'),
+    );
+  });
+
   it('cancels while waiting for a UserPromptSubmit hook without appending stale output', async () => {
     const hookEngine = new HookEngine([
       {
@@ -1560,6 +1942,40 @@ describe('Agent turn flow', () => {
     ]);
   });
 
+  it('keeps cancellation authoritative when a pending prompt hook rejects with a plain error', async () => {
+    const hookStarted = createControlledPromise<void>();
+    const hookResult = createControlledPromise<
+      Awaited<ReturnType<HookEngine['trigger']>>
+    >();
+    const hookEngine = new HookEngine();
+    vi.spyOn(hookEngine, 'trigger').mockImplementationOnce(() => {
+      hookStarted.resolve();
+      return hookResult;
+    });
+    const ctx = testAgent({ hookEngine });
+    ctx.configure();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'hook rejects after cancel' }] });
+    await hookStarted;
+    const ended = ctx.untilTurnEnd();
+    const cancellation = ctx.rpc.cancel({ turnId: 0 });
+    hookResult.reject(new Error('hook cleanup failed after abort'));
+
+    await cancellation;
+    expect(await ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'cancelled' }),
+      }),
+    );
+    expect(ctx.allEvents).not.toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'failed' }),
+      }),
+    );
+  });
+
   it('uses a Stop hook block reason as a one-shot turn continuation', async () => {
     const hookEngine = new HookEngine([
       {
@@ -1601,6 +2017,46 @@ describe('Agent turn flow', () => {
     expect(ctx.agent.context.data().history).toContainEqual(stopHookMessage);
     expect(ctx.llmCalls[1]?.history).toContainEqual(llmStopHookMessage);
     expect(JSON.stringify(ctx.agent.context.data().history)).toContain('Second answer.');
+  });
+
+  it('drains a targeted steer admitted while the Stop hook is pending', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-stop-steer-'));
+    const marker = join(dir, 'started');
+    const script = [
+      "const fs=require('node:fs');",
+      `fs.writeFileSync(${JSON.stringify(marker)}, 'started');`,
+      'setTimeout(() => process.exit(0), 150);',
+    ].join('');
+    const hookEngine = new HookEngine([
+      {
+        event: 'Stop',
+        command: `node -e ${JSON.stringify(script)}`,
+        timeout: 5,
+      },
+    ]);
+    const ctx = testAgent({ hookEngine });
+    ctx.configure();
+    ctx.mockNextResponse({ type: 'text', text: 'Answer before pending Stop hook.' });
+    ctx.mockNextResponse({ type: 'text', text: 'Answer after admitted steer.' });
+
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'STOP-OWNER-A' }],
+      promptId: 'prompt-stop-owner-a',
+    });
+    await waitForFile(marker);
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'STOP-STEER-B' }],
+      expectedPromptId: 'prompt-stop-owner-a',
+      requireActive: true,
+    });
+    await ctx.untilTurnEnd();
+
+    expect(ctx.llmCalls).toHaveLength(2);
+    expect(
+      ctx.llmCalls[1]!.history
+        .flatMap((message) => message.content)
+        .some((part) => part.type === 'text' && part.text === 'STOP-STEER-B'),
+    ).toBe(true);
   });
 
   it('cancels while waiting for a Stop hook', async () => {
@@ -1764,7 +2220,7 @@ describe('Agent turn flow', () => {
     // A programmatic abort (e.g. a subagent deadline timeout) carries a plain
     // AbortError as its reason, not a UserCancellationError, so it must not be
     // reported as a user interrupt.
-    ctx.agent.turn.cancel(0, abortError());
+    void ctx.agent.turn.cancel(0, abortError());
     await ctx.untilTurnEnd();
 
     expect(triggered).toEqual([]);
@@ -2417,16 +2873,16 @@ describe('Agent turn flow', () => {
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Run a command' }] });
 
     expect(await ctx.untilApprovalRequest()).toMatchInlineSnapshot(`
-      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Run a command" } ], "origin": { "kind": "user" }, "time": "<time>" }
+      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Run a command" } ], "origin": { "kind": "user" }, "admissionId": "<uuid-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started                { "turnId": 0, "origin": { "kind": "user" } }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Run a command" } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
-      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Run a command" } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "prompt", "id": "<uuid-1>", "turnId": 0 }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-2>", "turnId": "0", "step": 1 }, "time": "<time>" }
+      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-2>" }
       [wire] llm.tools_snapshot          { "hash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "tools": [ { "name": "Bash", "description": "Execute a \`bash\` command. Use this for shell semantics — pipes, env, processes, git, package managers, build/test runners, anything genuinely interactive or multi-step.\\n\\n**Translate these to a dedicated tool instead:**\\n- \`cat\` / \`head\` / \`tail\` (known path) → \`Read\`\\n- \`sed\` / \`awk\` (in-place edit) → \`Edit\`\\n- \`echo > file\` / \`cat <<EOF\` → \`Write\`\\n- \`find\` / recursive \`ls\` to locate files by name pattern → \`Glob\` (plain \`ls <known-directory>\` is fine for listing a directory)\\n- \`grep\` / \`rg\` (search file contents) → \`Grep\`\\n- \`echo\` / \`printf\` (talk to the user) → just output text directly\\n\\nThe dedicated tools render in the per-tool permission UI and keep raw stdout out of the conversation; that is why they are worth reaching for whenever one fits.\\n\\n**Output:**\\nThe stdout and stderr will be combined and returned as a string. The output may be truncated if it is too long. If the command exits non-zero, the output ends with a \`Command failed with exit code: N\` line; a command killed by its timeout or interrupted by the user ends with its own message instead.\\n\\nBackground execution is disabled for this agent. Do not set \`run_in_background=true\`.\\n\\n**Guidelines for safety and security:**\\n- Each shell tool call will be executed in a fresh shell environment. The shell variables, current working directory changes, and the shell history is not preserved between calls. To run a command in a particular directory, pass the \`cwd\` argument (or use absolute paths) rather than relying on a \`cd\` from an earlier call.\\n- The tool call will return after the command is finished. You shall not use this tool to execute an interactive command or a command that may run forever. For possibly long-running commands, set the \`timeout\` argument in seconds. The default is 60s; foreground commands allow up to 300s; a foreground command that hits its timeout is killed.\\n- Avoid using \`..\` to access files or directories outside of the working directory.\\n- Avoid modifying files outside of the working directory unless explicitly instructed to do so.\\n- Never run commands that require superuser privileges unless explicitly instructed to do so.\\n\\n**Guidelines for efficiency:**\\n- Use \`&&\` to chain commands that genuinely depend on each other, e.g. \`npm install && npm test\`. Independent read-only commands (separate \`git show\`, \`ls\`, or status checks) should be issued as separate parallel Bash calls in one response, not chained into a single call — chaining serializes their execution and mixes their output. Do not stitch outputs together with \`echo\` separators.\\n- Use \`;\` to run commands sequentially regardless of success/failure\\n- Use \`||\` for conditional execution (run second command only if first fails)\\n- Use pipe operations (\`|\`) and redirections (\`>\`, \`>>\`) to chain input and output between commands\\n- Always quote file paths containing spaces with double quotes (e.g., cd \\"/path with spaces/\\")\\n- Compose multi-step logic in a single call with \`if\` / \`case\` / \`for\` / \`while\` control flows.\\n- Do not set \`run_in_background=true\`; background task management tools are not available.\\n\\n**Commands available:**\\nThe following common command categories are usually available. Availability still depends on the host, so when in doubt run \`which <command>\` first to confirm a command exists before relying on it.\\n- Navigation and inspection: \`ls\`, \`pwd\`, \`cd\`, \`stat\`, \`file\`, \`du\`, \`df\`, \`tree\`\\n- File and directory management: \`cp\`, \`mv\`, \`rm\`, \`mkdir\`, \`touch\`, \`ln\`, \`chmod\`, \`chown\`\\n- Text and data processing: \`wc\`, \`sort\`, \`uniq\`, \`cut\`, \`tr\`, \`diff\`, \`xargs\`\\n- Archives and compression: \`tar\`, \`gzip\`, \`gunzip\`, \`zip\`, \`unzip\`\\n- Networking and transfer: \`curl\`, \`wget\`, \`ping\`, \`ssh\`, \`scp\`\\n- Version control: \`git\`; for GitHub-hosted work (PRs, issues, CI runs, API queries) prefer the \`gh\` CLI when installed — it carries the user's GitHub auth and can return structured JSON\\n- Process and system: \`ps\`, \`kill\`, \`top\`, \`env\`, \`date\`, \`uname\`, \`whoami\`\\n- Language and package toolchains: \`node\`, \`npm\`, \`pnpm\`, \`yarn\`, \`python\`, \`pip\` (use whichever the project actually relies on)\\n", "parameters": { "$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": { "command": { "type": "string", "minLength": 1, "description": "The command to execute." }, "cwd": { "description": "The working directory in which to run the command. When omitted, the command runs in the session's working directory.", "type": "string" }, "timeout": { "default": 60, "description": "Optional timeout in seconds for the command to execute. Foreground default 60s, max 300s. Background default 600s, max 86400s. Ignored for background commands when disable_timeout=true.", "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 }, "description": { "description": "A short description for the background task. Required when run_in_background is true.", "type": "string" }, "run_in_background": { "description": "Whether to run the command as a background task.", "type": "boolean" }, "disable_timeout": { "description": "If true, do not apply a timeout to the command. Only applies when run_in_background is true.", "type": "boolean" } }, "required": [ "command" ], "additionalProperties": false } } ], "time": "<time>" }
       [wire] llm.request                 { "kind": "loop", "provider": "kimi", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "messageCount": 1, "turnStep": "0.1", "time": "<time>" }
       [emit] assistant.delta             { "turnId": 0, "delta": "I will run Bash." }
       [emit] tool.call.delta             { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "argumentsPart": "{\\"command\\":\\"printf should-not-run\\",\\"timeout\\":60}" }
-      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will run Bash." } }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "part": { "type": "text", "text": "I will run Bash." } }, "time": "<time>" }
       [emit] requestApproval             { "turnId": 0, "toolCallId": "call_bash", "toolName": "Bash", "action": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
@@ -2443,13 +2899,13 @@ describe('Agent turn flow', () => {
     });
 
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
-      [wire] turn.cancel                 { "turnId": 0, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
+      [wire] turn.cancel                 { "turnId": 0, "ownerTurnId": 0, "outcomeId": "<uuid-4>", "outcomeTurnId": 0, "outcomeContent": "The user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.", "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
       [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }
       [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "call_bash", "toolCallId": "call_bash", "result": { "output": "The user manually interrupted \\"Bash\\" (and anything else running at the same time). This was a deliberate user action, not a system error, timeout, or capacity limit. Do not retry automatically or guess at the cause — wait for the user's next instruction.", "isError": true } }, "time": "<time>" }
       [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "The user manually interrupted \\"Bash\\" (and anything else running at the same time). This was a deliberate user action, not a system error, timeout, or capacity limit. Do not retry automatically or guess at the cause — wait for the user's next instruction.", "isError": true }
       [emit] turn.step.interrupted       { "turnId": 0, "step": 1, "reason": "aborted" }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "time": "<time>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "materializedTurnOutcomeId": "<uuid-4>", "time": "<time>" }
       [emit] turn.ended                  { "turnId": 0, "reason": "cancelled" }
     `);
     expect(records).toContainEqual({
@@ -2482,16 +2938,16 @@ describe('Agent turn flow', () => {
 
     const approval = await ctx.takeApprovalRequest();
     expect(approval.events).toMatchInlineSnapshot(`
-      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Run Bash, then listen" } ], "origin": { "kind": "user" }, "time": "<time>" }
+      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Run Bash, then listen" } ], "origin": { "kind": "user" }, "admissionId": "<uuid-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started                { "turnId": 0, "origin": { "kind": "user" } }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Run Bash, then listen" } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
-      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Run Bash, then listen" } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "prompt", "id": "<uuid-1>", "turnId": 0 }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-2>", "turnId": "0", "step": 1 }, "time": "<time>" }
+      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-2>" }
       [wire] llm.tools_snapshot          { "hash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "tools": [ { "name": "Bash", "description": "Execute a \`bash\` command. Use this for shell semantics — pipes, env, processes, git, package managers, build/test runners, anything genuinely interactive or multi-step.\\n\\n**Translate these to a dedicated tool instead:**\\n- \`cat\` / \`head\` / \`tail\` (known path) → \`Read\`\\n- \`sed\` / \`awk\` (in-place edit) → \`Edit\`\\n- \`echo > file\` / \`cat <<EOF\` → \`Write\`\\n- \`find\` / recursive \`ls\` to locate files by name pattern → \`Glob\` (plain \`ls <known-directory>\` is fine for listing a directory)\\n- \`grep\` / \`rg\` (search file contents) → \`Grep\`\\n- \`echo\` / \`printf\` (talk to the user) → just output text directly\\n\\nThe dedicated tools render in the per-tool permission UI and keep raw stdout out of the conversation; that is why they are worth reaching for whenever one fits.\\n\\n**Output:**\\nThe stdout and stderr will be combined and returned as a string. The output may be truncated if it is too long. If the command exits non-zero, the output ends with a \`Command failed with exit code: N\` line; a command killed by its timeout or interrupted by the user ends with its own message instead.\\n\\nBackground execution is disabled for this agent. Do not set \`run_in_background=true\`.\\n\\n**Guidelines for safety and security:**\\n- Each shell tool call will be executed in a fresh shell environment. The shell variables, current working directory changes, and the shell history is not preserved between calls. To run a command in a particular directory, pass the \`cwd\` argument (or use absolute paths) rather than relying on a \`cd\` from an earlier call.\\n- The tool call will return after the command is finished. You shall not use this tool to execute an interactive command or a command that may run forever. For possibly long-running commands, set the \`timeout\` argument in seconds. The default is 60s; foreground commands allow up to 300s; a foreground command that hits its timeout is killed.\\n- Avoid using \`..\` to access files or directories outside of the working directory.\\n- Avoid modifying files outside of the working directory unless explicitly instructed to do so.\\n- Never run commands that require superuser privileges unless explicitly instructed to do so.\\n\\n**Guidelines for efficiency:**\\n- Use \`&&\` to chain commands that genuinely depend on each other, e.g. \`npm install && npm test\`. Independent read-only commands (separate \`git show\`, \`ls\`, or status checks) should be issued as separate parallel Bash calls in one response, not chained into a single call — chaining serializes their execution and mixes their output. Do not stitch outputs together with \`echo\` separators.\\n- Use \`;\` to run commands sequentially regardless of success/failure\\n- Use \`||\` for conditional execution (run second command only if first fails)\\n- Use pipe operations (\`|\`) and redirections (\`>\`, \`>>\`) to chain input and output between commands\\n- Always quote file paths containing spaces with double quotes (e.g., cd \\"/path with spaces/\\")\\n- Compose multi-step logic in a single call with \`if\` / \`case\` / \`for\` / \`while\` control flows.\\n- Do not set \`run_in_background=true\`; background task management tools are not available.\\n\\n**Commands available:**\\nThe following common command categories are usually available. Availability still depends on the host, so when in doubt run \`which <command>\` first to confirm a command exists before relying on it.\\n- Navigation and inspection: \`ls\`, \`pwd\`, \`cd\`, \`stat\`, \`file\`, \`du\`, \`df\`, \`tree\`\\n- File and directory management: \`cp\`, \`mv\`, \`rm\`, \`mkdir\`, \`touch\`, \`ln\`, \`chmod\`, \`chown\`\\n- Text and data processing: \`wc\`, \`sort\`, \`uniq\`, \`cut\`, \`tr\`, \`diff\`, \`xargs\`\\n- Archives and compression: \`tar\`, \`gzip\`, \`gunzip\`, \`zip\`, \`unzip\`\\n- Networking and transfer: \`curl\`, \`wget\`, \`ping\`, \`ssh\`, \`scp\`\\n- Version control: \`git\`; for GitHub-hosted work (PRs, issues, CI runs, API queries) prefer the \`gh\` CLI when installed — it carries the user's GitHub auth and can return structured JSON\\n- Process and system: \`ps\`, \`kill\`, \`top\`, \`env\`, \`date\`, \`uname\`, \`whoami\`\\n- Language and package toolchains: \`node\`, \`npm\`, \`pnpm\`, \`yarn\`, \`python\`, \`pip\` (use whichever the project actually relies on)\\n", "parameters": { "$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": { "command": { "type": "string", "minLength": 1, "description": "The command to execute." }, "cwd": { "description": "The working directory in which to run the command. When omitted, the command runs in the session's working directory.", "type": "string" }, "timeout": { "default": 60, "description": "Optional timeout in seconds for the command to execute. Foreground default 60s, max 300s. Background default 600s, max 86400s. Ignored for background commands when disable_timeout=true.", "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 }, "description": { "description": "A short description for the background task. Required when run_in_background is true.", "type": "string" }, "run_in_background": { "description": "Whether to run the command as a background task.", "type": "boolean" }, "disable_timeout": { "description": "If true, do not apply a timeout to the command. Only applies when run_in_background is true.", "type": "boolean" } }, "required": [ "command" ], "additionalProperties": false } } ], "time": "<time>" }
       [wire] llm.request                 { "kind": "loop", "provider": "kimi", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "messageCount": 1, "turnStep": "0.1", "time": "<time>" }
       [emit] assistant.delta             { "turnId": 0, "delta": "I will ask first." }
       [emit] tool.call.delta             { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "argumentsPart": "{\\"command\\":\\"printf approved\\",\\"timeout\\":60}" }
-      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will ask first." } }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "part": { "type": "text", "text": "I will ask first." } }, "time": "<time>" }
       [emit] requestApproval             { "turnId": 0, "toolCallId": "call_bash", "toolName": "Bash", "action": "Running: printf approved", "display": { "kind": "command", "command": "printf approved", "cwd": "<cwd>", "language": "bash" } }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
@@ -2504,7 +2960,7 @@ describe('Agent turn flow', () => {
 
     await ctx.rpc.steer({ input: [{ type: 'text', text: 'Also mention the steer.' }] });
     expect(ctx.llmCalls).toHaveLength(1);
-    expect(ctx.newEvents()).toMatchInlineSnapshot(`[wire] turn.steer   { "input": [ { "type": "text", "text": "Also mention the steer." } ], "origin": { "kind": "user" }, "time": "<time>" }`);
+    expect(ctx.newEvents()).toMatchInlineSnapshot(`[wire] turn.steer   { "input": [ { "type": "text", "text": "Also mention the steer." } ], "origin": { "kind": "user" }, "admissionId": "<uuid-4>", "ownerTurnId": 0, "time": "<time>" }`);
 
     ctx.mockNextResponse({ type: 'text', text: 'Approved, and I saw the steer.' });
     approval.respond({
@@ -2514,23 +2970,23 @@ describe('Agent turn flow', () => {
 
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
       [wire] permission.record_approval_result   { "turnId": 0, "toolCallId": "call_bash", "toolName": "Bash", "action": "Running: printf approved", "result": { "decision": "approved", "selectedLabel": "approve" }, "time": "<time>" }
-      [wire] context.append_loop_event           { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf approved", "timeout": 60 }, "description": "Running: printf approved", "display": { "kind": "command", "command": "printf approved", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
+      [wire] context.append_loop_event           { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf approved", "timeout": 60 }, "description": "Running: printf approved", "display": { "kind": "command", "command": "printf approved", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
       [emit] tool.call.started                   { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf approved", "timeout": 60 }, "description": "Running: printf approved", "display": { "kind": "command", "command": "printf approved", "cwd": "<cwd>", "language": "bash" } }
       [emit] tool.progress                       { "turnId": 0, "toolCallId": "call_bash", "update": { "kind": "stdout", "text": "approved" } }
       [wire] context.append_loop_event           { "event": { "type": "tool.result", "parentUuid": "call_bash", "toolCallId": "call_bash", "result": { "output": "approved" } }, "time": "<time>" }
       [emit] tool.result                         { "turnId": 0, "toolCallId": "call_bash", "output": "approved" }
-      [wire] context.append_loop_event           { "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "usage": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "messageId": "mock-1" }, "time": "<time>" }
-      [emit] turn.step.completed                 { "turnId": 0, "step": 1, "stepId": "<uuid-1>", "usage": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use" }
+      [wire] context.append_loop_event           { "event": { "type": "step.end", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "usage": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "messageId": "mock-1" }, "time": "<time>" }
+      [emit] turn.step.completed                 { "turnId": 0, "step": 1, "stepId": "<uuid-2>", "usage": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use" }
       [wire] usage.record                        { "model": "mock-model", "usage": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
       [emit] agent.status.updated                { "model": "mock-model", "contextTokens": 29, "maxContextTokens": 1000000, "contextUsage": 0.000029, "planMode": false, "swarmMode": false, "permission": "manual", "usage": { "byModel": { "mock-model": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 7, "output": 22, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
-      [wire] context.append_message              { "message": { "role": "user", "content": [ { "type": "text", "text": "Also mention the steer." } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_loop_event           { "event": { "type": "step.begin", "uuid": "<uuid-3>", "turnId": "0", "step": 2 }, "time": "<time>" }
-      [emit] turn.step.started                   { "turnId": 0, "step": 2, "stepId": "<uuid-3>" }
+      [wire] context.append_message              { "message": { "role": "user", "content": [ { "type": "text", "text": "Also mention the steer." } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "steer", "id": "<uuid-4>", "turnId": 0 }, "time": "<time>" }
+      [wire] context.append_loop_event           { "event": { "type": "step.begin", "uuid": "<uuid-5>", "turnId": "0", "step": 2 }, "time": "<time>" }
+      [emit] turn.step.started                   { "turnId": 0, "step": 2, "stepId": "<uuid-5>" }
       [wire] llm.request                         { "kind": "loop", "provider": "kimi", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 999971, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "messageCount": 4, "turnStep": "0.2", "time": "<time>" }
       [emit] assistant.delta                     { "turnId": 0, "delta": "Approved, and I saw the steer." }
-      [wire] context.append_loop_event           { "event": { "type": "content.part", "uuid": "<uuid-4>", "turnId": "0", "step": 2, "stepUuid": "<uuid-3>", "part": { "type": "text", "text": "Approved, and I saw the steer." } }, "time": "<time>" }
-      [wire] context.append_loop_event           { "event": { "type": "step.end", "uuid": "<uuid-3>", "turnId": "0", "step": 2, "usage": { "inputOther": 39, "output": 11, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "messageId": "mock-2" }, "time": "<time>" }
-      [emit] turn.step.completed                 { "turnId": 0, "step": 2, "stepId": "<uuid-3>", "usage": { "inputOther": 39, "output": 11, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn" }
+      [wire] context.append_loop_event           { "event": { "type": "content.part", "uuid": "<uuid-6>", "turnId": "0", "step": 2, "stepUuid": "<uuid-5>", "part": { "type": "text", "text": "Approved, and I saw the steer." } }, "time": "<time>" }
+      [wire] context.append_loop_event           { "event": { "type": "step.end", "uuid": "<uuid-5>", "turnId": "0", "step": 2, "usage": { "inputOther": 39, "output": 11, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn", "messageId": "mock-2" }, "time": "<time>" }
+      [emit] turn.step.completed                 { "turnId": 0, "step": 2, "stepId": "<uuid-5>", "usage": { "inputOther": 39, "output": 11, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "end_turn" }
       [wire] usage.record                        { "model": "mock-model", "usage": { "inputOther": 39, "output": 11, "inputCacheRead": 0, "inputCacheCreation": 0 }, "usageScope": "turn", "time": "<time>" }
       [emit] agent.status.updated                { "model": "mock-model", "contextTokens": 50, "maxContextTokens": 1000000, "contextUsage": 0.00005, "planMode": false, "swarmMode": false, "permission": "manual", "usage": { "byModel": { "mock-model": { "inputOther": 46, "output": 33, "inputCacheRead": 0, "inputCacheCreation": 0 } }, "total": { "inputOther": 46, "output": 33, "inputCacheRead": 0, "inputCacheCreation": 0 }, "currentTurn": { "inputOther": 46, "output": 33, "inputCacheRead": 0, "inputCacheCreation": 0 } } }
       [emit] turn.ended                          { "turnId": 0, "reason": "completed" }
@@ -2546,24 +3002,25 @@ describe('Agent turn flow', () => {
     await ctx.expectResumeMatches();
   });
 
-  it('rejects a non-steer prompt while a turn is active', async () => {
-    const ctx = testAgent({ kaos: createCommandKaos('should-not-run') });
+  it('rejects an RPC prompt while a turn is active without persisting it for replay', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ kaos: createCommandKaos('should-not-run'), persistence });
     ctx.configure({ tools: ['Bash'] });
 
     ctx.mockNextResponse({ type: 'text', text: 'I will wait for approval.' }, bashCall());
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Start the active turn' }] });
 
     expect(await ctx.untilApprovalRequest()).toMatchInlineSnapshot(`
-      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Start the active turn" } ], "origin": { "kind": "user" }, "time": "<time>" }
+      [wire] turn.prompt                 { "input": [ { "type": "text", "text": "Start the active turn" } ], "origin": { "kind": "user" }, "admissionId": "<uuid-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started                { "turnId": 0, "origin": { "kind": "user" } }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Start the active turn" } ], "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-1>", "turnId": "0", "step": 1 }, "time": "<time>" }
-      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-1>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "Start the active turn" } ], "toolCalls": [], "origin": { "kind": "user" } }, "consumedTurnInput": { "kind": "prompt", "id": "<uuid-1>", "turnId": 0 }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "step.begin", "uuid": "<uuid-2>", "turnId": "0", "step": 1 }, "time": "<time>" }
+      [emit] turn.step.started           { "turnId": 0, "step": 1, "stepId": "<uuid-2>" }
       [wire] llm.tools_snapshot          { "hash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "tools": [ { "name": "Bash", "description": "Execute a \`bash\` command. Use this for shell semantics — pipes, env, processes, git, package managers, build/test runners, anything genuinely interactive or multi-step.\\n\\n**Translate these to a dedicated tool instead:**\\n- \`cat\` / \`head\` / \`tail\` (known path) → \`Read\`\\n- \`sed\` / \`awk\` (in-place edit) → \`Edit\`\\n- \`echo > file\` / \`cat <<EOF\` → \`Write\`\\n- \`find\` / recursive \`ls\` to locate files by name pattern → \`Glob\` (plain \`ls <known-directory>\` is fine for listing a directory)\\n- \`grep\` / \`rg\` (search file contents) → \`Grep\`\\n- \`echo\` / \`printf\` (talk to the user) → just output text directly\\n\\nThe dedicated tools render in the per-tool permission UI and keep raw stdout out of the conversation; that is why they are worth reaching for whenever one fits.\\n\\n**Output:**\\nThe stdout and stderr will be combined and returned as a string. The output may be truncated if it is too long. If the command exits non-zero, the output ends with a \`Command failed with exit code: N\` line; a command killed by its timeout or interrupted by the user ends with its own message instead.\\n\\nBackground execution is disabled for this agent. Do not set \`run_in_background=true\`.\\n\\n**Guidelines for safety and security:**\\n- Each shell tool call will be executed in a fresh shell environment. The shell variables, current working directory changes, and the shell history is not preserved between calls. To run a command in a particular directory, pass the \`cwd\` argument (or use absolute paths) rather than relying on a \`cd\` from an earlier call.\\n- The tool call will return after the command is finished. You shall not use this tool to execute an interactive command or a command that may run forever. For possibly long-running commands, set the \`timeout\` argument in seconds. The default is 60s; foreground commands allow up to 300s; a foreground command that hits its timeout is killed.\\n- Avoid using \`..\` to access files or directories outside of the working directory.\\n- Avoid modifying files outside of the working directory unless explicitly instructed to do so.\\n- Never run commands that require superuser privileges unless explicitly instructed to do so.\\n\\n**Guidelines for efficiency:**\\n- Use \`&&\` to chain commands that genuinely depend on each other, e.g. \`npm install && npm test\`. Independent read-only commands (separate \`git show\`, \`ls\`, or status checks) should be issued as separate parallel Bash calls in one response, not chained into a single call — chaining serializes their execution and mixes their output. Do not stitch outputs together with \`echo\` separators.\\n- Use \`;\` to run commands sequentially regardless of success/failure\\n- Use \`||\` for conditional execution (run second command only if first fails)\\n- Use pipe operations (\`|\`) and redirections (\`>\`, \`>>\`) to chain input and output between commands\\n- Always quote file paths containing spaces with double quotes (e.g., cd \\"/path with spaces/\\")\\n- Compose multi-step logic in a single call with \`if\` / \`case\` / \`for\` / \`while\` control flows.\\n- Do not set \`run_in_background=true\`; background task management tools are not available.\\n\\n**Commands available:**\\nThe following common command categories are usually available. Availability still depends on the host, so when in doubt run \`which <command>\` first to confirm a command exists before relying on it.\\n- Navigation and inspection: \`ls\`, \`pwd\`, \`cd\`, \`stat\`, \`file\`, \`du\`, \`df\`, \`tree\`\\n- File and directory management: \`cp\`, \`mv\`, \`rm\`, \`mkdir\`, \`touch\`, \`ln\`, \`chmod\`, \`chown\`\\n- Text and data processing: \`wc\`, \`sort\`, \`uniq\`, \`cut\`, \`tr\`, \`diff\`, \`xargs\`\\n- Archives and compression: \`tar\`, \`gzip\`, \`gunzip\`, \`zip\`, \`unzip\`\\n- Networking and transfer: \`curl\`, \`wget\`, \`ping\`, \`ssh\`, \`scp\`\\n- Version control: \`git\`; for GitHub-hosted work (PRs, issues, CI runs, API queries) prefer the \`gh\` CLI when installed — it carries the user's GitHub auth and can return structured JSON\\n- Process and system: \`ps\`, \`kill\`, \`top\`, \`env\`, \`date\`, \`uname\`, \`whoami\`\\n- Language and package toolchains: \`node\`, \`npm\`, \`pnpm\`, \`yarn\`, \`python\`, \`pip\` (use whichever the project actually relies on)\\n", "parameters": { "$schema": "http://json-schema.org/draft-07/schema#", "type": "object", "properties": { "command": { "type": "string", "minLength": 1, "description": "The command to execute." }, "cwd": { "description": "The working directory in which to run the command. When omitted, the command runs in the session's working directory.", "type": "string" }, "timeout": { "default": 60, "description": "Optional timeout in seconds for the command to execute. Foreground default 60s, max 300s. Background default 600s, max 86400s. Ignored for background commands when disable_timeout=true.", "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 }, "description": { "description": "A short description for the background task. Required when run_in_background is true.", "type": "string" }, "run_in_background": { "description": "Whether to run the command as a background task.", "type": "boolean" }, "disable_timeout": { "description": "If true, do not apply a timeout to the command. Only applies when run_in_background is true.", "type": "boolean" } }, "required": [ "command" ], "additionalProperties": false } } ], "time": "<time>" }
       [wire] llm.request                 { "kind": "loop", "provider": "kimi", "model": "mock-model", "modelAlias": "mock-model", "thinkingEffort": "off", "maxTokens": 1000000, "toolSelect": false, "systemPromptHash": "ec9c34379c88babbc468ef2f3e0e08cd2f422c8c4a910664fb8bb394d703a575", "toolsHash": "aca3041121ee711028f726fed37e7b999f7e8885c05dbece76ef97eb43e2ec1e", "messageCount": 1, "turnStep": "0.1", "time": "<time>" }
       [emit] assistant.delta             { "turnId": 0, "delta": "I will wait for approval." }
       [emit] tool.call.delta             { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "argumentsPart": "{\\"command\\":\\"printf should-not-run\\",\\"timeout\\":60}" }
-      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-2>", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "part": { "type": "text", "text": "I will wait for approval." } }, "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "content.part", "uuid": "<uuid-3>", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "part": { "type": "text", "text": "I will wait for approval." } }, "time": "<time>" }
       [emit] requestApproval             { "turnId": 0, "toolCallId": "call_bash", "toolName": "Bash", "action": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }
     `);
     expect(ctx.lastLlmInput()).toMatchInlineSnapshot(`
@@ -2572,24 +3029,537 @@ describe('Agent turn flow', () => {
       messages:
         user: text "Start the active turn"
     `);
-    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'This should not start a new turn' }] });
+    await expect(
+      ctx.rpc.prompt({
+        input: [{ type: 'text', text: 'This should not start a new turn' }],
+      }),
+    ).rejects.toMatchObject({
+      name: 'KimiError',
+      code: ErrorCodes.TURN_AGENT_BUSY,
+      message: 'Cannot launch a new turn while another turn (ID 0) is active',
+      details: { turnId: 0 },
+    });
 
     expect(ctx.newEvents()).toMatchInlineSnapshot(`
-      [wire] turn.prompt   { "input": [ { "type": "text", "text": "This should not start a new turn" } ], "origin": { "kind": "user" }, "time": "<time>" }
-      [emit] error         { "code": "turn.agent_busy", "message": "Cannot launch a new turn while another turn (ID 0) is active", "details": { "turnId": 0 }, "retryable": true }
+      [emit] error   { "code": "turn.agent_busy", "message": "Cannot launch a new turn while another turn (ID 0) is active", "details": { "turnId": 0 }, "retryable": true }
     `);
+    expect(
+      persistence.records
+        .filter((record) => record.type === 'turn.prompt')
+        .flatMap((record) => record.input)
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text),
+    ).toEqual(['Start the active turn']);
     await ctx.rpc.cancel({ turnId: 0 });
     expect(await ctx.untilTurnEnd()).toMatchInlineSnapshot(`
-      [wire] turn.cancel                 { "turnId": 0, "time": "<time>" }
-      [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-1>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
+      [wire] turn.cancel                 { "turnId": 0, "ownerTurnId": 0, "outcomeId": "<uuid-4>", "outcomeTurnId": 0, "outcomeContent": "The user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.", "time": "<time>" }
+      [wire] context.append_loop_event   { "event": { "type": "tool.call", "uuid": "call_bash", "turnId": "0", "step": 1, "stepUuid": "<uuid-2>", "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }, "time": "<time>" }
       [emit] tool.call.started           { "turnId": 0, "toolCallId": "call_bash", "name": "Bash", "args": { "command": "printf should-not-run", "timeout": 60 }, "description": "Running: printf should-not-run", "display": { "kind": "command", "command": "printf should-not-run", "cwd": "<cwd>", "language": "bash" } }
       [wire] context.append_loop_event   { "event": { "type": "tool.result", "parentUuid": "call_bash", "toolCallId": "call_bash", "result": { "output": "The user manually interrupted \\"Bash\\" (and anything else running at the same time). This was a deliberate user action, not a system error, timeout, or capacity limit. Do not retry automatically or guess at the cause — wait for the user's next instruction.", "isError": true } }, "time": "<time>" }
       [emit] tool.result                 { "turnId": 0, "toolCallId": "call_bash", "output": "The user manually interrupted \\"Bash\\" (and anything else running at the same time). This was a deliberate user action, not a system error, timeout, or capacity limit. Do not retry automatically or guess at the cause — wait for the user's next instruction.", "isError": true }
       [emit] turn.step.interrupted       { "turnId": 0, "step": 1, "reason": "aborted" }
-      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "time": "<time>" }
+      [wire] context.append_message      { "message": { "role": "user", "content": [ { "type": "text", "text": "<system-reminder>\\nThe user interrupted the previous turn before it finished.\\n\\nSome operations may already have taken effect. Treat the next user message as a follow-up, and check existing state before repeating operations.\\n</system-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "turn_outcome" } }, "materializedTurnOutcomeId": "<uuid-4>", "time": "<time>" }
       [emit] turn.ended                  { "turnId": 0, "reason": "cancelled" }
     `);
     await ctx.expectResumeMatches();
+  });
+
+  it('keeps direct TurnFlow busy submissions compatible with the null return contract', async () => {
+    const ctx = testAgent({ generate: abortableGenerate });
+    ctx.configure();
+
+    expect(ctx.agent.turn.prompt([{ type: 'text', text: 'Start the active turn' }])).toBe(0);
+    ctx.newEvents();
+
+    expect(
+      ctx.agent.turn.prompt([{ type: 'text', text: 'Direct caller should see null' }]),
+    ).toBeNull();
+    expect(ctx.newEvents()).toMatchInlineSnapshot(`
+      [emit] error   { "code": "turn.agent_busy", "message": "Cannot launch a new turn while another turn (ID 0) is active", "details": { "turnId": 0 }, "retryable": true }
+    `);
+
+    await ctx.rpc.cancel({ turnId: 0 });
+    await ctx.untilTurnEnd();
+  });
+
+  it('reserves the active turn before a synchronous turn.started listener can re-enter prompt', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    let reentrantPrompt: ReturnType<typeof ctx.rpc.prompt> | undefined;
+    ctx.emitter.once('turn.started', () => {
+      reentrantPrompt = ctx.rpc.prompt({
+        input: [{ type: 'text', text: 'REENTRANT-PROMPT' }],
+        promptId: 'prompt-reentrant',
+      });
+    });
+
+    await expect(
+      ctx.rpc.prompt({
+        input: [{ type: 'text', text: 'OWNING-PROMPT' }],
+        promptId: 'prompt-owner',
+      }),
+    ).resolves.toEqual({ kind: 'started', turnId: 0 });
+    await expect(reentrantPrompt).rejects.toMatchObject({ code: ErrorCodes.TURN_AGENT_BUSY });
+    expect(ctx.allEvents).toContainEqual(
+      expect.objectContaining({
+        type: '[rpc]',
+        event: 'turn.started',
+        args: expect.objectContaining({ turnId: 0, promptId: 'prompt-owner' }),
+      }),
+    );
+    expect(
+      persistence.records.filter((record) => record.type === 'turn.prompt'),
+    ).toHaveLength(1);
+
+    await ctx.rpc.cancel({ turnId: 0 });
+    await ctx.untilTurnEnd();
+  });
+
+  it('reserves the active turn before a synchronous persistence callback can re-enter prompt', async () => {
+    let ctx!: TestAgentContext;
+    let reentrantResult: number | null | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type !== 'turn.prompt' || reentrantResult !== undefined) return;
+        reentrantResult = ctx.agent.turn.prompt([
+          { type: 'text', text: 'PERSISTENCE-REENTRANT-PROMPT' },
+        ]);
+      },
+    });
+    ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+
+    expect(
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'PERSISTENCE-OWNER-PROMPT' }] }),
+    ).toEqual({ kind: 'started', turnId: 0 });
+    expect(reentrantResult).toBeNull();
+    expect(
+      persistence.records
+        .filter((record) => record.type === 'turn.prompt')
+        .flatMap((record) => record.input)
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text),
+    ).toEqual(['PERSISTENCE-OWNER-PROMPT']);
+
+    await ctx.rpc.cancel({ turnId: 0 });
+    await ctx.untilTurnEnd();
+  });
+
+  it('rejects a turn-targeted steer after its turn has already ended', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence });
+    ctx.configure();
+    ctx.mockNextResponse({ type: 'text', text: 'The owning turn is complete.' });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'OWNING-TURN' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+    await expect(
+      ctx.rpc.steer({
+        input: [{ type: 'text', text: 'STALE-TARGETED-STEER' }],
+        expectedTurnId: 0,
+        requireActive: true,
+      }),
+    ).rejects.toMatchObject({ code: ErrorCodes.TURN_AGENT_BUSY });
+
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(persistence.records.filter((record) => record.type === 'turn.steer')).toHaveLength(0);
+  });
+
+  it('accepts a prompt-targeted steer only for the exact logical owner', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'ACTIVE-OWNER' }],
+      promptId: 'prompt-owner',
+    });
+
+    await expect(
+      ctx.rpc.steer({
+        input: [{ type: 'text', text: 'WRONG-TURN-STEER' }],
+        expectedPromptId: 'prompt-other',
+        requireActive: true,
+      }),
+    ).rejects.toMatchObject({ code: ErrorCodes.TURN_AGENT_BUSY });
+    await expect(
+      ctx.rpc.steer({
+        input: [{ type: 'text', text: 'MATCHING-TURN-STEER' }],
+        expectedPromptId: 'prompt-owner',
+        requireActive: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(
+      persistence.records
+        .filter((record) => record.type === 'turn.steer')
+        .flatMap((record) => record.input)
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text),
+    ).toEqual(['MATCHING-TURN-STEER']);
+    await ctx.rpc.cancel({ turnId: 0 });
+    await ctx.untilTurnEnd();
+  });
+
+  it('drops targeted and direct user steers on cancel while retaining an untargeted notification', async () => {
+    const firstRequestStarted = createControlledPromise<void>();
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      generateCalls += 1;
+      if (generateCalls !== 1) return textResult('FOLLOW-UP-COMPLETED');
+      firstRequestStarted.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      return textResult('UNEXPECTED-FIRST-RESPONSE');
+    };
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ generate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'OWNER-A' }],
+      promptId: 'prompt-a',
+    });
+    await firstRequestStarted;
+
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'OWNED-STEER-B' }],
+      expectedPromptId: 'prompt-a',
+      requireActive: true,
+    });
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'DIRECT-USER-STEER' }],
+    });
+    ctx.agent.turn.steer(
+      [{ type: 'text', text: 'UNTARGETED-BACKGROUND' }],
+      {
+        kind: 'background_task',
+        taskId: 'task-owner-cancel',
+        status: 'completed',
+        notificationId: 'notification-owner-cancel',
+      },
+    );
+    await ctx.rpc.cancel({ turnId: 0 });
+
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'FOLLOW-UP-C' }],
+      promptId: 'prompt-c',
+    });
+    await ctx.agent.turn.waitForCurrentTurn();
+
+    const history = ctx.agent.context.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(history).not.toContain('OWNED-STEER-B');
+    expect(history).not.toContain('DIRECT-USER-STEER');
+    expect(history).toContain('UNTARGETED-BACKGROUND');
+    expect(history).toContain('FOLLOW-UP-C');
+    expect(
+      persistence.records.find((record) => record.type === 'turn.cancel'),
+    ).toMatchObject({ promptId: 'prompt-a' });
+    expect(
+      persistence.records.find(
+        (record) =>
+          record.type === 'turn.steer' &&
+          record.input.some((part) => part.type === 'text' && part.text === 'OWNED-STEER-B'),
+      ),
+    ).toMatchObject({ expectedPromptId: 'prompt-a' });
+    expect(
+      persistence.records.find(
+        (record) =>
+          record.type === 'turn.steer' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'DIRECT-USER-STEER',
+          ),
+      ),
+    ).toMatchObject({ expectedPromptId: 'prompt-a' });
+  });
+
+  it('binds a direct user steer to the root turn when the prompt has no caller id', async () => {
+    const firstRequestStarted = createControlledPromise<void>();
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      _history,
+      _callbacks,
+      options,
+    ) => {
+      generateCalls += 1;
+      if (generateCalls !== 1) return textResult('FOLLOW-UP-WITHOUT-LEAK');
+      firstRequestStarted.resolve();
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = (): void => {
+          reject(options?.signal?.reason ?? abortError());
+        };
+        if (options?.signal?.aborted === true) onAbort();
+        else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
+      return textResult('UNEXPECTED-FIRST-RESPONSE');
+    };
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ generate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'OWNER-WITHOUT-PROMPT-ID' }] });
+    await firstRequestStarted;
+    await ctx.rpc.steer({ input: [{ type: 'text', text: 'DIRECT-STEER-WITHOUT-OWNER-ID' }] });
+
+    await ctx.rpc.cancel({ turnId: 0 });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FOLLOW-UP-AFTER-ROOT-CANCEL' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+
+    const history = ctx.agent.context.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(history).not.toContain('DIRECT-STEER-WITHOUT-OWNER-ID');
+    expect(history).toContain('FOLLOW-UP-AFTER-ROOT-CANCEL');
+    expect(
+      persistence.records.find(
+        (record) =>
+          record.type === 'turn.steer' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'DIRECT-STEER-WITHOUT-OWNER-ID',
+          ),
+      ),
+    ).toMatchObject({ ownerTurnId: 0 });
+    expect(
+      persistence.records.find((record) => record.type === 'turn.cancel'),
+    ).toMatchObject({ ownerTurnId: 0 });
+  });
+
+  it('does not admit a steer cancelled synchronously by its persistence observer', async () => {
+    let ctx!: TestAgentContext;
+    let nestedCancellation: Promise<void> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          record.type === 'turn.steer' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'REENTRANT-STEER-B',
+          )
+        ) {
+          nestedCancellation ??= ctx.agent.turn.cancel(0);
+        }
+      },
+    });
+    ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'REENTRANT-OWNER-A' }],
+      promptId: 'prompt-reentrant-owner-a',
+    });
+    const worker = ctx.agent.turn.waitForCurrentTurn();
+
+    await expect(
+      ctx.rpc.steer({
+        input: [{ type: 'text', text: 'REENTRANT-STEER-B' }],
+        expectedPromptId: 'prompt-reentrant-owner-a',
+        requireActive: true,
+      }),
+    ).rejects.toMatchObject({ code: ErrorCodes.TURN_AGENT_BUSY });
+    await Promise.all([nestedCancellation, worker]);
+
+    const history = ctx.agent.context.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n');
+    expect(history).not.toContain('REENTRANT-STEER-B');
+  });
+
+  it('does not drop a background steer when append persistence re-enters cancellation', async () => {
+    const providerStarted = createControlledPromise<void>();
+    const providerResult = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const generate: GenerateFn = async () => {
+      providerStarted.resolve();
+      return providerResult;
+    };
+    let ctx!: TestAgentContext;
+    let nestedCancellation: Promise<void> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          record.type === 'context.append_message' &&
+          record.message.content.some(
+            (part) => part.type === 'text' && part.text === 'APPEND-STEER-B',
+          )
+        ) {
+          nestedCancellation ??= ctx.agent.turn.cancel(0);
+        }
+      },
+    });
+    ctx = testAgent({ generate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'APPEND-OWNER-A' }],
+      promptId: 'prompt-append-owner-a',
+    });
+    await providerStarted;
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'APPEND-STEER-B' }],
+      expectedPromptId: 'prompt-append-owner-a',
+      requireActive: true,
+    });
+    ctx.agent.turn.steer(
+      [{ type: 'text', text: 'APPEND-BACKGROUND-N' }],
+      {
+        kind: 'background_task',
+        taskId: 'task-append-reentry',
+        status: 'completed',
+        notificationId: 'notification-append-reentry',
+      },
+    );
+
+    providerResult.resolve(textResult('Provider response before cancellation.'));
+    await vi.waitFor(() => expect(nestedCancellation).toBeDefined());
+    await nestedCancellation;
+    const ended = await ctx.untilTurnEnd();
+    expect(ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'cancelled' }),
+      }),
+    );
+
+    const history = ctx.agent.context.history
+      .flatMap((message) => message.content)
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text);
+    expect(history.filter((text) => text === 'APPEND-STEER-B')).toHaveLength(1);
+    expect(history.filter((text) => text === 'APPEND-BACKGROUND-N')).toHaveLength(1);
+    const terminalCancel = persistence.records.find((record) => record.type === 'turn.cancel');
+    expect(terminalCancel?.type === 'turn.cancel' ? terminalCancel.outcomeId : undefined).toBeDefined();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FOLLOW-UP-AFTER-CANCELLED-TURN' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+    expect(contextTexts(ctx).match(/previous turn before it finished/g)).toHaveLength(1);
+  });
+
+  it('emits a terminal turn without retrying a failed terminal steer append', async () => {
+    const providerStarted = createControlledPromise<void>();
+    const failProvider = createControlledPromise<never>();
+    let steerAppendAttempts = 0;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          record.type === 'context.append_message' &&
+          record.message.content.some(
+            (part) => part.type === 'text' && part.text === 'FAILED-APPEND-STEER-B',
+          )
+        ) {
+          steerAppendAttempts += 1;
+          throw new Error('terminal steer append failed');
+        }
+      },
+    });
+    const generate: GenerateFn = async () => {
+      providerStarted.resolve();
+      return failProvider;
+    };
+    const ctx = testAgent({
+      generate,
+      persistence,
+      ...singleAttemptAgentOptions(),
+    });
+    ctx.configure();
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: 'FAILED-APPEND-OWNER-A' }],
+      promptId: 'prompt-failed-append-owner-a',
+    });
+    await providerStarted;
+    await ctx.rpc.steer({
+      input: [{ type: 'text', text: 'FAILED-APPEND-STEER-B' }],
+      expectedPromptId: 'prompt-failed-append-owner-a',
+      requireActive: true,
+    });
+    failProvider.reject(new APIStatusError(500, 'provider failed', 'req-failed-append'));
+
+    const events = await ctx.untilTurnEnd();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'failed' }),
+      }),
+    );
+    expect(steerAppendAttempts).toBe(1);
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('deduplicates a cancellation re-entered by its persistence observer', async () => {
+    let ctx!: TestAgentContext;
+    let nestedCancellation: Promise<void> | undefined;
+    let cancelRecords = 0;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type !== 'turn.cancel') return;
+        cancelRecords += 1;
+        nestedCancellation ??= ctx.agent.turn.cancel(record.turnId);
+      },
+    });
+    ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'ACTIVE-BEFORE-REENTRY' }] });
+    const worker = ctx.agent.turn.waitForCurrentTurn();
+
+    const cancellation = ctx.agent.turn.cancel(0);
+    expect(nestedCancellation).toBe(cancellation);
+    await Promise.all([cancellation, worker]);
+
+    expect(cancelRecords).toBe(1);
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('finishes active-turn cancellation before reporting a turn.cancel persistence failure', async () => {
+    const persistenceError = new Error('turn.cancel persistence failed');
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type === 'turn.cancel') throw persistenceError;
+      },
+    });
+    const ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'ACTIVE-BEFORE-CANCEL-FAILURE' }] });
+
+    await expect(ctx.rpc.cancel({ turnId: 0 })).rejects.toBe(persistenceError);
+
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('runs every shutdown cleanup before reporting a turn.cancel persistence failure', async () => {
+    const persistenceError = new Error('shutdown cancellation persistence failed');
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (record.type === 'turn.cancel') throw persistenceError;
+      },
+    });
+    const ctx = testAgent({ generate: abortableGenerate, persistence });
+    ctx.configure();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'ACTIVE-BEFORE-SHUTDOWN-FAILURE' }] });
+    const compactionCancel = vi.spyOn(ctx.agent.fullCompaction, 'cancel');
+
+    await expect(ctx.agent.turn.shutdown(abortError('Session closed'))).rejects.toBe(
+      persistenceError,
+    );
+
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(ctx.agent.turn.isClosed).toBe(true);
+    expect(compactionCancel).toHaveBeenCalledOnce();
   });
 });
 
@@ -2779,6 +3749,16 @@ function textResult(text: string): Awaited<ReturnType<GenerateFn>> {
   };
 }
 
+function streamFromIterator(iterator: AsyncIterator<StreamedMessagePart>): StreamedMessage {
+  return {
+    id: null,
+    usage: null,
+    finishReason: null,
+    rawFinishReason: null,
+    [Symbol.asyncIterator]: () => iterator,
+  };
+}
+
 describe('abandoned tool exchange teardown', () => {
   it('closes dangling tool calls when a turn dies mid-batch so follow-up messages are not swallowed', async () => {
     // A transcript write failure between a recorded tool.call and its paired
@@ -2843,3 +3823,964 @@ describe('abandoned tool exchange teardown', () => {
     expect(JSON.stringify(ctx.agent.context.history)).toContain('follow-up after failure');
   });
 });
+
+describe('turn input crash-prefix recovery', () => {
+  it('launches a background steer admitted while a failed goal turn is finalizing', async () => {
+    const pauseStarted = createControlledPromise<void>();
+    const releasePause = createControlledPromise<void>();
+    const histories: Message[][] = [];
+    let calls = 0;
+    const ctx = testAgent({
+      generate: async (_provider, _systemPrompt, _tools, history) => {
+        histories.push(structuredClone(history));
+        calls += 1;
+        if (calls === 1) throw new Error('provider failed');
+        return textResult('background handled');
+      },
+    });
+    ctx.configure();
+    await ctx.agent.goal.createGoal({ objective: 'complete several slices' });
+    const pauseActiveGoal = ctx.agent.goal.pauseActiveGoal.bind(ctx.agent.goal);
+    vi.spyOn(ctx.agent.goal, 'pauseActiveGoal').mockImplementation(async (options) => {
+      pauseStarted.resolve();
+      await releasePause;
+      return pauseActiveGoal(options);
+    });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'start goal work' }] });
+    const firstWorker = ctx.agent.turn.waitForCurrentTurn();
+    await pauseStarted;
+    ctx.agent.turn.steer(
+      [{ type: 'text', text: 'BACKGROUND-DURING-TERMINAL-WINDOW' }],
+      {
+        kind: 'background_task',
+        taskId: 'terminal-window-task',
+        status: 'completed',
+        notificationId: 'terminal-window-notification',
+      },
+    );
+    releasePause.resolve();
+    await firstWorker;
+    if (ctx.agent.turn.hasActiveTurn) await ctx.agent.turn.waitForCurrentTurn();
+
+    expect(histories).toHaveLength(2);
+    expect(
+      histories[1]!
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text)
+        .join('\n'),
+    ).toContain('BACKGROUND-DURING-TERMINAL-WINDOW');
+  });
+
+  it('replays an active-turn steer when the process stops after admission but before context commit', async () => {
+    const provider = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => provider });
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'ACTIVE-PROMPT' }],
+      promptId: 'active-prompt-id',
+    });
+    await original.rpc.steer({
+      input: [{ type: 'text', text: 'DURABLE-ACTIVE-STEER' }],
+      expectedPromptId: 'active-prompt-id',
+      requireActive: true,
+    });
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) =>
+          record.type === 'turn.steer' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'DURABLE-ACTIVE-STEER',
+          ),
+      ),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed)).toContain('DURABLE-ACTIVE-STEER');
+  });
+
+  it('replays a prompt admitted immediately before its context commit', async () => {
+    const provider = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => provider });
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'PROMPT-BEFORE-CONTEXT-COMMIT' }],
+      promptId: 'prompt-before-context-commit',
+    });
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.prompt',
+      ),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed).match(/PROMPT-BEFORE-CONTEXT-COMMIT/g)).toHaveLength(1);
+  });
+
+  it('does not replay a prompt whose context consumption was already committed', async () => {
+    const provider = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => provider });
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'PROMPT-ALREADY-COMMITTED' }],
+      promptId: 'prompt-already-committed',
+    });
+    const resumedGenerate = vi.fn(async () => textResult('must not run'));
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.message.content.some(
+            (part) => part.type === 'text' && part.text === 'PROMPT-ALREADY-COMMITTED',
+          ),
+      ),
+      generate: resumedGenerate,
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed).match(/PROMPT-ALREADY-COMMITTED/g)).toHaveLength(1);
+    expect(resumedGenerate).not.toHaveBeenCalled();
+    expect(resumed.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('durably consumes an accepted empty retry without creating a visible message', async () => {
+    const provider = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => provider });
+    original.configure();
+    expect(original.agent.turn.retry('test retry')).toBe(0);
+    const resumedGenerate = vi.fn(async () => textResult('must not run'));
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.input_consumed',
+      ),
+      generate: resumedGenerate,
+    });
+    await resumed.agent.resume();
+
+    expect(resumedGenerate).not.toHaveBeenCalled();
+    expect(resumed.agent.context.history).toHaveLength(0);
+    expect(resumed.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('keeps a background steer admitted before a deferred prompt', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => summary });
+    original.appendExchange(1, 'old user', 'old assistant', 40);
+    await original.rpc.beginCompaction({});
+    original.agent.turn.steer(
+      [{ type: 'text', text: 'BACKGROUND-BEFORE-DEFERRED' }],
+      {
+        kind: 'background_task',
+        taskId: 'background-task',
+        status: 'completed',
+        notificationId: 'background-notification',
+      },
+    );
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'DEFERRED-AFTER-BACKGROUND' }],
+      promptId: 'deferred-after-background',
+    });
+
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(persistence.records)),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+    if (resumed.agent.turn.hasActiveTurn) await resumed.agent.turn.waitForCurrentTurn();
+
+    expect(contextTexts(resumed)).toContain('BACKGROUND-BEFORE-DEFERRED');
+  });
+
+  it('delivers a pending steer once after recovering a committed compaction', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => summary });
+    original.configure();
+    original.appendExchange(1, 'old user', 'old assistant', 40);
+    const applied = original.once('context.apply_compaction');
+    await original.rpc.beginCompaction({});
+    original.agent.turn.steer(
+      [{ type: 'text', text: 'BACKGROUND-BEHIND-RECOVERY' }],
+      {
+        kind: 'background_task',
+        taskId: 'recovery-task',
+        status: 'completed',
+        notificationId: 'recovery-notification',
+      },
+    );
+    summary.resolve(textResult('summary'));
+    await applied;
+
+    const histories: Message[][] = [];
+    let runtimeHandlesRestored = false;
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'context.apply_compaction',
+      ),
+      generate: async (_provider, _systemPrompt, _tools, history) => {
+        expect(runtimeHandlesRestored).toBe(true);
+        histories.push(structuredClone(history));
+        return textResult('recovered');
+      },
+    });
+    const ended = resumed.once('turn.ended');
+    await resumed.agent.resume({
+      beforePendingWorkResume: () => {
+        runtimeHandlesRestored = true;
+      },
+    });
+    await ended;
+
+    expect(contextTexts(resumed).match(/BACKGROUND-BEHIND-RECOVERY/g)).toHaveLength(1);
+    expect(
+      histories[0]!
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === 'text' && part.text === 'BACKGROUND-BEHIND-RECOVERY'),
+    ).toHaveLength(1);
+  });
+
+  it('replays a deferred prompt after its activation record but before its context commit', async () => {
+    const summary = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => summary });
+    original.appendExchange(1, 'old user', 'old assistant', 40);
+    await original.rpc.beginCompaction({});
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'DEFERRED-ACTIVATION-PREFIX' }],
+      promptId: 'deferred-activation-prefix',
+    });
+    summary.resolve(textResult('summary'));
+    await original.once('turn.started');
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.deferred_prompt_started',
+      ),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed)).toContain('DEFERRED-ACTIVATION-PREFIX');
+  });
+
+  it('keeps an unowned background steer when replay stops immediately after owner cancellation', async () => {
+    const provider = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: () => provider });
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'CANCELLED-OWNER' }],
+      promptId: 'cancelled-owner',
+    });
+    original.agent.turn.steer(
+      [{ type: 'text', text: 'BACKGROUND-SURVIVES-CANCEL' }],
+      {
+        kind: 'background_task',
+        taskId: 'cancel-task',
+        status: 'completed',
+        notificationId: 'cancel-notification',
+      },
+    );
+    void original.rpc.cancel({
+      expectedPromptId: 'cancelled-owner',
+      requireActive: true,
+    });
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.cancel',
+      ),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed)).toContain('BACKGROUND-SURVIVES-CANCEL');
+  });
+
+  it('does not duplicate a committed steer and replays every later uncommitted steer', async () => {
+    const firstResponse = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const persistence = new InMemoryAgentRecordPersistence();
+    let calls = 0;
+    const original = testAgent({
+      persistence,
+      generate: () => {
+        calls += 1;
+        return calls === 1 ? firstResponse : Promise.resolve(textResult('follow-up complete'));
+      },
+    });
+    await original.rpc.prompt({
+      input: [{ type: 'text', text: 'MULTI-STEER-OWNER' }],
+      promptId: 'multi-steer-owner',
+    });
+    await original.rpc.steer({
+      input: [{ type: 'text', text: 'FIRST-BUFFERED-STEER' }],
+      expectedPromptId: 'multi-steer-owner',
+      requireActive: true,
+    });
+    await original.rpc.steer({
+      input: [{ type: 'text', text: 'SECOND-BUFFERED-STEER' }],
+      expectedPromptId: 'multi-steer-owner',
+      requireActive: true,
+    });
+    firstResponse.resolve(textResult('first response'));
+    await original.agent.turn.waitForCurrentTurn();
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.message.content.some(
+            (part) => part.type === 'text' && part.text === 'FIRST-BUFFERED-STEER',
+          ),
+      ),
+      generate: async () => textResult('recovered'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed).match(/FIRST-BUFFERED-STEER/g)).toHaveLength(1);
+    expect(contextTexts(resumed).match(/SECOND-BUFFERED-STEER/g)).toHaveLength(1);
+  });
+
+  it('materializes a user interruption after crashing immediately after turn.cancel', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: abortableGenerate });
+    original.configure();
+    const stepStarted = original.once('turn.step.started');
+    await original.rpc.prompt({ input: [{ type: 'text', text: 'WORK-BEFORE-INTERRUPT' }] });
+    await stepStarted;
+    void original.rpc.cancel({ turnId: 0 });
+
+    const histories: Message[][] = [];
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.cancel' && record.outcomeId !== undefined,
+      ),
+      generate: async (_provider, _systemPrompt, _tools, history) => {
+        histories.push(structuredClone(history));
+        return textResult('continued safely');
+      },
+    });
+    await resumed.agent.resume();
+    await resumed.rpc.prompt({ input: [{ type: 'text', text: '继续' }] });
+    await resumed.agent.turn.waitForCurrentTurn();
+
+    expect(contextTexts(resumed).match(/The user interrupted the previous turn/g)).toHaveLength(1);
+    expect(
+      histories[0]!
+        .flatMap((message) => message.content)
+        .filter(
+          (part) =>
+            part.type === 'text' && part.text.includes('The user interrupted the previous turn'),
+        ),
+    ).toHaveLength(1);
+  });
+
+  it('materializes a provider failure after crashing immediately after turn.outcome', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({
+      persistence,
+      generate: async () => {
+        throw new APIStatusError(500, 'temporary provider failure', 'request-outcome-prefix');
+      },
+      ...singleAttemptAgentOptions(),
+    });
+    original.configure();
+    await original.rpc.prompt({ input: [{ type: 'text', text: 'WORK-BEFORE-500' }] });
+    await original.untilTurnEnd();
+
+    const histories: Message[][] = [];
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.outcome',
+      ),
+      generate: async (_provider, _systemPrompt, _tools, history) => {
+        histories.push(structuredClone(history));
+        return textResult('continued after failure');
+      },
+    });
+    await resumed.agent.resume();
+    await resumed.rpc.prompt({ input: [{ type: 'text', text: '继续' }] });
+    await resumed.agent.turn.waitForCurrentTurn();
+
+    expect(contextTexts(resumed).match(/API request failed with HTTP 500/g)).toHaveLength(1);
+    expect(
+      histories[0]!
+        .flatMap((message) => message.content)
+        .filter(
+          (part) => part.type === 'text' && part.text.includes('API request failed with HTTP 500'),
+        ),
+    ).toHaveLength(1);
+  });
+
+  it('joins repeated cancellation and records one outcome reminder', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const ctx = testAgent({ persistence, generate: abortableGenerate });
+    ctx.configure();
+    const stepStarted = ctx.once('turn.step.started');
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'CANCEL-ONCE' }] });
+    await stepStarted;
+
+    const first = ctx.rpc.cancel({ turnId: 0 });
+    const second = ctx.rpc.cancel({ turnId: 0 });
+    await Promise.all([first, second]);
+    await ctx.untilTurnEnd();
+
+    expect(persistence.records.filter((record) => record.type === 'turn.cancel')).toHaveLength(1);
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.message.origin?.kind === 'injection' &&
+          record.message.origin.variant === 'turn_outcome',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('persists an active shutdown outcome in the cancellation record', async () => {
+    const persistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({ persistence, generate: abortableGenerate });
+    original.configure();
+    const stepStarted = original.once('turn.step.started');
+    await original.rpc.prompt({ input: [{ type: 'text', text: 'WORK-BEFORE-SHUTDOWN' }] });
+    await stepStarted;
+    void original.agent.turn.shutdown(abortError('Session process stopped'));
+
+    const resumed = testAgent({
+      persistence: crashPrefixThrough(
+        persistence.records,
+        (record) => record.type === 'turn.cancel' && record.outcomeId !== undefined,
+      ),
+      generate: async () => textResult('continued after restart'),
+    });
+    await resumed.agent.resume();
+
+    expect(contextTexts(resumed).match(/interrupted by the runtime/g)).toHaveLength(1);
+    expect(contextTexts(resumed)).toContain('Session process stopped');
+  });
+
+  it('does not duplicate an outcome acknowledgement accepted before its observer throws', async () => {
+    let throwOnce = true;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          throwOnce &&
+          record.type === 'context.append_message' &&
+          record.materializedTurnOutcomeId !== undefined
+        ) {
+          throwOnce = false;
+          throw new Error('outcome observer failed after acceptance');
+        }
+      },
+    });
+    let generateCalls = 0;
+    const ctx = testAgent({
+      persistence,
+      generate: async () => {
+        generateCalls += 1;
+        if (generateCalls === 1) {
+          throw new APIStatusError(500, 'first request failed', 'request-accepted-outcome');
+        }
+        return textResult('follow-up complete');
+      },
+      ...singleAttemptAgentOptions(),
+    });
+    ctx.configure();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FAIL-ONCE-FOR-OUTCOME' }] });
+    await ctx.untilTurnEnd();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'FOLLOW-UP-AFTER-OUTCOME' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.materializedTurnOutcomeId !== undefined,
+      ),
+    ).toHaveLength(1);
+    expect(contextTexts(ctx).match(/API request failed with HTTP 500/g)).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+
+  it('releases the active turn when terminal persistence hits a diagnostic double fault', async () => {
+    const base = new InMemoryAgentRecordPersistence();
+    const persistence: AgentRecordPersistence = {
+      read: () => base.read(),
+      append: (record) => {
+        const isOutcomeIntent = record.type === 'turn.outcome';
+        const isOutcomeReminder =
+          record.type === 'context.append_message' &&
+          record.message.origin?.kind === 'injection' &&
+          record.message.origin.variant === 'turn_outcome';
+        if (isOutcomeIntent || isOutcomeReminder) {
+          throw markAgentRecordAppendError(
+            new Error('terminal record rejected before acceptance'),
+            false,
+          );
+        }
+        base.append(record);
+      },
+      rewrite: (records) => {
+        base.rewrite(records);
+      },
+      flush: () => base.flush(),
+      close: () => base.close(),
+    };
+    const ctx = testAgent({
+      persistence,
+      log: throwingErrorLogger(),
+      generate: async () => ({
+        id: null,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'filtered terminal response' }],
+          toolCalls: [],
+        },
+        usage: {
+          inputOther: 10,
+          output: 5,
+          inputCacheRead: 0,
+          inputCacheCreation: 0,
+        },
+        finishReason: 'filtered',
+        rawFinishReason: 'content_filter',
+      }),
+    });
+    ctx.configure();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'TERMINAL-PERSISTENCE-DOUBLE-FAULT' }] });
+    const ended = await ctx.untilTurnEnd();
+
+    expect(ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({
+          reason: 'failed',
+          error: expect.objectContaining({ code: 'provider.filtered' }),
+        }),
+      }),
+    );
+    expect(ctx.agent.turn.hasActiveTurn).toBe(false);
+    expect(base.records.filter((record) => record.type === 'turn.outcome')).toHaveLength(0);
+    expect(
+      base.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.message.origin?.kind === 'injection' &&
+          record.message.origin.variant === 'turn_outcome',
+      ),
+    ).toHaveLength(0);
+    const resumedGenerate = vi.fn(async () => textResult('must not run'));
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(base.records)),
+      generate: resumedGenerate,
+    });
+    await resumed.agent.resume();
+    expect(resumedGenerate).not.toHaveBeenCalled();
+    expect(contextTexts(resumed)).toBe(contextTexts(ctx));
+  });
+
+  it('still completes a turn when its initial context record observer fails after acceptance', async () => {
+    let throwOnce = true;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          throwOnce &&
+          record.type === 'context.append_message' &&
+          record.consumedTurnInput?.kind === 'prompt'
+        ) {
+          throwOnce = false;
+          throw new Error('initial context observer failed after acceptance');
+        }
+      },
+    });
+    const ctx = testAgent({ persistence });
+    ctx.configure();
+    ctx.mockNextResponse({ type: 'text', text: 'completed despite observer failure' });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'POSTACCEPT-INITIAL-PROMPT' }] });
+    const ended = await ctx.untilTurnEnd();
+
+    expect(ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'completed' }),
+      }),
+    );
+    expect(contextTexts(ctx).match(/POSTACCEPT-INITIAL-PROMPT/g)).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+
+  it('completes a durably accepted prompt after an admission diagnostic double fault', async () => {
+    let throwOnce = true;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (throwOnce && record.type === 'turn.prompt') {
+          throwOnce = false;
+          throw new Error('prompt observer failed after acceptance');
+        }
+      },
+    });
+    const ctx = testAgent({ persistence, log: throwingWarnLogger() });
+    ctx.configure();
+    ctx.mockNextResponse({ type: 'text', text: 'completed after diagnostic double fault' });
+
+    await expect(
+      ctx.rpc.prompt({ input: [{ type: 'text', text: 'POSTACCEPT-PROMPT-DOUBLE-FAULT' }] }),
+    ).resolves.toEqual({ kind: 'started', turnId: 0 });
+    const ended = await ctx.untilTurnEnd();
+
+    expect(ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'completed' }),
+      }),
+    );
+    expect(persistence.records.filter((record) => record.type === 'turn.prompt')).toHaveLength(1);
+    expect(contextTexts(ctx).match(/POSTACCEPT-PROMPT-DOUBLE-FAULT/g)).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+
+  it('reserves launch while materializing an older outcome before prompt admission', async () => {
+    let ctx!: TestAgentContext;
+    let nestedPrompt: number | null | undefined;
+    let nestedCancellation: Promise<void> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          record.type !== 'context.append_message' ||
+          record.materializedTurnOutcomeId !== 'older-outcome'
+        ) {
+          return;
+        }
+        nestedPrompt = ctx.agent.turn.prompt([{ type: 'text', text: 'REENTRANT-PROMPT' }]);
+        nestedCancellation = ctx.agent.turn.cancel();
+      },
+    });
+    ctx = testAgent({ persistence });
+    ctx.configure();
+    ctx.agent.turn.restoreOutcome(
+      'older-outcome',
+      0,
+      'OLDER-OUTCOME-MUST-PRECEDE-THE-NEW-PROMPT',
+    );
+    ctx.mockNextResponse({ type: 'text', text: 'outer completed' });
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'OUTER-PROMPT' }] });
+    await ctx.agent.turn.waitForCurrentTurn();
+    await nestedCancellation;
+
+    expect(nestedPrompt).toBeNull();
+    expect(persistence.records.filter((record) => record.type === 'turn.cancel')).toHaveLength(0);
+    expect(persistence.records.filter((record) => record.type === 'turn.prompt')).toHaveLength(1);
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.materializedTurnOutcomeId === 'older-outcome',
+      ),
+    ).toHaveLength(1);
+    const outcomeIndex = persistence.records.findIndex(
+      (record) =>
+        record.type === 'context.append_message' &&
+        record.materializedTurnOutcomeId === 'older-outcome',
+    );
+    const promptIndex = persistence.records.findIndex((record) => record.type === 'turn.prompt');
+    expect(outcomeIndex).toBeLessThan(promptIndex);
+    expect(contextTexts(ctx).match(/OLDER-OUTCOME-MUST-PRECEDE/g)).toHaveLength(1);
+  });
+
+  it('holds the resume reservation while materializing a recovered outcome', async () => {
+    const originalPersistence = new InMemoryAgentRecordPersistence();
+    const original = testAgent({
+      persistence: originalPersistence,
+      generate: async () => {
+        throw new APIStatusError(500, 'resume barrier failure', 'request-resume-barrier');
+      },
+      ...singleAttemptAgentOptions(),
+    });
+    original.configure();
+    await original.rpc.prompt({ input: [{ type: 'text', text: 'BEFORE-RESUME-BARRIER' }] });
+    await original.untilTurnEnd();
+    const outcomeIndex = originalPersistence.records.findIndex(
+      (record) => record.type === 'turn.outcome',
+    );
+    expect(outcomeIndex).toBeGreaterThanOrEqual(0);
+
+    let resumed!: TestAgentContext;
+    let nestedPrompt: number | null | undefined;
+    let nestedCancellation: Promise<void> | undefined;
+    const persistence = new InMemoryAgentRecordPersistence(
+      structuredClone(originalPersistence.records.slice(0, outcomeIndex + 1)),
+      {
+        onRecord: (record) => {
+          if (
+            record.type !== 'context.append_message' ||
+            record.materializedTurnOutcomeId === undefined
+          ) {
+            return;
+          }
+          nestedPrompt = resumed.agent.turn.prompt([
+            { type: 'text', text: 'REENTRANT-DURING-RESUME' },
+          ]);
+          nestedCancellation = resumed.agent.turn.cancel();
+        },
+      },
+    );
+    resumed = testAgent({ persistence, generate: async () => textResult('must not run') });
+
+    await resumed.agent.resume();
+    await nestedCancellation;
+
+    expect(nestedPrompt).toBeNull();
+    expect(resumed.agent.turn.hasActiveTurn).toBe(false);
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record.materializedTurnOutcomeId !== undefined,
+      ),
+    ).toHaveLength(1);
+    expect(contextTexts(resumed).match(/API request failed with HTTP 500/g)).toHaveLength(1);
+  });
+
+  it('keeps a partial prompt expansion running when re-entrant cancellation is rejected before acceptance', async () => {
+    const providerStarted = createControlledPromise<void>();
+    const providerResult = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let ctx!: TestAgentContext;
+    let cancellation: Promise<void> | undefined;
+    const { base, persistence } = rejectFirstTurnCancelPersistence((record) => {
+      if (record.type === 'context.append_message' && record.turnInputPart?.index === 0) {
+        cancellation = ctx.agent.turn.cancel(record.turnInputPart.consumedTurnInput.turnId);
+      }
+    });
+    ctx = testAgent({
+      persistence,
+      generate: async () => {
+        providerStarted.resolve();
+        return providerResult;
+      },
+    });
+    ctx.configure();
+    const ended = ctx.untilTurnEnd();
+    const caption = buildImageCompressionCaption({
+      original: { width: 3000, height: 2000, byteLength: 500_000, mimeType: 'image/png' },
+      final: { width: 1500, height: 1000, byteLength: 200_000, mimeType: 'image/png' },
+    });
+
+    await ctx.rpc.prompt({
+      input: [{ type: 'text', text: `KEEP-RUNNING-AFTER-REJECTED-CANCEL${caption}` }],
+    });
+    await providerStarted;
+    await expect(cancellation).rejects.toThrow('turn.cancel rejected before acceptance');
+
+    expect(ctx.agent.turn.hasActiveTurn).toBe(true);
+    expect(base.records.filter((record) => record.type === 'turn.cancel')).toHaveLength(0);
+    providerResult.resolve(textResult('completed after rejected cancellation'));
+    expect(await ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'completed' }),
+      }),
+    );
+    expect(contextTexts(ctx)).not.toContain('interrupted the previous turn');
+    expect(base.records.filter((record) => record.type === 'turn.outcome')).toHaveLength(0);
+    const resumedGenerate = vi.fn(async () => textResult('must not run'));
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(base.records)),
+      generate: resumedGenerate,
+    });
+    await resumed.agent.resume();
+    expect(resumedGenerate).not.toHaveBeenCalled();
+    expect(contextTexts(resumed)).toBe(contextTexts(ctx));
+  });
+
+  it('rolls back shutdown when its cancellation record is rejected before acceptance', async () => {
+    const providerStarted = createControlledPromise<void>();
+    const providerResult = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    const { base, persistence } = rejectFirstTurnCancelPersistence();
+    const ctx = testAgent({
+      persistence,
+      generate: async () => {
+        providerStarted.resolve();
+        return providerResult;
+      },
+    });
+    ctx.configure();
+    const ended = ctx.untilTurnEnd();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'KEEP-RUNNING-AFTER-REJECTED-SHUTDOWN' }] });
+    await providerStarted;
+    await ctx.rpc.steer({ input: [{ type: 'text', text: 'PRESERVE-BUFFERED-STEER' }] });
+    await expect(ctx.agent.turn.shutdown(new Error('runtime stopped'))).rejects.toThrow(
+      'turn.cancel rejected before acceptance',
+    );
+
+    expect(ctx.agent.turn.isClosed).toBe(false);
+    expect(ctx.agent.turn.hasActiveTurn).toBe(true);
+    expect(base.records.filter((record) => record.type === 'turn.cancel')).toHaveLength(0);
+    providerResult.resolve(textResult('completed after rejected shutdown'));
+    expect(await ended).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: expect.objectContaining({ reason: 'completed' }),
+      }),
+    );
+    expect(contextTexts(ctx)).not.toContain('interrupted by the runtime');
+    expect(contextTexts(ctx).match(/PRESERVE-BUFFERED-STEER/g)).toHaveLength(1);
+    expect(base.records.filter((record) => record.type === 'turn.outcome')).toHaveLength(0);
+    const resumedGenerate = vi.fn(async () => textResult('must not run'));
+    const resumed = testAgent({
+      persistence: new InMemoryAgentRecordPersistence(structuredClone(base.records)),
+      generate: resumedGenerate,
+    });
+    await resumed.agent.resume();
+    expect(resumedGenerate).not.toHaveBeenCalled();
+    expect(contextTexts(resumed)).toBe(contextTexts(ctx));
+  });
+
+  it('keeps a buffered steer after an admission diagnostic double fault', async () => {
+    const firstResponse = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let throwOnce = true;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (throwOnce && record.type === 'turn.steer') {
+          throwOnce = false;
+          throw new Error('steer observer failed after acceptance');
+        }
+      },
+    });
+    let calls = 0;
+    const ctx = testAgent({
+      persistence,
+      log: throwingWarnLogger(),
+      generate: async () => {
+        calls += 1;
+        return calls === 1 ? firstResponse : textResult('steer handled');
+      },
+    });
+    ctx.configure();
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'STEER-OWNER' }] });
+
+    await expect(
+      ctx.rpc.steer({ input: [{ type: 'text', text: 'POSTACCEPT-BUFFERED-STEER' }] }),
+    ).resolves.toBeUndefined();
+    firstResponse.resolve(textResult('first response'));
+    await ctx.agent.turn.waitForCurrentTurn();
+
+    expect(contextTexts(ctx).match(/POSTACCEPT-BUFFERED-STEER/g)).toHaveLength(1);
+    expect(persistence.records.filter((record) => record.type === 'turn.steer')).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+
+  it('keeps a deferred prompt whose durable admission observer fails afterward', async () => {
+    const compactionResponse = createControlledPromise<Awaited<ReturnType<GenerateFn>>>();
+    let throwOnce = true;
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: (record) => {
+        if (
+          throwOnce &&
+          record.type === 'turn.prompt' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'POSTACCEPT-DEFERRED-PROMPT',
+          )
+        ) {
+          throwOnce = false;
+          throw new Error('deferred prompt observer failed after acceptance');
+        }
+      },
+    });
+    let calls = 0;
+    const ctx = testAgent({
+      persistence,
+      generate: async () => {
+        calls += 1;
+        return calls === 1 ? compactionResponse : textResult('deferred prompt handled');
+      },
+    });
+    ctx.configure();
+    ctx.appendExchange(1, 'old user', 'old assistant', 100);
+    await ctx.rpc.beginCompaction({});
+
+    await expect(
+      ctx.rpc.prompt({ input: [{ type: 'text', text: 'POSTACCEPT-DEFERRED-PROMPT' }] }),
+    ).resolves.toMatchObject({ kind: 'deferred' });
+    const ended = ctx.once('turn.ended');
+    compactionResponse.resolve(textResult('summary'));
+    await ended;
+
+    expect(contextTexts(ctx).match(/POSTACCEPT-DEFERRED-PROMPT/g)).toHaveLength(1);
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'turn.prompt' &&
+          record.input.some(
+            (part) => part.type === 'text' && part.text === 'POSTACCEPT-DEFERRED-PROMPT',
+          ),
+      ),
+    ).toHaveLength(1);
+    await ctx.expectResumeMatches();
+  });
+});
+
+function crashPrefixThrough(
+  records: readonly AgentRecord[],
+  predicate: (record: AgentRecord) => boolean,
+): InMemoryAgentRecordPersistence {
+  const index = records.findIndex(predicate);
+  if (index === -1) throw new Error('crash-prefix boundary not found');
+  return new InMemoryAgentRecordPersistence(structuredClone(records.slice(0, index + 1)));
+}
+
+function contextTexts(ctx: TestAgentContext): string {
+  return ctx.agent.context.history
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n');
+}
+
+function rejectFirstTurnCancelPersistence(
+  onRecord?: (record: AgentRecord) => void,
+): { base: InMemoryAgentRecordPersistence; persistence: AgentRecordPersistence } {
+  const base = new InMemoryAgentRecordPersistence();
+  let rejectCancel = true;
+  const persistence: AgentRecordPersistence = {
+    read: () => base.read(),
+    append: (record) => {
+      if (rejectCancel && record.type === 'turn.cancel') {
+        rejectCancel = false;
+        throw markAgentRecordAppendError(
+          new Error('turn.cancel rejected before acceptance'),
+          false,
+        );
+      }
+      base.append(record);
+      onRecord?.(record);
+    },
+    rewrite: (records) => {
+      base.rewrite(records);
+    },
+    flush: () => base.flush(),
+    close: () => base.close(),
+  };
+  return { base, persistence };
+}

@@ -99,6 +99,9 @@ function stubContextMemory(): IAgentContextMemoryService & {
     append: (...inserted) => {
       messages.push(...inserted);
     },
+    appendTurnOutcome: (message) => {
+      messages.push(message);
+    },
     appendLoopEvent: () => {},
     closeAbandonedToolExchange: () => 0,
     clear: () => {

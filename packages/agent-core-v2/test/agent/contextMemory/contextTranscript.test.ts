@@ -29,6 +29,10 @@ function assistantMessage(text: string): ContextMessage {
   return { role: 'assistant', content: [{ type: 'text', text }], toolCalls: [] };
 }
 
+function turnOutcomeMessage(text: string): ContextMessage {
+  return userMessage(text, { kind: 'injection', variant: 'turn_outcome' });
+}
+
 function appendMessage(message: ContextMessage): WireRecord {
   return { type: 'context.append_message', message };
 }
@@ -50,6 +54,7 @@ function compaction(
   compactedCount: number,
   keptUserMessageCount?: number,
   keptHeadUserMessageCount?: number,
+  keptTurnOutcomeCount?: number,
 ): WireRecord {
   return {
     type: 'context.apply_compaction',
@@ -60,6 +65,7 @@ function compaction(
     tokensAfter: 100,
     ...(keptUserMessageCount === undefined ? {} : { keptUserMessageCount }),
     ...(keptHeadUserMessageCount === undefined ? {} : { keptHeadUserMessageCount }),
+    ...(keptTurnOutcomeCount === undefined ? {} : { keptTurnOutcomeCount }),
   };
 }
 
@@ -120,6 +126,17 @@ describe('reduceContextTranscript', () => {
     expect(result.foldedLength).toBe(4);
   });
 
+  it('accounts for a protected turn outcome separately from real user messages', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('u1')),
+      appendMessage(turnOutcomeMessage('outcome')),
+      appendMessage(userMessage('u2')),
+      compaction('SUM', 3, 2, undefined, 1),
+    ]);
+
+    expect(result.foldedLength).toBe(4);
+  });
+
   it('carries the originating wire record time per entry', () => {
     const result = reduceContextTranscript([
       { type: 'context.append_message', message: userMessage('u1'), time: 100 },
@@ -172,7 +189,44 @@ describe('reduceContextTranscript', () => {
     expect(texts(result)).toEqual(['message A', 'reply A']);
   });
 
-  it('undo stops at a compaction summary', () => {
+  it('removes a turn outcome reminder when its user prompt is undone', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('message A')),
+      appendMessage(turnOutcomeMessage('outcome A')),
+      undo(1),
+    ]);
+
+    expect(texts(result)).toEqual([]);
+    expect(result.foldedLength).toBe(0);
+  });
+
+  it('keeps the preceding turn outcome reminder when only the latest prompt is undone', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('message A')),
+      appendMessage(turnOutcomeMessage('outcome A')),
+      appendMessage(userMessage('message B')),
+      appendMessage(turnOutcomeMessage('outcome B')),
+      undo(1),
+    ]);
+
+    expect(texts(result)).toEqual(['message A', 'outcome A']);
+    expect(result.foldedLength).toBe(2);
+  });
+
+  it('removes the full two-turn tail when undoing two prompts', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('message A')),
+      appendMessage(turnOutcomeMessage('outcome A')),
+      appendMessage(userMessage('message B')),
+      appendMessage(turnOutcomeMessage('outcome B')),
+      undo(2),
+    ]);
+
+    expect(texts(result)).toEqual([]);
+    expect(result.foldedLength).toBe(0);
+  });
+
+  it('leaves the transcript unchanged when the requested undo crosses a compaction boundary', () => {
     const result = reduceContextTranscript([
       appendMessage(userMessage('old')),
       compaction('SUM', 1, 1),
@@ -180,7 +234,9 @@ describe('reduceContextTranscript', () => {
       appendMessage(assistantMessage('answer')),
       undo(2),
     ]);
-    expect(texts(result)).toEqual(['old', 'SUM']);
+
+    expect(texts(result)).toEqual(['old', 'SUM', 'recent', 'answer']);
+    expect(result.foldedLength).toBe(4);
   });
 
   it('clear keeps prior transcript entries but resets the folded view', () => {
@@ -204,6 +260,19 @@ describe('reduceContextTranscript', () => {
     ]);
     expect(texts(result)).toEqual(['u1']);
     expect(result.foldedLength).toBe(0);
+  });
+
+  it('leaves the transcript unchanged when the requested undo crosses a clear floor', () => {
+    const result = reduceContextTranscript([
+      appendMessage(userMessage('u1')),
+      { type: 'context.clear' },
+      appendMessage(userMessage('u2')),
+      appendMessage(assistantMessage('a2')),
+      undo(2),
+    ]);
+
+    expect(texts(result)).toEqual(['u1', 'u2', 'a2']);
+    expect(result.foldedLength).toBe(2);
   });
 
   it('folds tool calls and results from loop events', () => {

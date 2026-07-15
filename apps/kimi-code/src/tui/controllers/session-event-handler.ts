@@ -260,7 +260,7 @@ export class SessionEventHandler {
       case 'goal.updated': this.handleGoalUpdated(event); break;
       case 'skill.activated': this.handleSkillActivated(event); break;
       case 'plugin_command.activated': this.handlePluginCommandActivated(event); break;
-      case 'error': this.handleSessionError(event); break;
+      case 'error': this.handleSessionError(event, sendQueued); break;
       case 'warning': this.handleSessionWarning(event); break;
       case 'compaction.started': this.handleCompactionBegin(event); break;
       case 'compaction.completed': this.handleCompactionEnd(event, sendQueued); break;
@@ -851,10 +851,24 @@ export class SessionEventHandler {
     }
   }
 
-  private handleSessionError(event: ErrorEvent): void {
+  private handleSessionError(
+    event: ErrorEvent,
+    sendQueued: (item: QueuedMessage) => void,
+  ): void {
     this.host.streamingUI.flushNow();
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.finalizeLiveTextBuffers('idle');
+    if (
+      this.host.state.appState.isCompacting &&
+      (event.code.startsWith('compaction.') ||
+        event.code === 'auth.login_required' ||
+        event.code === 'provider.auth_error')
+    ) {
+      // Pre-commit compaction failures have no completed/cancelled terminal:
+      // the error event itself is the terminal signal for the UI.
+      this.host.streamingUI.failCompaction();
+      this.finishCompaction(sendQueued);
+    }
     if (event.code === OAUTH_LOGIN_REQUIRED_CODE) {
       this.host.showError(OAUTH_LOGIN_REQUIRED_STARTUP_NOTICE);
       return;
@@ -1012,7 +1026,13 @@ export class SessionEventHandler {
   private finishCompaction(sendQueued: (item: QueuedMessage) => void): void {
     const hasActiveTurn = this.host.streamingUI.hasActiveTurn();
     if (!hasActiveTurn) {
-      const next = this.host.shiftQueuedMessage();
+      // Auto-compaction failures terminate the owning turn first and emit the
+      // compaction error second. finalizeTurn may therefore have already
+      // removed and scheduled one queued message; never drain a second item for
+      // the same terminal sequence.
+      const next = this.host.state.queuedMessageDispatchPending
+        ? undefined
+        : this.host.shiftQueuedMessage();
       if (next !== undefined) {
         this.host.state.queuedMessageDispatchPending = true;
       }

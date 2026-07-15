@@ -40,6 +40,7 @@ import {
   sanitizeToolCallId,
   type ToolCallIdPolicy,
 } from './tool-call-id';
+import { cancelNativeStream } from './stream-cancellation';
 export interface KimiOptions {
   apiKey?: string | undefined;
   baseUrl?: string | undefined;
@@ -251,11 +252,13 @@ class KimiStreamedMessage implements StreamedMessage {
   private _finishReason: FinishReason | null = null;
   private _rawFinishReason: string | null = null;
   private readonly _iter: AsyncGenerator<StreamedMessagePart>;
+  private readonly _nativeStream: unknown;
 
   constructor(
     response: OpenAI.Chat.ChatCompletion | AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
     isStream: boolean,
   ) {
+    this._nativeStream = isStream ? response : undefined;
     if (isStream) {
       this._iter = this._convertStreamResponse(
         response as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
@@ -279,6 +282,10 @@ class KimiStreamedMessage implements StreamedMessage {
 
   get rawFinishReason(): string | null {
     return this._rawFinishReason;
+  }
+
+  cancel(): void {
+    cancelNativeStream(this._nativeStream);
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {

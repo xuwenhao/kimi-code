@@ -14,6 +14,8 @@ import { IAgentTaskService } from '#/agent/task/task';
 import { IAgentPlanService } from '#/agent/plan/plan';
 import { IAgentPromptService } from '#/agent/prompt/prompt';
 import { TurnModel } from '#/agent/loop/turnOps';
+import { CompactionModel } from '#/agent/fullCompaction/compactionOps';
+import { IAgentContextInjectorService } from '#/agent/contextInjector/contextInjector';
 import { IWireService } from '#/wire/wire';
 import {
   createAgentTaskPersistence,
@@ -429,6 +431,195 @@ describe('Agent resume', () => {
         origin: { kind: 'compaction_summary' },
       }),
     ]);
+  });
+
+  it('converges a committed compaction crash prefix without cancelling the summary', async () => {
+    const persistence = new RecordingAgentPersistence([
+      resumeConfigRecord(),
+      contextAppendRecord(0, [
+        { role: 'user', text: 'Historical prompt', origin: { kind: 'user' } },
+      ]),
+      { type: 'full_compaction.begin', source: 'manual' },
+      {
+        type: 'context.apply_compaction',
+        summary: 'Durably committed summary.',
+        compactedCount: 1,
+        tokensBefore: 120,
+        tokensAfter: 24,
+      },
+    ] as unknown as WireRecord[]);
+    const ctx = testAgent({ persistence, autoConfigure: false });
+
+    await ctx.restorePersisted();
+    await ctx.get(IWireService).flush();
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(ctx.context.get().map(textContent)).toContain('Durably committed summary.');
+    expect(persistence.appended.filter((record) => record.type === 'full_compaction.complete')).toHaveLength(1);
+    expect(persistence.appended.some((record) => record.type === 'full_compaction.cancel')).toBe(false);
+    expect(ctx.allEvents.some((event) => event.event === 'compaction.cancelled')).toBe(false);
+    expect(ctx.allEvents.some((event) => event.event === 'compaction.completed')).toBe(false);
+  });
+
+  it('marks a stranded pre-commit compaction as failed on replay', async () => {
+    const persistence = new RecordingAgentPersistence([
+      resumeConfigRecord(),
+      contextAppendRecord(0, [
+        { role: 'user', text: 'Historical prompt', origin: { kind: 'user' } },
+      ]),
+      { type: 'full_compaction.begin', source: 'manual' },
+    ] as unknown as WireRecord[]);
+    const ctx = testAgent({ persistence, autoConfigure: false });
+
+    await ctx.restorePersisted();
+    await ctx.get(IWireService).flush();
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(
+      persistence.appended.filter(
+        (record) =>
+          record.type === 'full_compaction.complete' && record['outcome'] === 'failed',
+      ),
+    ).toHaveLength(1);
+    expect(persistence.appended.some((record) => record.type === 'full_compaction.cancel')).toBe(false);
+    expect(ctx.context.get().map(textContent)).toEqual(['Historical prompt']);
+    expect(ctx.allEvents.some((event) => event.event === 'compaction.cancelled')).toBe(false);
+    expect(ctx.allEvents.some((event) => event.event === 'compaction.completed')).toBe(false);
+  });
+
+  it('retries failed post-commit maintenance before the first resumed model request', async () => {
+    const persistence = new RecordingAgentPersistence([
+      resumeConfigRecord(),
+      contextAppendRecord(0, [
+        { role: 'user', text: 'Historical prompt', origin: { kind: 'user' } },
+      ]),
+      { type: 'full_compaction.begin', source: 'manual' },
+      {
+        type: 'context.apply_compaction',
+        summary: 'Durably committed summary.',
+        compactedCount: 1,
+        tokensBefore: 120,
+        tokensAfter: 24,
+      },
+    ] as unknown as WireRecord[]);
+    const ctx = testAgent({ persistence, autoConfigure: false });
+    const inject = vi
+      .spyOn(ctx.get(IAgentContextInjectorService), 'injectAfterCompaction')
+      .mockRejectedValueOnce(new Error('transient reinjection failure'))
+      .mockResolvedValue(undefined);
+
+    await ctx.restorePersisted();
+    await ctx.get(IWireService).flush();
+
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('committed');
+    expect(persistence.appended.some((record) => record.type === 'full_compaction.complete')).toBe(false);
+
+    ctx.mockNextResponse({ type: 'text', text: 'Continued after recovery.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
+    await ctx.untilTurnEnd();
+    await ctx.get(IWireService).flush();
+
+    expect(inject).toHaveBeenCalledTimes(2);
+    expect(ctx.get(IWireService).getModel(CompactionModel).phase).toBe('idle');
+    expect(persistence.appended.filter((record) => record.type === 'full_compaction.complete')).toHaveLength(1);
+    expect(persistence.appended.some((record) => record.type === 'full_compaction.cancel')).toBe(false);
+    expect(persistence.appended.findIndex((record) => record.type === 'full_compaction.complete'))
+      .toBeLessThan(persistence.appended.findIndex((record) => record.type === 'llm.request'));
+    expect(ctx.llmCalls.at(-1)!.history.map(textContent)).toContain(
+      'Durably committed summary.',
+    );
+  });
+
+  it('materializes a cancellation intent once after a crash and before the follow-up prompt', async () => {
+    const outcomeId = 'cancel-outcome-0';
+    const outcomeContent = 'The user interrupted the previous turn before it finished.';
+    const persistence = new RecordingAgentPersistence([
+      resumeConfigRecord(),
+      contextAppendRecord(0, [
+        { role: 'user', text: 'Do the long-running work.', origin: { kind: 'user' } },
+      ]),
+      turnPromptRecord(0, { kind: 'user' }),
+      {
+        type: 'turn.cancel',
+        turnId: 0,
+        outcomeId,
+        outcomeTurnId: 0,
+        outcomeContent,
+      },
+    ] as unknown as WireRecord[]);
+    const ctx = testAgent({ persistence, autoConfigure: false });
+
+    await ctx.restorePersisted();
+    await ctx.get(IWireService).flush();
+
+    expect(ctx.get(IWireService).getModel(TurnModel).pendingOutcomes).toEqual([]);
+    expect(
+      persistence.appended.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record['materializedTurnOutcomeId'] === outcomeId,
+      ),
+    ).toHaveLength(1);
+
+    ctx.mockNextResponse({ type: 'text', text: 'Continued safely.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
+    await ctx.untilTurnEnd();
+
+    const followUpHistory = ctx.llmCalls.at(-1)!.history;
+    expect(followUpHistory.filter((message) => textContent(message).includes(outcomeContent))).toHaveLength(1);
+    expect(followUpHistory.map(textContent)).toEqual([
+      'Do the long-running work.',
+      `<system-reminder>\n${outcomeContent}\n</system-reminder>`,
+      'Continue.',
+    ]);
+
+    const replayPersistence = new RecordingAgentPersistence(persistence.records);
+    const replay = testAgent({ persistence: replayPersistence, autoConfigure: false });
+    await replay.restorePersisted();
+    await replay.get(IWireService).flush();
+
+    expect(
+      replayPersistence.appended.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record['materializedTurnOutcomeId'] === outcomeId,
+      ),
+    ).toHaveLength(0);
+    expect(
+      replay.context.get().filter((message) => textContent(message).includes(outcomeContent)),
+    ).toHaveLength(1);
+  });
+
+  it('materializes a failed-turn intent after a crash for the next prompt', async () => {
+    const outcomeId = 'failed-outcome-0';
+    const outcomeContent = 'The previous turn failed with HTTP 500 before producing a response.';
+    const persistence = new RecordingAgentPersistence([
+      resumeConfigRecord(),
+      contextAppendRecord(0, [
+        { role: 'user', text: 'Investigate the failure.', origin: { kind: 'user' } },
+      ]),
+      turnPromptRecord(0, { kind: 'user' }),
+      { type: 'turn.outcome', outcomeId, turnId: 0, content: outcomeContent },
+    ] as unknown as WireRecord[]);
+    const ctx = testAgent({ persistence, autoConfigure: false });
+
+    await ctx.restorePersisted();
+    await ctx.get(IWireService).flush();
+    ctx.mockNextResponse({ type: 'text', text: 'Recovered.' });
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Continue.' }] });
+    await ctx.untilTurnEnd();
+
+    expect(ctx.get(IWireService).getModel(TurnModel).pendingOutcomes).toEqual([]);
+    expect(
+      persistence.records.filter(
+        (record) =>
+          record.type === 'context.append_message' &&
+          record['materializedTurnOutcomeId'] === outcomeId,
+      ),
+    ).toHaveLength(1);
+    expect(
+      ctx.llmCalls.at(-1)!.history.filter((message) => textContent(message).includes(outcomeContent)),
+    ).toHaveLength(1);
   });
 
 

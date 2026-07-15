@@ -975,6 +975,18 @@ export class BackgroundManager {
     entry: ManagedTask,
     settlement: BackgroundTaskSettlement,
   ): Promise<void> {
+    // Process tasks settle after their streams have drained (up to the
+    // process-task grace boundary), but output.log appends are intentionally
+    // serialized on a separate queue. Drain the writes already queued at
+    // settlement before exposing a terminal status or persisting terminal
+    // metadata. A later chunk from a stream that outlives the drain grace is
+    // outside this snapshot and keeps the existing bounded-late-output
+    // behavior.
+    if (this.persistence !== undefined && entry.outputPersistStarted) {
+      const queuedOutputWrites = entry.outputWriteQueue;
+      await queuedOutputWrites;
+    }
+
     entry.status = settlement.status;
     entry.endedAt = Date.now();
     entry.stopReason =

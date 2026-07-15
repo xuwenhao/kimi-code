@@ -12,14 +12,23 @@ export const COMPACTION_SUMMARY_PREFIX = summaryPrefixTemplate.trimEnd();
 export const COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000;
 export const COMPACT_USER_MESSAGE_HEAD_TOKENS = 2_000;
 export const COMPACTION_ELISION_VARIANT = 'compaction_elision';
+export const TURN_OUTCOME_VARIANT = 'turn_outcome';
+
+const COMPACTION_SOURCE_INDEX = Symbol('compactionSourceIndex');
 
 type MessageLike = ContextMessage;
+type IndexedMessage = ContextMessage & { readonly [COMPACTION_SOURCE_INDEX]: number };
 
 export interface CompactionUserSelection<T> {
   readonly head: T[];
   readonly tail: T[];
   readonly elided: boolean;
   readonly omittedTokens: number;
+}
+
+export interface CompactionTurnOutcome {
+  readonly index: number;
+  readonly message: ContextMessage;
 }
 
 export interface ContextCompactionShapeInput {
@@ -31,6 +40,7 @@ export interface ContextCompactionShapeInput {
   readonly tokensAfter?: number;
   readonly keptUserMessageCount?: number;
   readonly keptHeadUserMessageCount?: number;
+  readonly keptTurnOutcomeCount?: number;
   readonly droppedCount?: number;
   readonly legacyTail?: boolean;
 }
@@ -43,6 +53,7 @@ export interface ContextCompactionShape {
   readonly tokensAfter: number;
   readonly keptUserMessageCount: number;
   readonly keptHeadUserMessageCount?: number;
+  readonly keptTurnOutcomeCount?: number;
   readonly droppedCount?: number;
   readonly messages: readonly ContextMessage[];
 }
@@ -64,19 +75,19 @@ export function buildContextCompactionShape(
       tokensBefore: input.tokensBefore,
       tokensAfter: input.tokensAfter ?? estimateTokensForMessages(messages),
       keptUserMessageCount: 0,
+      keptTurnOutcomeCount: input.keptTurnOutcomeCount,
       droppedCount: input.droppedCount,
       messages,
     };
   }
 
-  const compactableUserMessages = collectCompactableUserMessages(history);
+  const compactableUserMessages = collectIndexedCompactableUserMessages(history);
   const selection = selectCompactionUserMessages(compactableUserMessages);
   const elisionMessage = selection.elided
     ? createCompactionElisionMessage(selection.omittedTokens)
     : undefined;
-  const keptMessages = elisionMessage === undefined
-    ? [...selection.head, ...selection.tail]
-    : [...selection.head, elisionMessage, ...selection.tail];
+  const turnOutcome = latestTurnOutcomeAfterLastAssistant(history);
+  const keptMessages = mergeCompactionHandoff(selection, elisionMessage, turnOutcome);
   const contextSummary = input.contextSummary ?? input.summary;
   const tokensAfter =
     input.tokensAfter ?? estimateTokens(contextSummary) + estimateTokensForMessages(keptMessages);
@@ -93,6 +104,7 @@ export function buildContextCompactionShape(
     tokensAfter,
     keptUserMessageCount,
     keptHeadUserMessageCount,
+    keptTurnOutcomeCount: turnOutcome === undefined ? undefined : 1,
     droppedCount: input.droppedCount,
     messages: [...keptMessages, createCompactionSummaryMessage(contextSummary)],
   };
@@ -133,6 +145,30 @@ export function collectCompactableUserMessages<T extends MessageLike>(messages: 
   return messages.filter(
     (message) => isRealUserInput(message) && !isCompactionSummaryMessage(message),
   );
+}
+
+export function latestTurnOutcomeAfterLastAssistant(
+  messages: readonly ContextMessage[],
+): CompactionTurnOutcome | undefined {
+  let lastAssistantIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === 'assistant' && message.origin === undefined) {
+      lastAssistantIndex = index;
+      break;
+    }
+  }
+  for (let index = messages.length - 1; index > lastAssistantIndex; index--) {
+    const message = messages[index];
+    if (
+      message?.role === 'user' &&
+      message.origin?.kind === 'injection' &&
+      message.origin.variant === TURN_OUTCOME_VARIANT
+    ) {
+      return { index, message };
+    }
+  }
+  return undefined;
 }
 
 export function isCompactionSummaryMessage(message: MessageLike): boolean {
@@ -258,6 +294,57 @@ export function selectCompactionUserMessages<T extends MessageLike>(
 
 function usesLegacyTailShape(input: ContextCompactionShapeInput): boolean {
   return input.legacyTail === true;
+}
+
+function collectIndexedCompactableUserMessages(
+  history: readonly ContextMessage[],
+): IndexedMessage[] {
+  const messages: IndexedMessage[] = [];
+  history.forEach((message, index) => {
+    if (!isRealUserInput(message) || isCompactionSummaryMessage(message)) return;
+    messages.push({ ...message, [COMPACTION_SOURCE_INDEX]: index });
+  });
+  return messages;
+}
+
+function mergeCompactionHandoff(
+  selection: CompactionUserSelection<IndexedMessage>,
+  elisionMessage: ContextMessage | undefined,
+  turnOutcome: CompactionTurnOutcome | undefined,
+): ContextMessage[] {
+  const head = [...selection.head];
+  const tail = [...selection.tail];
+  if (turnOutcome !== undefined) {
+    const headInsertAt = head.findIndex(
+      (message) => message[COMPACTION_SOURCE_INDEX] > turnOutcome.index,
+    );
+    if (headInsertAt >= 0) {
+      head.splice(headInsertAt, 0, withSourceIndex(turnOutcome.message, turnOutcome.index));
+    } else {
+      const tailInsertAt = tail.findIndex(
+        (message) => message[COMPACTION_SOURCE_INDEX] > turnOutcome.index,
+      );
+      tail.splice(
+        tailInsertAt < 0 ? tail.length : tailInsertAt,
+        0,
+        withSourceIndex(turnOutcome.message, turnOutcome.index),
+      );
+    }
+  }
+  const indexed = elisionMessage === undefined
+    ? [...head, ...tail]
+    : [...head, elisionMessage, ...tail];
+  return indexed.map(stripSourceIndex);
+}
+
+function withSourceIndex(message: ContextMessage, index: number): IndexedMessage {
+  return { ...message, [COMPACTION_SOURCE_INDEX]: index };
+}
+
+function stripSourceIndex(message: ContextMessage | IndexedMessage): ContextMessage {
+  const { [COMPACTION_SOURCE_INDEX]: _index, ...plain } = message as IndexedMessage;
+  void _index;
+  return plain;
 }
 
 function extractText(content: readonly ContentPart[]): string {

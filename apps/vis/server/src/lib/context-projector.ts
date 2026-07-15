@@ -501,8 +501,14 @@ export function projectContext(
       case 'metadata':
       case 'forked':
       case 'turn.prompt':
+      case 'turn.deferred_prompt_started':
       case 'turn.steer':
       case 'turn.cancel':
+      case 'turn.input_consumed':
+      // A turn outcome is durable intent, not context by itself. Recovery
+      // materializes it later as a context.append_message record; projecting
+      // both would expose the reminder too early and then duplicate it.
+      case 'turn.outcome':
       case 'permission.record_approval_result':
       case 'full_compaction.begin':
       case 'full_compaction.cancel':

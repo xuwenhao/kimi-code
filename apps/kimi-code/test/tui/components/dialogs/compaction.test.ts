@@ -56,6 +56,20 @@ describe('CompactionComponent', () => {
     }
   });
 
+  it('stops the progress animation and renders a failed terminal', () => {
+    const component = new CompactionComponent();
+
+    try {
+      component.markFailed();
+
+      const output = component.render(80).map(strip).join('\n');
+      expect(output).toContain('Compaction failed');
+      expect(output).not.toContain('Compacting context');
+    } finally {
+      component.dispose();
+    }
+  });
+
   it('renders a cancelled terminal state', () => {
     const component = new CompactionComponent();
 

@@ -92,6 +92,11 @@ export type FinishReason =
  */
 export interface StreamedMessage {
   [Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart>;
+  /**
+   * Requests best-effort cancellation of provider-owned transport resources.
+   * Implementations must return promptly and must not wait for stream cleanup.
+   */
+  cancel?(): void;
   /** Provider-assigned response identifier, or `null` if not available. */
   readonly id: string | null;
   /** Token usage statistics, populated after the stream completes. */
@@ -127,8 +132,9 @@ export interface GenerateOptions {
    * An {@link AbortSignal} that, when aborted, requests cancellation of the
    * in-flight generate call. Providers that accept a signal will forward it
    * to their underlying HTTP client; the generate loop in
-   * {@link generate | generate()} also checks the signal between streamed
-   * parts.
+   * {@link generate | generate()} also makes the signal authoritative while
+   * waiting for the provider request, each streamed `next()`, and
+   * `onMessagePart` callbacks.
    */
   signal?: AbortSignal;
   /**

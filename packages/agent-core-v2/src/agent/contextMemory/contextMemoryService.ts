@@ -82,6 +82,14 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
     this.publishSplice({ start, deleteCount: 0, messages: [...messages] });
   }
 
+  appendTurnOutcome(message: ContextMessage, outcomeId: string): void {
+    const start = this.get().length;
+    this.wire.dispatch(
+      contextAppendMessage({ message, materializedTurnOutcomeId: outcomeId }),
+    );
+    this.publishSplice({ start, deleteCount: 0, messages: [message] });
+  }
+
   appendLoopEvent(event: LoopRecordedEvent): void {
     this.wire.dispatch(contextAppendLoopEvent({ event }));
   }
@@ -111,7 +119,9 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
 
   clear(): void {
     const deleteCount = this.get().length;
-    if (deleteCount === 0) return;
+    // Persist even for an empty transcript: context.clear is also the durable
+    // tombstone for a cancellation/failure outcome intent that may have been
+    // written immediately before its reminder append.
     this.wire.dispatch(contextClear({}), contextSizeMeasured({ length: 0, tokens: 0 }));
     this.publishSplice({ start: 0, deleteCount, messages: [] });
   }
@@ -142,6 +152,7 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
         tokensAfter: result.tokensAfter,
         keptUserMessageCount: result.keptUserMessageCount,
         keptHeadUserMessageCount: result.keptHeadUserMessageCount,
+        keptTurnOutcomeCount: result.keptTurnOutcomeCount,
         droppedCount: result.droppedCount,
       }),
       contextSizeMeasured({ length: result.messages.length, tokens: result.tokensAfter }),

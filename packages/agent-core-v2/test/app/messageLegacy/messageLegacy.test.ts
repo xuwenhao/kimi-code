@@ -1,3 +1,9 @@
+/**
+ * Legacy message-list projection contracts over reduced wire transcripts.
+ * Uses in-memory scope/service boundaries and verifies pagination and filtering.
+ * Run: pnpm --dir packages/agent-core-v2 exec vitest run test/app/messageLegacy/messageLegacy.test.ts
+ */
+
 import { describe, expect, it } from 'vitest';
 
 import { toDisposable } from '#/_base/di/lifecycle';
@@ -19,6 +25,13 @@ import { MessageLegacyService } from '#/app/messageLegacy/messageLegacyService';
 
 function textMessage(role: ContextMessage['role'], text: string): ContextMessage {
   return { role, content: [{ type: 'text', text }], toolCalls: [] };
+}
+
+function turnOutcomeMessage(text: string): ContextMessage {
+  return {
+    ...textMessage('user', text),
+    origin: { kind: 'injection', variant: 'turn_outcome' },
+  };
 }
 
 function buildService(opts: {
@@ -122,6 +135,22 @@ describe('MessageLegacyService', () => {
     expect(page.items.map((m) => m.role)).toEqual(['assistant', 'user']);
     expect(page.items[1]?.content[0]).toEqual({ type: 'text', text: 'hi' });
     expect(page.has_more).toBe(false);
+  });
+
+  it('omits a stale turn outcome reminder after its user prompt is undone', async () => {
+    const svc = buildService({
+      summary,
+      records: [
+        { type: 'context.append_message', message: textMessage('user', 'message A') },
+        { type: 'context.append_message', message: turnOutcomeMessage('outcome A') },
+        { type: 'context.undo', count: 1 },
+      ],
+      contextMessages: [],
+    });
+
+    const page = await svc.list('s1', {});
+
+    expect(page.items).toEqual([]);
   });
 
   it('throws session.not_found for an unknown session id', async () => {

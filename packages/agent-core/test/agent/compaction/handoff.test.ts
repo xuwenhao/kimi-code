@@ -192,6 +192,39 @@ describe('collectCompactableUserMessages', () => {
 
     expect(collectCompactableUserMessages(messages).map(messageText)).toEqual(['u1', 'u2']);
   });
+
+  it('keeps only the latest turn outcome until a real model assistant has seen it', () => {
+    const oldOutcome = {
+      ...textMessage('user', 'old outcome'),
+      origin: { kind: 'injection' as const, variant: 'turn_outcome' },
+    };
+    const latestOutcome = {
+      ...textMessage('user', 'latest outcome'),
+      origin: { kind: 'injection' as const, variant: 'turn_outcome' },
+    };
+    const hookBlock = {
+      ...textMessage('assistant', 'blocked without a request'),
+      origin: { kind: 'hook_result' as const, event: 'UserPromptSubmit', blocked: true },
+    };
+    const messages = [
+      { ...textMessage('user', 'u1'), origin: { kind: 'user' as const } },
+      oldOutcome,
+      latestOutcome,
+      hookBlock,
+      { ...textMessage('user', 'u2'), origin: { kind: 'user' as const } },
+    ];
+
+    expect(collectCompactableUserMessages(messages).map(messageText)).toEqual([
+      'u1',
+      'latest outcome',
+      'u2',
+    ]);
+    expect(
+      collectCompactableUserMessages([...messages, textMessage('assistant', 'model reply')]).map(
+        messageText,
+      ),
+    ).toEqual(['u1', 'u2']);
+  });
 });
 
 describe('selectRecentUserMessages', () => {
@@ -342,6 +375,27 @@ describe('selectCompactionUserMessages', () => {
     expect(estimateTokens(tailText)).toBeLessThanOrEqual(333);
     expect(/^(?:😀)*$/u.test(tailText)).toBe(true);
     expect(tailText.length % 2).toBe(0);
+  });
+
+  it('keeps a complete unseen turn outcome outside the budget of an oversized follow-up', () => {
+    const old = { ...textMessage('user', 'o'.repeat(1_000)), origin: { kind: 'user' as const } };
+    const outcome = {
+      ...textMessage('user', 'FULL-INTERRUPTION-REMINDER'),
+      origin: { kind: 'injection' as const, variant: 'turn_outcome' },
+    };
+    const followUp = {
+      ...textMessage('user', 'f'.repeat(10_000)),
+      origin: { kind: 'user' as const },
+    };
+    const compactable = collectCompactableUserMessages([old, outcome, followUp]);
+
+    const selection = selectCompactionUserMessages(compactable, 1_000, 100);
+    const kept = [...selection.head, ...selection.tail];
+
+    expect(kept.filter((message) => message.origin?.kind === 'injection')).toEqual([outcome]);
+    expect(messageText(kept.find((message) => message.origin?.kind === 'injection')!)).toBe(
+      'FULL-INTERRUPTION-REMINDER',
+    );
   });
 });
 

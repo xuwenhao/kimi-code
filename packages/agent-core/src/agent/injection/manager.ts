@@ -72,8 +72,9 @@ export class InjectionManager {
    * started them and their status updates, so without this the model can forget
    * a task is running and spawn a duplicate. Appended as an `injection`-origin
    * reminder, so the next compaction drops and rebuilds it — kept fresh, never
-   * stacked. Runs only on the live path: restore replays the persisted reminder
-   * and `FullCompaction.begin` short-circuits before compaction there.
+   * stacked. A crash after context application can rerun this boundary during
+   * compaction recovery; that path deduplicates already-durable reminders before
+   * appending anything missing.
    */
   private injectActiveBackgroundTasks(): void {
     const tasks = this.agent.background.list(true);

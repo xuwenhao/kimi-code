@@ -33,7 +33,10 @@ export function isUserCancellation(value: unknown): value is UserCancellationErr
 }
 
 export function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(abortReason(signal));
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    return Promise.reject(abortReason(signal));
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => {
       reject(abortReason(signal));

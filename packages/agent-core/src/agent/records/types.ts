@@ -6,7 +6,7 @@ import type { MCPToolDefinition } from '../../mcp/types';
 import type { ToolStoreUpdate } from '../../tools/store';
 import type { CompactionBeginData, CompactionResult } from '../compaction';
 import type { AgentConfigUpdateData } from '../config';
-import type { ContextMessage, PromptOrigin } from '../context';
+import type { ContextMessage, PromptOrigin, TurnInputConsumption } from '../context';
 import type { PermissionApprovalResultRecord, PermissionMode } from '../permission';
 import type { McpToolCollision, UserToolRegistration } from '../tool';
 import type { UsageRecordScope } from '../usage';
@@ -44,12 +44,48 @@ export interface AgentRecordEvents {
   'turn.prompt': {
     input: readonly ContentPart[];
     origin: PromptOrigin;
+    /** Stable identity used to acknowledge this admission atomically with context. */
+    admissionId?: string;
+    /** Allocated immediately for a prompt that starts without being deferred. */
+    turnId?: number;
+    /** Durable identity for a prompt accepted while manual compaction is active. */
+    deferredPromptId?: string;
+    /** Optional caller correlation echoed when the prompt eventually starts. */
+    promptId?: string;
+  };
+  'turn.deferred_prompt_started': {
+    deferredPromptId: string;
+    turnId: number;
   };
   'turn.steer': {
     input: readonly ContentPart[];
     origin: PromptOrigin;
+    /** Stable identity used to acknowledge this admission atomically with context. */
+    admissionId?: string;
+    /** Allocated immediately when an idle steer starts a standalone turn. */
+    turnId?: number;
+    /** Prompt that owns a queued steer. Absent for background/cron notifications. */
+    expectedPromptId?: string;
+    /** Fallback owner for ordinary SDK prompts that omit promptId. */
+    ownerTurnId?: number;
+    /** Fallback owner while such a prompt is deferred behind compaction. */
+    ownerDeferredPromptId?: string;
   };
-  'turn.cancel': { turnId?: number };
+  'turn.cancel': {
+    turnId?: number;
+    /** Durable owner used to discard only that prompt's unconsumed steers on replay. */
+    promptId?: string;
+    ownerTurnId?: number;
+    ownerDeferredPromptId?: string;
+    /** Cancellation reminder intent, committed atomically with the cancel. */
+    outcomeId?: string;
+    outcomeTurnId?: number;
+    outcomeContent?: string;
+    /** Incomplete multi-record prompt/steer expansions tombstoned by this cancel. */
+    cancelledTurnInputs?: readonly TurnInputConsumption[];
+  };
+  /** Failure/cancellation reminder intent, materialized by a context record. */
+  'turn.outcome': { outcomeId: string; turnId: number; content: string };
 
   'config.update': AgentConfigUpdateData;
 
@@ -93,7 +129,17 @@ export interface AgentRecordEvents {
   'full_compaction.complete': {};
   'micro_compaction.apply': { cutoff: number };
 
-  'context.append_message': { message: ContextMessage };
+  'context.append_message': {
+    message: ContextMessage;
+    /** Admission consumed by this exact, durable context mutation. */
+    consumedTurnInput?: TurnInputConsumption;
+    /** Stable child identity for a multi-message prompt expansion. */
+    turnInputPart?: { consumedTurnInput: TurnInputConsumption; index: number };
+    /** Durable acknowledgement that a turn outcome reminder reached context. */
+    materializedTurnOutcomeId?: string;
+  };
+  /** Consumption marker for an accepted empty input, which has no message to append. */
+  'turn.input_consumed': { consumedTurnInput: TurnInputConsumption };
   'context.append_loop_event': { event: LoopRecordedEvent };
   'context.clear': {};
   'context.apply_compaction': CompactionResult;
@@ -212,6 +258,12 @@ export type AgentRecordOf<K extends keyof AgentRecordEvents> = Extract<
 
 export interface AgentRecordPersistence {
   read(): AsyncIterable<AgentRecord>;
+  /**
+   * Accept a record into the implementation's durable-write queue. When an
+   * implementation can throw on either side of that boundary, tag the error
+   * with `markAgentRecordAppendError(error, accepted)` so terminal writers can
+   * distinguish a safe retry from an already-accepted append.
+   */
   append(input: AgentRecord): void;
   rewrite(records: readonly AgentRecord[]): void;
   flush(): Promise<void>;

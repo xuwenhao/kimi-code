@@ -1,8 +1,16 @@
+/**
+ * Foreground and background subagent lifecycle contracts through
+ * SessionSubagentHost. Real Agent turn workers are used; model generation,
+ * git context, tools, and hooks are controlled boundaries.
+ * Run with: pnpm --dir packages/agent-core exec vitest run test/session/subagent-host.test.ts
+ */
+
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'pathe';
 
 import { testKaos } from '../fixtures/test-kaos';
+import { createControlledPromise, type ControlledPromise } from '@antfu/utils';
 import { APIStatusError, type Message, type ToolCall } from '@moonshot-ai/kosong';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -522,6 +530,160 @@ describe('SessionSubagentHost', () => {
     expect(createAgent).not.toHaveBeenCalled();
   });
 
+  it('rejects spawn on cancellation while child creation ignores the signal', async () => {
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    const creationStarted = createControlledPromise<void>();
+    const releaseCreation = createControlledPromise<{ readonly id: string; readonly agent: Agent }>();
+    const session = fakeSession(parent.agent, child.agent);
+    vi.mocked(session.createAgent).mockImplementation(async () => {
+      creationStarted.resolve();
+      return releaseCreation;
+    });
+    const host = new SessionSubagentHost(session, 'main');
+    const controller = new AbortController();
+
+    const launch = host.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_agent',
+      prompt: 'Implement the fix',
+      description: 'Fix bug',
+      runInBackground: false,
+      signal: controller.signal,
+    });
+    const launchResult = launch.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await creationStarted;
+
+    controller.abort(abortError('Cancelled during child creation'));
+
+    const result = await launchResult;
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') {
+      expect(result.error).toMatchObject({ name: 'AbortError' });
+    }
+
+    releaseCreation.resolve({ id: 'agent-0', agent: child.agent });
+    await releaseCreation;
+    await Promise.resolve();
+    expect(child.llmCalls).toHaveLength(0);
+    expect(parent.allEvents).not.toContainEqual(
+      expect.objectContaining({
+        type: '[rpc]',
+        event: 'subagent.spawned',
+      }),
+    );
+  });
+
+  it('rejects resume on cancellation while restoring the child ignores the signal', async () => {
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    child.configure();
+    child.agent.useProfile(
+      profile({ name: 'coder', tools: [], systemPrompt: 'coder prompt' }),
+    );
+    const childRestoreStarted = createControlledPromise<void>();
+    const releaseChildRestore = createControlledPromise<Agent>();
+    const session = fakeSession(parent.agent, child.agent, {
+      'agent-0': {
+        homedir: '/tmp/kimi-session/agents/agent-0',
+        type: 'sub',
+        parentAgentId: 'main',
+      },
+    });
+    vi.mocked(session.ensureAgentResumed).mockImplementation(async (agentId) => {
+      if (agentId === 'main') return parent.agent;
+      childRestoreStarted.resolve();
+      return releaseChildRestore;
+    });
+    const host = new SessionSubagentHost(session, 'main');
+    const controller = new AbortController();
+
+    const launch = host.resume('agent-0', {
+      parentToolCallId: 'call_agent',
+      prompt: 'Continue the fix',
+      description: 'Continue work',
+      runInBackground: false,
+      signal: controller.signal,
+    });
+    const launchResult = launch.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await childRestoreStarted;
+
+    controller.abort(abortError('Cancelled during child restore'));
+
+    const result = await launchResult;
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') {
+      expect(result.error).toMatchObject({ name: 'AbortError' });
+    }
+
+    releaseChildRestore.resolve(child.agent);
+    await releaseChildRestore;
+    await Promise.resolve();
+    expect(child.llmCalls).toHaveLength(0);
+    expect(parent.allEvents).not.toContainEqual(
+      expect.objectContaining({
+        type: '[rpc]',
+        event: 'subagent.spawned',
+      }),
+    );
+  });
+
+  it('settles cancellation while child system context preparation ignores the signal', async () => {
+    const contextStarted = createControlledPromise<void>();
+    const releaseContext = createControlledPromise<boolean>();
+    const contextKaos = createFakeKaos({
+      iterdir: async function* () {
+        contextStarted.resolve();
+        if (await releaseContext) yield '/workspace/late-entry';
+      },
+      stat: vi.fn(async () => {
+        throw new Error('Not found');
+      }),
+    });
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    const session = fakeSession(parent.agent, child.agent);
+    vi.mocked(session.systemContextKaos).mockReturnValue(contextKaos);
+    const host = new SessionSubagentHost(session, 'main');
+
+    const handle = await host.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_agent',
+      prompt: 'Implement the fix',
+      description: 'Fix bug',
+      runInBackground: false,
+      signal,
+    });
+    const completion = handle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await contextStarted;
+
+    const cancellation = host.cancelAll(abortError('Cancelled during context preparation'));
+
+    await expect(cancellation).resolves.toBeUndefined();
+    const result = await completion;
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') {
+      expect(result.error).toMatchObject({ name: 'AbortError' });
+    }
+
+    releaseContext.resolve(false);
+    await releaseContext;
+    await Promise.resolve();
+    expect(child.llmCalls).toHaveLength(0);
+  });
+
   it('cancels the child turn when the caller signal aborts', async () => {
     const parent = testAgent();
     parent.configure();
@@ -550,7 +712,6 @@ describe('SessionSubagentHost', () => {
       expect.objectContaining({
         type: '[wire]',
         event: 'turn.cancel',
-        args: expect.objectContaining({ turnId: 0 }),
       }),
     );
     expect(parent.allEvents).toContainEqual(
@@ -565,13 +726,44 @@ describe('SessionSubagentHost', () => {
     );
   });
 
-  it('cancelAll aborts foreground children', async () => {
+  it('cancels the captured turn worker when its wait signal is already aborted', async () => {
+    const controlled = delayedAbortGenerate();
+    const child = testAgent({ generate: controlled.generate });
+    child.configure();
+
+    await child.rpc.prompt({ input: [{ type: 'text', text: 'Keep working' }] });
+    await controlled.started;
+    const turnSettlement = child.agent.turn.waitForCurrentTurn();
+    const controller = new AbortController();
+    controller.abort(abortError('Deadline reached'));
+
+    expect(() => child.agent.turn.waitForCurrentTurn(controller.signal)).toThrow(
+      'Deadline reached',
+    );
+    const cancelledByPreAbortedWait = child.allEvents.some(
+      (event) => event.type === '[wire]' && event.event === 'turn.cancel',
+    );
+    if (!cancelledByPreAbortedWait) {
+      // Keep the regression test self-cleaning against the old behavior: it
+      // records the failed contract above, then explicitly releases the turn.
+      void child.agent.turn.cancel(undefined, abortError('Test cleanup'));
+    }
+    await controlled.abortObserved;
+
+    controlled.release.resolve();
+    await expect(turnSettlement).resolves.toMatchObject({
+      event: { type: 'turn.ended', reason: 'cancelled' },
+    });
+    expect(cancelledByPreAbortedWait).toBe(true);
+  });
+
+  it('cancelAll waits for a foreground child turn to settle after abort', async () => {
     const parent = testAgent();
     parent.configure();
     parent.newEvents();
 
-    const child = testAgent();
-    child.mockNextResponse({ type: 'text', text: 'I will run Bash.' }, bashCall());
+    const controlled = delayedAbortGenerate();
+    const child = testAgent({ generate: controlled.generate });
     const session = fakeSession(parent.agent, child.agent);
     const host = new SessionSubagentHost(session, 'main');
 
@@ -583,18 +775,246 @@ describe('SessionSubagentHost', () => {
       runInBackground: false,
       signal,
     });
+    const completion = handle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
 
-    await child.untilApprovalRequest();
-    host.cancelAll();
+    await controlled.started;
+    const cancellation = host.cancelAll();
+    await controlled.abortObserved;
 
-    await expect(handle.completion).rejects.toThrow('Aborted');
+    expect(await settlesByNextMicrotask(cancellation)).toBe(false);
+    expect(await settlesByNextMicrotask(completion)).toBe(false);
+
+    controlled.release.resolve();
+    await cancellation;
+
+    const result = await completion;
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') expect(result.error).toMatchObject({ name: 'AbortError' });
+    expect(child.agent.turn.hasActiveTurn).toBe(false);
     expect(child.allEvents).toContainEqual(
       expect.objectContaining({
         type: '[wire]',
         event: 'turn.cancel',
-        args: expect.objectContaining({ turnId: 0 }),
       }),
     );
+  });
+
+  it('RPC cancel waits for a foreground child while the main agent is idle', async () => {
+    const parent = testAgent();
+    parent.configure();
+    const controlled = delayedAbortGenerate();
+    const child = testAgent({ generate: controlled.generate });
+    const session = fakeSession(parent.agent, child.agent);
+    const host = new SessionSubagentHost(session, 'main');
+    Object.defineProperty(parent.agent, 'subagentHost', { value: host });
+
+    const handle = await host.spawn({
+      profileName: 'explore',
+      parentToolCallId: 'call_agent',
+      prompt: 'Keep working',
+      description: 'Long task',
+      runInBackground: false,
+      signal,
+    });
+    const completion = handle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await controlled.started;
+
+    const cancellation = parent.rpc.cancel({});
+    await controlled.abortObserved;
+    expect(parent.agent.turn.hasActiveTurn).toBe(false);
+    expect(await settlesByNextMicrotask(cancellation)).toBe(false);
+
+    controlled.release.resolve();
+    await cancellation;
+
+    expect((await completion).status).toBe('rejected');
+    expect(child.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('waits for foreground descendants when the caller signal cancels a child turn', async () => {
+    const parent = testAgent();
+    parent.configure();
+    const childControl = delayedAbortGenerate();
+    const child = testAgent({ generate: childControl.generate });
+    const grandchildControl = delayedAbortGenerate();
+    const grandchild = testAgent({ generate: grandchildControl.generate });
+    const childHost = new SessionSubagentHost(fakeSession(child.agent, grandchild.agent), 'main');
+    Object.defineProperty(child.agent, 'subagentHost', { value: childHost });
+    const parentHost = new SessionSubagentHost(fakeSession(parent.agent, child.agent), 'main');
+    const controller = new AbortController();
+
+    const childHandle = await parentHost.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_child',
+      prompt: 'Implement the parent slice',
+      description: 'Implement parent slice',
+      runInBackground: false,
+      signal: controller.signal,
+    });
+    const childCompletion = childHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await childControl.started;
+
+    const grandchildHandle = await childHost.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_grandchild',
+      prompt: 'Implement the nested slice',
+      description: 'Implement nested slice',
+      runInBackground: false,
+      signal,
+    });
+    const grandchildCompletion = grandchildHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await grandchildControl.started;
+
+    controller.abort(abortError('Caller stopped the child'));
+    await childControl.abortObserved;
+    await grandchildControl.abortObserved;
+    childControl.release.resolve();
+
+    expect(await settlesByNextMicrotask(childCompletion)).toBe(false);
+
+    grandchildControl.release.resolve();
+    const childResult = await childCompletion;
+    expect(childResult.status).toBe('rejected');
+    if (childResult.status === 'rejected') {
+      expect(childResult.error).toMatchObject({ name: 'AbortError' });
+    }
+    expect((await grandchildCompletion).status).toBe('rejected');
+  });
+
+  it('recursively waits for a foreground grandchild when its parent has not started a turn', async () => {
+    const collectStarted = createControlledPromise<void>();
+    const releaseCollection = createControlledPromise<string>();
+    vi.mocked(collectGitContext).mockImplementationOnce(async () => {
+      collectStarted.resolve();
+      return releaseCollection;
+    });
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    const grandchildControl = delayedAbortGenerate();
+    const grandchild = testAgent({ generate: grandchildControl.generate });
+    const childHost = new SessionSubagentHost(fakeSession(child.agent, grandchild.agent), 'main');
+    Object.defineProperty(child.agent, 'subagentHost', { value: childHost });
+    const parentHost = new SessionSubagentHost(fakeSession(parent.agent, child.agent), 'main');
+    Object.defineProperty(parent.agent, 'subagentHost', { value: parentHost });
+
+    const childHandle = await parentHost.spawn({
+      profileName: 'explore',
+      parentToolCallId: 'call_child',
+      prompt: 'Inspect the repository',
+      description: 'Inspect repository',
+      runInBackground: false,
+      signal,
+    });
+    const childCompletion = childHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await collectStarted;
+
+    const grandchildHandle = await childHost.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_grandchild',
+      prompt: 'Implement the nested task',
+      description: 'Implement nested task',
+      runInBackground: false,
+      signal,
+    });
+    const grandchildCompletion = grandchildHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await grandchildControl.started;
+
+    const cancellation = parent.rpc.cancel({});
+    await grandchildControl.abortObserved;
+    releaseCollection.resolve('');
+    expect(await settlesByNextMicrotask(cancellation)).toBe(false);
+
+    grandchildControl.release.resolve();
+    await cancellation;
+
+    expect((await childCompletion).status).toBe('rejected');
+    expect((await grandchildCompletion).status).toBe('rejected');
+    expect(grandchild.agent.turn.hasActiveTurn).toBe(false);
+  });
+
+  it('leaves a background grandchild running when cancelling its foreground parent', async () => {
+    const collectStarted = createControlledPromise<void>();
+    const releaseCollection = createControlledPromise<string>();
+    vi.mocked(collectGitContext).mockImplementationOnce(async () => {
+      collectStarted.resolve();
+      return releaseCollection;
+    });
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    const grandchildControl = delayedAbortGenerate();
+    const grandchild = testAgent({ generate: grandchildControl.generate });
+    const childHost = new SessionSubagentHost(fakeSession(child.agent, grandchild.agent), 'main');
+    Object.defineProperty(child.agent, 'subagentHost', { value: childHost });
+    const parentHost = new SessionSubagentHost(fakeSession(parent.agent, child.agent), 'main');
+    Object.defineProperty(parent.agent, 'subagentHost', { value: parentHost });
+
+    const childHandle = await parentHost.spawn({
+      profileName: 'explore',
+      parentToolCallId: 'call_child',
+      prompt: 'Inspect the repository',
+      description: 'Inspect repository',
+      runInBackground: false,
+      signal,
+    });
+    const childCompletion = childHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await collectStarted;
+
+    const backgroundController = new AbortController();
+    const grandchildHandle = await childHost.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_grandchild',
+      prompt: 'Keep monitoring in the background',
+      description: 'Monitor in background',
+      runInBackground: true,
+      signal: backgroundController.signal,
+    });
+    const grandchildCompletion = grandchildHandle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await grandchildControl.started;
+
+    const cancellation = parent.rpc.cancel({});
+    releaseCollection.resolve('');
+    await cancellation;
+
+    expect((await childCompletion).status).toBe('rejected');
+    expect(grandchild.agent.turn.hasActiveTurn).toBe(true);
+    expect(await settlesByNextMicrotask(grandchildCompletion)).toBe(false);
+    expect(grandchild.allEvents).not.toContainEqual(
+      expect.objectContaining({
+        type: '[wire]',
+        event: 'turn.cancel',
+      }),
+    );
+
+    backgroundController.abort(abortError('Test cleanup'));
+    await grandchildControl.abortObserved;
+    grandchildControl.release.resolve();
+    expect((await grandchildCompletion).status).toBe('rejected');
   });
 
   it("tells a cancelled subagent's in-flight tools the user interrupted them", async () => {
@@ -683,15 +1103,13 @@ describe('SessionSubagentHost', () => {
     });
 
     await child.untilApprovalRequest();
-    host.cancelAll();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await host.cancelAll();
 
     expect(child.agent.turn.hasActiveTurn).toBe(true);
     expect(child.allEvents).not.toContainEqual(
       expect.objectContaining({
         type: '[wire]',
         event: 'turn.cancel',
-        args: expect.objectContaining({ turnId: 0 }),
       }),
     );
 
@@ -702,7 +1120,6 @@ describe('SessionSubagentHost', () => {
       expect.objectContaining({
         type: '[wire]',
         event: 'turn.cancel',
-        args: expect.objectContaining({ turnId: 0 }),
       }),
     );
   });
@@ -843,6 +1260,49 @@ describe('SessionSubagentHost', () => {
         },
       ],
     });
+  });
+
+  it('does not start an explore turn after cancellation during git context collection', async () => {
+    const collectStarted = createControlledPromise<void>();
+    const releaseCollection = createControlledPromise<string>();
+    vi.mocked(collectGitContext).mockImplementationOnce(async () => {
+      collectStarted.resolve();
+      return releaseCollection;
+    });
+    const parent = testAgent();
+    parent.configure();
+    const child = testAgent();
+    child.mockNextResponse({ type: 'text', text: 'This turn must not start.' });
+    const session = fakeSession(parent.agent, child.agent);
+    const host = new SessionSubagentHost(session, 'main');
+
+    const handle = await host.spawn({
+      profileName: 'explore',
+      parentToolCallId: 'call_agent',
+      prompt: 'Find the cause',
+      description: 'Find cause',
+      runInBackground: false,
+      signal,
+    });
+    const completion = handle.completion.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error }),
+    );
+    await collectStarted;
+
+    const cancellation = host.cancelAll(abortError('Cancelled during context collection'));
+
+    await expect(cancellation).resolves.toBeUndefined();
+    const result = await completion;
+    expect(result.status).toBe('rejected');
+    if (result.status === 'rejected') {
+      expect(result.error).toMatchObject({ name: 'AbortError' });
+    }
+
+    releaseCollection.resolve('<git-context>late context</git-context>');
+    await releaseCollection;
+    await Promise.resolve();
+    expect(child.llmCalls).toHaveLength(0);
   });
 
   it('does not prepend git context for non-explore subagents', async () => {
@@ -1627,6 +2087,54 @@ function fakeSession(
       },
     ),
   } as unknown as Session;
+}
+
+function delayedAbortGenerate(): {
+  readonly generate: GenerateFn;
+  readonly started: Promise<void>;
+  readonly abortObserved: Promise<void>;
+  readonly release: ControlledPromise;
+} {
+  const started = createControlledPromise<void>();
+  const abortObserved = createControlledPromise<void>();
+  const release = createControlledPromise<void>();
+  const generate: GenerateFn = async (
+    _provider,
+    _systemPrompt,
+    _tools,
+    _history,
+    _callbacks,
+    options,
+  ) => {
+    started.resolve();
+    options?.signal?.addEventListener(
+      'abort',
+      () => {
+        abortObserved.resolve();
+      },
+      { once: true },
+    );
+    await abortObserved;
+    await release;
+    throw abortError();
+  };
+  return { generate, started, abortObserved, release };
+}
+
+async function settlesByNextMicrotask(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise<void>((resolve) => {
+    queueMicrotask(resolve);
+  });
+  return settled;
 }
 
 function contextProfile(): ResolvedAgentProfile {

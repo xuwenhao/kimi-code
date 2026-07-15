@@ -55,6 +55,7 @@ const MESSAGES_PAGE_SIZE = 50;
 // sidebar can fall back to it when a workspace's first-page size is unknown.
 export const SESSIONS_INITIAL_PAGE_SIZE = 5;
 const PROMPT_NOT_FOUND_CODE = 40402;
+const PROMPT_ALREADY_COMPLETED_CODE = 40903;
 const WORKSPACE_NOT_FOUND_CODE = 40410;
 // Shared "already resolved" conflict (40902). The daemon reuses it for both
 // approvals and questions when a second client races the resolve, so a
@@ -117,6 +118,48 @@ const promptGenerationBySession = new Map<string, number>();
 const pendingLocalTurnStarts = new Map<string, Set<number>>();
 const afterLocalTurnsSettled = new Map<string, () => void>();
 let nextLocalTurnToken = 0;
+
+/**
+ * A queued prompt becomes part of the active turn only after the steer request
+ * is admitted. Keep that short transaction visible to Stop: once the user asks
+ * to stop the session, a concurrent steer failure is the expected result of
+ * cancelling that transaction, not a second operation error to surface.
+ *
+ * There can be more than one browser request in flight for a session (for
+ * example, a double Ctrl+S before the first response), so track operation
+ * objects rather than one prompt id per session. The daemon remains the source
+ * of truth for queue ownership; this set records only local cancellation
+ * intent and is always cleared by steerPrompt's finally block.
+ */
+interface PendingSteerOperation {
+  stopRequested: boolean;
+}
+
+const pendingSteersBySession = new Map<string, Set<PendingSteerOperation>>();
+
+function registerPendingSteer(sessionId: string): PendingSteerOperation {
+  const operation: PendingSteerOperation = { stopRequested: false };
+  const pending = pendingSteersBySession.get(sessionId) ?? new Set<PendingSteerOperation>();
+  pending.add(operation);
+  pendingSteersBySession.set(sessionId, pending);
+  return operation;
+}
+
+function finishPendingSteer(sessionId: string, operation: PendingSteerOperation): void {
+  const pending = pendingSteersBySession.get(sessionId);
+  if (pending === undefined) return;
+  pending.delete(operation);
+  if (pending.size === 0) pendingSteersBySession.delete(sessionId);
+}
+
+function markPendingSteersStopping(sessionId: string): boolean {
+  let marked = false;
+  for (const operation of pendingSteersBySession.get(sessionId) ?? []) {
+    operation.stopRequested = true;
+    marked = true;
+  }
+  return marked;
+}
 
 export interface LocalTurnStartState {
   generation: number;
@@ -1610,6 +1653,11 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
     };
     updateSessionMessages(sid, (msgs) => [...msgs, optimisticMsg]);
 
+    // Register before submitting B. prompt.submitted may reach the browser and
+    // replace promptIdBySession with B before the submit HTTP response returns;
+    // Stop must still know it is cancelling a pending A+B steer transaction in
+    // that window.
+    const pendingSteer = registerPendingSteer(sid);
     const localTurnToken = beginLocalTurn(sid);
     try {
       const api = getKimiWebApi();
@@ -1640,6 +1688,25 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
         return updated;
       });
 
+      if (pendingSteer.stopRequested) {
+        // Stop may have won before submit returned, when B was only queued and
+        // aborting A alone could let B auto-start. Pair the session-level stop
+        // issued by abortCurrentPrompt() with an idempotent abort(B) once its
+        // authoritative id is known. Never attempt the steer after Stop.
+        try {
+          await api.abortPrompt(sid, result.promptId);
+        } catch (error) {
+          const alreadyGone =
+            isDaemonApiError(error) &&
+            (error.code === PROMPT_NOT_FOUND_CODE ||
+              error.code === PROMPT_ALREADY_COMPLETED_CODE);
+          if (!alreadyGone) {
+            pushOperationFailure('abortCurrentPrompt', error, { sessionId: sid });
+          }
+        }
+        return;
+      }
+
       if (result.status !== 'queued') {
         // The turn ended while the user was typing — the prompt started a turn
         // of its own. Wire it up like a regular send so :abort keeps working.
@@ -1650,16 +1717,29 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
 
       try {
         await api.steerPrompts(sid, [result.promptId]);
-      } catch {
-        // The active turn finished between submit and steer — the daemon starts
-        // the parked prompt as its own turn. Nothing to roll back.
+      } catch (error) {
+        // PROMPT_NOT_FOUND is the one server response that proves the original
+        // active-turn target disappeared before steer admission. A concurrent
+        // local Stop is also expected to reject the steer request: aborting the
+        // reserved queued prompt linearizes as cancelling both it and the
+        // active prompt. Every other failure leaves the queued prompt's fate
+        // unknown (it may still be parked), so do not claim it auto-started —
+        // surface the failure while retaining its accepted transcript echo.
+        const activeTurnEnded =
+          isDaemonApiError(error) && error.code === PROMPT_NOT_FOUND_CODE;
+        if (!activeTurnEnded && !pendingSteer.stopRequested) {
+          pushOperationFailure('steer', error, { sessionId: sid });
+        }
       }
-    } catch (err) {
+    } catch (error) {
       // Submit failed: drop the optimistic echo so the transcript doesn't show
       // a delivered-looking message the daemon never received.
       updateSessionMessages(sid, (msgs) => msgs.filter((m) => m.id !== tempId));
-      pushOperationFailure('steer', err, { sessionId: sid });
+      if (!pendingSteer.stopRequested) {
+        pushOperationFailure('steer', error, { sessionId: sid });
+      }
     } finally {
+      finishPendingSteer(sid, pendingSteer);
       settleLocalTurn(sid, localTurnToken);
     }
   }
@@ -1761,6 +1841,12 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
   async function abortCurrentPrompt(): Promise<void> {
     const sid = rawState.activeSessionId;
     if (!sid) return;
+    // Mark before the first await. The authoritative prompt id may still name
+    // active A or may already have been overwritten by queued B's
+    // prompt.submitted event; stopping either side of an admitted steer
+    // transaction cancels A+B, and the concurrent steer request is then
+    // expected to fail.
+    const stoppingSteer = markPendingSteersStopping(sid);
     const session = rawState.sessions.find((s) => s.id === sid);
 
     // 1. Authoritative id captured at submit time.
@@ -1777,6 +1863,16 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
     }
 
     const api = getKimiWebApi();
+    // During a local steer, per-prompt abort and session abort are both needed
+    // to close the pre-admission window: queued B may already be cached while
+    // the server has not reserved it against active A yet. Start the session
+    // abort concurrently so a slow per-prompt request cannot delay Stop.
+    const steerSessionAbort = stoppingSteer
+      ? api.abortSession(sid).then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        )
+      : undefined;
 
     // 3. If we have a real id, try the per-prompt abort first. If the daemon
     //    reports the prompt is missing/already completed, clear the stale id and
@@ -1784,29 +1880,37 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
     if (promptId !== undefined) {
       try {
         const result = await api.abortPrompt(sid, promptId);
-        if (result.aborted) return;
+        if (result.aborted && !stoppingSteer) return;
         const nextPromptIds = { ...rawState.promptIdBySession };
         delete nextPromptIds[sid];
         rawState.promptIdBySession = nextPromptIds;
-      } catch (err) {
-        if (isDaemonApiError(err) && err.code === PROMPT_NOT_FOUND_CODE) {
+      } catch (error) {
+        if (isDaemonApiError(error) && error.code === PROMPT_NOT_FOUND_CODE) {
           // Stale id — try the session-level fallback below.
           const nextPromptIds = { ...rawState.promptIdBySession };
           delete nextPromptIds[sid];
           rawState.promptIdBySession = nextPromptIds;
         } else {
-          pushOperationFailure('abortCurrentPrompt', err, { sessionId: sid });
-          return;
+          pushOperationFailure('abortCurrentPrompt', error, { sessionId: sid });
+          if (!stoppingSteer) return;
         }
       }
+    }
+
+    if (steerSessionAbort !== undefined) {
+      const outcome = await steerSessionAbort;
+      if (!outcome.ok) {
+        pushOperationFailure('abortCurrentPrompt', outcome.error, { sessionId: sid });
+      }
+      return;
     }
 
     // 4. No real id, or the prompt id is no longer recognized: cancel whatever
     //    is running in the session (including skill activations).
     try {
       await api.abortSession(sid);
-    } catch (err) {
-      pushOperationFailure('abortCurrentPrompt', err, { sessionId: sid });
+    } catch (error) {
+      pushOperationFailure('abortCurrentPrompt', error, { sessionId: sid });
     }
   }
 

@@ -321,6 +321,24 @@ describe('KimiTUI resume message replay', () => {
     expect(transcript).not.toContain('preceding user request');
   });
 
+  it('renders ordinary user text that contains system reminder tags', async () => {
+    const literalText =
+      '<system-reminder>\nThis text was typed by the user and is not an injection.\n</system-reminder>';
+    const driver = await replayIntoDriver([
+      message('user', [{ type: 'text', text: literalText }], {
+        origin: { kind: 'user' },
+      }),
+    ]);
+
+    expect(
+      driver.state.transcriptEntries
+        .filter((entry) => entry.kind === 'user')
+        .map((entry) => entry.content),
+    ).toEqual([literalText]);
+    const transcript = stripAnsi(driver.state.transcriptContainer.render(140).join('\n'));
+    expect(transcript).toContain('This text was typed by the user and is not an injection.');
+  });
+
   it('renders one synthetic tool failure without exposing its turn outcome reminder', async () => {
     const abandonedOutput =
       'Tool call did not complete: the turn failed before its result was recorded. Do not assume the tool completed successfully.';
@@ -723,6 +741,30 @@ describe('KimiTUI resume message replay', () => {
     expect(driver.streamingUI.hasPendingAgentGroup()).toBe(false);
     expect(driver.streamingUI.getToolComponent('call_agent_1')).toBeUndefined();
     expect(driver.streamingUI.getToolComponent('call_agent_2')).toBeUndefined();
+  });
+
+  it('hides legacy image-compression metadata when replaying a user message', async () => {
+    const legacyCaption =
+      '<system>Image compressed to fit model limits: original 3264x666 image/png (344 KB) -> ' +
+      '2000x408 image/png (282 KB). Full-detail original: /tmp/originals/shot.png.</system>';
+    const driver = await replayIntoDriver([
+      message(
+        'user',
+        [
+          {
+            type: 'text',
+            text: `Inspect this${legacyCaption}<system>ordinary user text</system>`,
+          },
+        ],
+        { origin: { kind: 'user' } },
+      ),
+    ]);
+
+    expect(
+      driver.state.transcriptEntries
+        .filter((entry) => entry.kind === 'user')
+        .map((entry) => entry.content),
+    ).toEqual(['Inspect this<system>ordinary user text</system>']);
   });
 
   it('groups replayed Read calls from one assistant message using live grouping', async () => {

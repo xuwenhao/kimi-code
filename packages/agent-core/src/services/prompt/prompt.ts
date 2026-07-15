@@ -14,13 +14,13 @@
  *      `IEventService.onDidPublish(handler)` (VSCode-style
  *      accessor returning an `IDisposable`) in its constructor. We use this
  *      to:
- *      - capture `turn.started` → record `promptId ↔ turnId` mapping (so
- *        later abort can pass the correct numeric `turnId` to
- *        `core.rpc.cancel({turnId})`).
- *      - capture `turn.ended` for the prompt's top-level turn → SYNTHESIZE a
- *        `prompt.completed` (reason='completed', 'failed', or 'blocked') or
- *        `prompt.aborted` (reason='cancelled') event. The event service then
- *        broadcasts these. agent-core's event union has no prompt-level
+ *      - capture `turn.started` → keep the active `promptId ↔ turnId` mapping
+ *        current across goal-continuation turns, so abort always targets the
+ *        turn that is actually running.
+ *      - capture candidate terminal `turn.ended` events, verify that no goal
+ *        continuation is still running, then SYNTHESIZE `prompt.completed`
+ *        (reason='completed', 'failed', or 'blocked') or `prompt.aborted`
+ *        (reason='cancelled'). agent-core's event union has no prompt-level
  *        types.
  *      VSCode-style accessors `onDidComplete: Event<...>` /
  *      `onDidAbort: Event<...>` are also exposed so callers can observe the
@@ -37,18 +37,17 @@
  * **prompt_id ↔ turnId mapping**:
  * - Daemon mints `prompt_<ULID>` on submit. This is a daemon-only id; agent-core
  *   knows nothing about it.
- * - `turn.started.turnId: number` is the agent-core counterpart. On the FIRST
- *   `turn.started` after a submit, we associate `promptId ↔ turnId` for the
- *   session's active prompt. Future `turn.started` events on the same session
- *   without an intervening submit are nested turns — they don't reset the
- *   mapping.
- * - On `turn.ended` matching the top-level turn (turnId equal to the original
- *   mapping), we synthesize the lifecycle event and clear `activePromptId`.
+ * - `turn.started.turnId: number` is the agent-core counterpart. Every main
+ *   agent `turn.started` while the prompt is active refreshes the mapping;
+ *   subagent events use a different `agentId` and therefore a different key.
+ * - A completed turn does not finish the prompt while an active goal is
+ *   driving continuations. The final turn, or a goal transition that stops
+ *   between turns, synthesizes the lifecycle event and clears the mapping.
  *
  * **queueing**: the impl maintains an active `Map<sessionId, PromptState>` plus
  * a per-session FIFO queue. A second submit while a non-terminal prompt exists
- * returns status=`queued`; when the top-level active turn ends, the daemon
- * starts the next queued prompt.
+ * returns status=`queued`; once the active prompt reaches its verified terminal
+ * boundary, the daemon starts the next queued prompt.
  *
  * **`user_message_id` derivation**: SCHEMAS §5 mandates a `user_message_id`
  * in the submit response. When the full message history adapter is available,
@@ -139,11 +138,15 @@ export interface IPromptService {
 
   /**
    * `POST /v1/sessions/{sid}/prompts/{pid}:steer` and collection
-   * `POST /v1/sessions/{sid}/prompts:steer` — remove queued prompt(s) and
-   * inject their content into the active turn via agent-core steer.
+   * `POST /v1/sessions/{sid}/prompts:steer` — reserve queued prompt(s) and
+   * inject their content into the active turn via agent-core steer. Reserved
+   * prompts remain visible in `list()` until admission succeeds; an ordinary
+   * steer failure leaves them queued.
    *
    * Throws `SessionNotFoundError` (→ 40401) for unknown `sid`.
    * Throws `PromptNotFoundError`  (→ 40402) when any pid is not queued.
+   * Throws `PromptAlreadyCompletedError` (→ 40903) when a concurrent stop
+   * cancels the reserved prompt(s) with their active owner.
    */
   steer(sid: string, promptIds: readonly string[]): Promise<PromptSteerResult>;
 
@@ -154,7 +157,11 @@ export interface IPromptService {
    * For an active prompt, this issues `core.rpc.cancel` and synthesizes a
    * `prompt.aborted` event. For a queued prompt, it removes the prompt from
    * the queue and synthesizes `prompt.aborted` without dispatching to
-   * agent-core.
+   * agent-core. If `pid` belongs to a steer admission currently reserved
+   * against the active prompt, the selected prompt(s) and active prompt form
+   * one cancellation transaction: all selected ids are removed and receive
+   * `prompt.aborted`, then the active owner is cancelled. Unselected queued
+   * prompts continue normally.
    *
    * Per REST.md §3.5: aborting an already-completed prompt returns
    * `PromptAlreadyCompletedError` (→ 40903 with `data.aborted: false`).
@@ -176,9 +183,9 @@ export interface IPromptService {
    * `core.rpc.cancel({ sessionId, agentId: 'main' })` without a `turnId`, which
    * cancels any active agent-core turn (including skill activations).
    *
-   * Returns `{ aborted: true }` when a cancel RPC was issued, `{ aborted: false }`
-   * when the session was idle. Throws `SessionNotFoundError` (→ 40401) for
-   * unknown `sid`.
+   * Returns `{ aborted: true }` after the daemon-managed prompt or direct
+   * agent-core cancellation settles. Throws `SessionNotFoundError` (→ 40401)
+   * for unknown `sid`.
    */
   abortBySession(sid: string): Promise<PromptAbortResult>;
 
@@ -214,9 +221,8 @@ export interface IPromptService {
 
   /**
    * VSCode-style accessor for `prompt.completed` synthetic events. The
-   * listener fires synchronously when a top-level `turn.ended`
-   * (reason='completed'|'failed'|'blocked') is synthesised into a prompt-lifecycle
-   * event, BEFORE `bus.publish(synth)`.
+   * listener fires after a candidate terminal turn has been verified as the
+   * prompt boundary, BEFORE `bus.publish(synth)`.
    *
    * Returns an `IDisposable`. Owners stash it via
    * `Disposable._register(svc.onDidComplete(handler))`.
@@ -226,8 +232,8 @@ export interface IPromptService {
   /**
    * VSCode-style accessor for `prompt.aborted` synthetic events. Same
    * `IDisposable` contract as `onDidComplete`. The listener fires when a
-   * top-level `turn.ended` (reason='cancelled') or an abort RPC synthesises
-   * a prompt-lifecycle event, BEFORE `bus.publish(synth)`.
+   * verified cancelled turn or an abort RPC synthesises a prompt-lifecycle
+   * event, BEFORE `bus.publish(synth)`.
    */
   readonly onDidAbort: Event<SyntheticPromptAbortedEvent>;
 

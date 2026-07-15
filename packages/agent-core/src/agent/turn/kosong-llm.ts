@@ -86,6 +86,24 @@ export class KosongLLM implements LLM {
     this.usedContextTokens = config.usedContextTokens;
   }
 
+  /**
+   * Refresh only the prompt text while preserving this turn's provider,
+   * capability, completion budget, and transport. Full compaction uses this
+   * after it re-renders the active profile; ordinary mid-turn config updates
+   * must remain deferred until the next turn.
+   */
+  withSystemPrompt(systemPrompt: string): KosongLLM {
+    if (systemPrompt === this.systemPrompt) return this;
+    return new KosongLLM({
+      provider: this.provider,
+      systemPrompt,
+      capability: this.capability,
+      generate: this.generate,
+      completionBudgetConfig: this.completionBudgetConfig,
+      usedContextTokens: this.usedContextTokens,
+    });
+  }
+
   async chat(params: LLMChatParams): Promise<LLMChatResponse> {
     let requestStartedAt = Date.now();
     let requestSentAt: number | undefined;

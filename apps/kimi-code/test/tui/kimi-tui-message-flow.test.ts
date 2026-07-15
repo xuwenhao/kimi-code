@@ -3235,6 +3235,101 @@ command = "vim"
     expect(transcript).not.toContain('kimi export');
   });
 
+  it('treats a compaction error as a failed terminal and leaves compacting state', async () => {
+    const { driver } = await makeDriver();
+    const sendQueued = vi.fn();
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'compaction.started',
+        agentId: 'main',
+        sessionId: 'ses-1',
+      } as Event,
+      sendQueued,
+    );
+    expect(driver.state.appState.isCompacting).toBe(true);
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'error',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        code: 'compaction.failed',
+        message: 'provider aborted without a cancellation signal',
+        retryable: false,
+      } as Event,
+      sendQueued,
+    );
+
+    expect(driver.state.appState.isCompacting).toBe(false);
+    expect(driver.state.appState.streamingPhase).toBe('idle');
+    const transcript = stripSgr(renderTranscript(driver));
+    expect(transcript).toContain('Compaction failed');
+    expect(transcript).not.toContain('Compacting context');
+  });
+
+  it('does not drain a second queued message when turn failure precedes compaction error', async () => {
+    vi.useFakeTimers();
+    try {
+      const { driver } = await makeDriver();
+      const sendQueued = vi.fn();
+      driver.sessionEventHandler.handleEvent(
+        {
+          type: 'turn.started',
+          agentId: 'main',
+          sessionId: 'ses-1',
+          turnId: 1,
+          origin: { kind: 'user' },
+        } as Event,
+        sendQueued,
+      );
+      driver.sessionEventHandler.handleEvent(
+        {
+          type: 'compaction.started',
+          agentId: 'main',
+          sessionId: 'ses-1',
+          turnId: 1,
+          trigger: 'auto',
+        } as Event,
+        sendQueued,
+      );
+      driver.state.queuedMessages = [{ text: 'first' }, { text: 'second' }];
+
+      driver.sessionEventHandler.handleEvent(
+        {
+          type: 'turn.ended',
+          agentId: 'main',
+          sessionId: 'ses-1',
+          turnId: 1,
+          reason: 'failed',
+          durationMs: 1,
+          error: { code: 'compaction.failed', message: 'summary failed', retryable: false },
+        } as Event,
+        sendQueued,
+      );
+      driver.sessionEventHandler.handleEvent(
+        {
+          type: 'error',
+          agentId: 'main',
+          sessionId: 'ses-1',
+          code: 'compaction.failed',
+          message: 'summary failed',
+          retryable: false,
+        } as Event,
+        sendQueued,
+      );
+
+      expect(driver.state.queuedMessages).toEqual([{ text: 'second' }]);
+      expect(driver.state.queuedMessageDispatchPending).toBe(true);
+      await vi.runAllTimersAsync();
+      expect(sendQueued).toHaveBeenCalledTimes(1);
+      expect(sendQueued).toHaveBeenCalledWith({ text: 'first' });
+      expect(driver.state.queuedMessages).toEqual([{ text: 'second' }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shows concise provider filter text for filtered session errors', async () => {
     const { driver } = await makeDriver();
     const verboseMessage =

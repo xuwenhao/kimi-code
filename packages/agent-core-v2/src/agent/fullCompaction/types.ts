@@ -21,6 +21,7 @@ export interface CompactionResult {
    * backward compatibility with older wire records.
    */
   keptHeadUserMessageCount?: number;
+  keptTurnOutcomeCount?: number;
   /**
    * Oldest messages trimmed from the summarizer input when the compaction
    * request overflowed the model window; not covered by the produced summary.

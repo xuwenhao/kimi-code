@@ -584,6 +584,10 @@ export interface TurnStartedEvent {
   readonly type: 'turn.started';
   readonly turnId: number;
   readonly origin: PromptOrigin;
+  /** Caller-supplied prompt correlation echoed by the turn that owns it. */
+  readonly promptId?: string;
+  /** Internal durable correlation for a prompt admitted during compaction. */
+  readonly deferredPromptId?: string;
 }
 
 export interface TurnEndedEvent {
@@ -1448,6 +1452,8 @@ export const turnStartedEventSchema = z.object({
   type: z.literal('turn.started'),
   turnId: z.number(),
   origin: promptOriginSchema,
+  promptId: z.string().optional(),
+  deferredPromptId: z.string().optional(),
 }) satisfies z.ZodType<TurnStartedEvent>;
 
 export const turnEndedEventSchema = z.object({

@@ -41,6 +41,7 @@ import {
   sanitizeToolCallId,
   type ToolCallIdPolicy,
 } from './tool-call-id';
+import { cancelNativeStream } from './stream-cancellation';
 
 // Inbound: scan in priority order; first string value wins. Outbound: the first
 // entry doubles as the default field we serialize ThinkPart back into. Both
@@ -325,12 +326,14 @@ export class OpenAILegacyStreamedMessage implements StreamedMessage {
   private _finishReason: FinishReason | null = null;
   private _rawFinishReason: string | null = null;
   private readonly _iter: AsyncGenerator<StreamedMessagePart>;
+  private readonly _nativeStream: unknown;
 
   constructor(
     response: OpenAI.Chat.ChatCompletion | AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
     isStream: boolean,
     reasoningKey: string | undefined,
   ) {
+    this._nativeStream = isStream ? response : undefined;
     if (isStream) {
       this._iter = this._convertStreamResponse(
         response as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
@@ -358,6 +361,10 @@ export class OpenAILegacyStreamedMessage implements StreamedMessage {
 
   get rawFinishReason(): string | null {
     return this._rawFinishReason;
+  }
+
+  cancel(): void {
+    cancelNativeStream(this._nativeStream);
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {

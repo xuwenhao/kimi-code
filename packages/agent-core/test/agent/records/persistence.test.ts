@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   AGENT_WIRE_PROTOCOL_VERSION,
+  agentRecordAppendAccepted,
   BlobStore,
   FileSystemAgentRecordPersistence,
   InMemoryAgentRecordPersistence,
@@ -200,13 +201,18 @@ describe('FileSystemAgentRecordPersistence', () => {
     });
     await expect(persistence.flush()).rejects.toBeInstanceOf(Error);
 
-    expect(() => {
+    let appendError: unknown;
+    try {
       persistence.append({
         type: 'turn.prompt',
         input: [{ type: 'text', text: 'second' }],
         origin: { kind: 'user' },
       });
-    }).toThrow();
+    } catch (error) {
+      appendError = error;
+    }
+    expect(appendError).toBeInstanceOf(Error);
+    expect(agentRecordAppendAccepted(appendError)).toBe(false);
     expect(() => {
       persistence.rewrite([
         {
@@ -279,5 +285,29 @@ describe('InMemoryAgentRecordPersistence', () => {
       },
     ]);
     expect(persistence.records).toEqual(records);
+  });
+
+  it('marks an observer failure as post-accept without changing its identity', () => {
+    const observerError = new Error('observer failed after append');
+    const persistence = new InMemoryAgentRecordPersistence([], {
+      onRecord: () => {
+        throw observerError;
+      },
+    });
+    let thrown: unknown;
+
+    try {
+      persistence.append({
+        type: 'turn.prompt',
+        input: [{ type: 'text', text: 'accepted' }],
+        origin: { kind: 'user' },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(observerError);
+    expect(agentRecordAppendAccepted(thrown)).toBe(true);
+    expect(persistence.records).toHaveLength(1);
   });
 });

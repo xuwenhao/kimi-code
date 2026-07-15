@@ -112,12 +112,19 @@ export async function generate(
     : tools;
 
   options?.onRequestStart?.();
-  const stream = await provider.generate(systemPrompt, wireTools, history, options);
+  const providerRequest = provider.generate(systemPrompt, wireTools, history, options);
+  const stream = await waitForAbort(providerRequest, options?.signal, {
+    // A provider may ignore AbortSignal and resolve after the caller has
+    // already moved on. Retire that late stream without ever iterating it.
+    onLateResolve: (lateStream) => {
+      requestCancellation(lateStream);
+    },
+  });
 
   // Post-await abort check: `provider.generate()` may have resolved before
   // noticing a mid-flight abort. Reject immediately rather than draining
   // the stream.
-  await throwIfAborted(options?.signal, stream);
+  throwIfAborted(options?.signal, stream);
 
   // Decode-phase accounting. We split the window from the first streamed part
   // to stream end into time spent awaiting the next part (server + network) vs.
@@ -131,7 +138,7 @@ export async function generate(
   let firstPartAt: number | undefined;
   let lastResumeAt = 0;
 
-  for await (const part of stream) {
+  for await (const part of iterateWithAbort(stream, options?.signal)) {
     const arrivedAt = Date.now();
     if (firstPartAt === undefined) {
       firstPartAt = arrivedAt;
@@ -140,12 +147,14 @@ export async function generate(
     }
 
     try {
-      await throwIfAborted(options?.signal, stream);
+      // The abort-aware iterator owns stream cleanup while its yielded part is
+      // being consumed. Let closing the iterator request cancellation once.
+      throwIfAborted(options?.signal);
 
       // Notify raw part callback (deep copy to avoid aliasing mutations).
       if (callbacks?.onMessagePart !== undefined) {
-        await callbacks.onMessagePart(deepCopyPart(part));
-        await throwIfAborted(options?.signal, stream);
+        await waitForAbort(callbacks.onMessagePart(deepCopyPart(part)), options?.signal);
+        throwIfAborted(options?.signal);
       }
 
       // Index-based routing for parallel tool call argument deltas.
@@ -188,7 +197,7 @@ export async function generate(
     }
   }
 
-  await throwIfAborted(options?.signal, stream);
+  throwIfAborted(options?.signal, stream);
   if (firstPartAt !== undefined) {
     // Tail wait: from the last processed part to the stream's done signal.
     serverDecodeMs += Date.now() - lastResumeAt;
@@ -234,9 +243,9 @@ export async function generate(
   }
 
   // Fire onToolCall for every fully-assembled tool call, in final order.
-  if (callbacks?.onToolCall !== undefined) {
+  if (callbacks?.onToolCall !== undefined && message.toolCalls.length > 0) {
+    throwIfAborted(options?.signal, stream);
     for (const toolCall of message.toolCalls) {
-      await throwIfAborted(options?.signal, stream);
       await callbacks.onToolCall(toolCall);
     }
   }
@@ -250,34 +259,165 @@ export async function generate(
   };
 }
 
-type CancelableStream = StreamedMessage & {
+type CancelableTarget = {
   cancel?: () => unknown;
   return?: () => unknown;
 };
 
 function throwAbortError(): never {
-  throw new DOMException('The operation was aborted.', 'AbortError');
+  throw createAbortError();
 }
 
-async function cancelStream(stream: StreamedMessage): Promise<void> {
-  const cancelable = stream as CancelableStream;
+/**
+ * Ask provider-owned resources to stop without making caller cancellation
+ * depend on provider cooperation. Both synchronous throws and eventual
+ * rejections are contained: cancellation is best-effort cleanup, never a new
+ * reason for the turn worker to remain pending.
+ */
+function requestCancellation(...targets: unknown[]): void {
+  const seen = new Set<unknown>();
+  for (const target of targets) {
+    if (
+      target === null ||
+      (typeof target !== 'object' && typeof target !== 'function') ||
+      seen.has(target)
+    ) {
+      continue;
+    }
+    seen.add(target);
+    const cancelable = target as CancelableTarget;
+    invokeCancellation(cancelable, 'cancel');
+    invokeCancellation(cancelable, 'return');
+  }
+}
 
+function invokeCancellation(target: CancelableTarget, method: keyof CancelableTarget): void {
   try {
-    await cancelable.cancel?.();
-  } catch {}
-
-  try {
-    await cancelable.return?.();
+    const cleanup = target[method]?.();
+    // Attaching a rejection handler also prevents a provider that rejects its
+    // cleanup promise later from producing an unhandled rejection.
+    void Promise.resolve(cleanup).catch(() => {});
   } catch {}
 }
 
-async function throwIfAborted(signal?: AbortSignal, stream?: StreamedMessage): Promise<void> {
+interface AbortWaitOptions<T> {
+  readonly onAbort?: () => void;
+  readonly onLateResolve?: (value: T) => void;
+}
+
+/**
+ * Wait for an external operation while making AbortSignal authoritative even
+ * when that operation ignores it. The original promise always keeps handlers
+ * attached, so a late resolution/rejection is observed but cannot re-enter
+ * the caller after cancellation.
+ */
+function waitForAbort<T>(
+  value: T | PromiseLike<T>,
+  signal?: AbortSignal,
+  options?: AbortWaitOptions<T>,
+): Promise<T> {
+  const promise = Promise.resolve(value);
+  if (signal === undefined) return promise;
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const removeAbortListener = (): void => {
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      removeAbortListener();
+      try {
+        options?.onAbort?.();
+      } catch {}
+      reject(createAbortError());
+    };
+
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    void promise.then(
+      (result) => {
+        if (settled) {
+          try {
+            options?.onLateResolve?.(result);
+          } catch {}
+          return;
+        }
+        settled = true;
+        removeAbortListener();
+        resolve(result);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        removeAbortListener();
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Abort-aware adapter around an arbitrary provider iterator. In particular,
+ * `next()` is raced independently for every chunk: a provider that stops
+ * answering after an abort cannot pin the generate call forever. Late iterator
+ * results remain consumed by `waitForAbort` and are never yielded to callbacks.
+ */
+async function* iterateWithAbort(
+  stream: StreamedMessage,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamedMessagePart> {
+  const iterator = stream[Symbol.asyncIterator]();
+  let completed = false;
+  let cancellationRequested = false;
+  const cancel = (): void => {
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    // The stream owns transport cancellation; the iterator owns iteration
+    // teardown. Avoid also calling stream.return / iterator.cancel, which can
+    // close the same provider resource twice through wrapper aliases.
+    invokeCancellation(stream as CancelableTarget, 'cancel');
+    invokeCancellation(iterator as CancelableTarget, 'return');
+  };
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        cancel();
+        throwAbortError();
+      }
+      const next = await waitForAbort(iterator.next(), signal, { onAbort: cancel });
+      if (signal?.aborted) {
+        cancel();
+        throwAbortError();
+      }
+      if (next.done === true) {
+        completed = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    if (!completed) cancel();
+  }
+}
+
+function createAbortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal, stream?: StreamedMessage): void {
   if (!signal?.aborted) {
     return;
   }
 
   if (stream !== undefined) {
-    await cancelStream(stream);
+    requestCancellation(stream);
   }
 
   throwAbortError();

@@ -1,3 +1,9 @@
+/**
+ * Session lifecycle and hook contracts through real session/agent workers.
+ * Filesystem, process, and provider behavior are controlled test boundaries.
+ * Run: pnpm --dir packages/agent-core exec vitest run test/session/lifecycle-hooks.test.ts
+ */
+
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'pathe';
@@ -10,7 +16,9 @@ import { testKaos } from '../fixtures/test-kaos';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { SDKSessionRPC } from '../../src/rpc';
+import { Agent } from '../../src/agent';
 import { Session } from '../../src/session';
+import { SessionAPIImpl } from '../../src/session/rpc';
 import { ProcessBackgroundTask } from '../../src/agent/background';
 import { agentTask } from '../agent/background/helpers';
 
@@ -111,6 +119,140 @@ describe('Session lifecycle hooks', () => {
     await expect(session.close()).resolves.toBeUndefined();
   });
 
+  it('does not let a synchronous metadata-event observer reject a prompt', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const observerError = new Error('metadata observer failed synchronously');
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>((event): Promise<void> => {
+      if (event.type === 'session.meta.updated') throw observerError;
+      return Promise.resolve();
+    });
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-meta-sync-observer',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    await session.createMain();
+    const warn = vi.spyOn(session.log, 'warn').mockImplementation(() => {});
+
+    await expect(
+      new SessionAPIImpl(session).prompt({
+        agentId: 'main',
+        input: [{ type: 'text', text: 'prompt survives sync observer failure' }],
+      }),
+    ).resolves.toMatchObject({ kind: 'started' });
+    expect(warn).toHaveBeenCalledWith('session event delivery failed', {
+      eventType: 'session.meta.updated',
+      error: observerError,
+    });
+
+    await session.close();
+  });
+
+  it('does not let an asynchronously rejected metadata event reject a prompt', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const observerError = new Error('metadata observer rejected asynchronously');
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>((event) =>
+      event.type === 'session.meta.updated' ? Promise.reject(observerError) : Promise.resolve(),
+    );
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-meta-async-observer',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    await session.createMain();
+    const warn = vi.spyOn(session.log, 'warn').mockImplementation(() => {});
+
+    await expect(
+      new SessionAPIImpl(session).prompt({
+        agentId: 'main',
+        input: [{ type: 'text', text: 'prompt survives async observer failure' }],
+      }),
+    ).resolves.toMatchObject({ kind: 'started' });
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith('session event delivery failed', {
+        eventType: 'session.meta.updated',
+        error: observerError,
+      });
+    });
+
+    await session.close();
+  });
+
+  it('isolates a synchronous MCP status-event observer failure', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const observerError = new Error('MCP status observer failed synchronously');
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>((event): Promise<void> => {
+      if (event.type === 'mcp.server.status') throw observerError;
+      return Promise.resolve();
+    });
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-mcp-sync-observer',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const warn = vi.spyOn(session.log, 'warn').mockImplementation(() => {});
+    const emitters = session as unknown as {
+      onMcpServerStatusChange(entry: {
+        name: string;
+        transport: 'stdio';
+        status: 'failed';
+        toolCount: number;
+        error: string;
+      }): void;
+    };
+
+    expect(() => {
+      emitters.onMcpServerStatusChange({
+        name: 'example',
+        transport: 'stdio',
+        status: 'failed',
+        toolCount: 0,
+        error: 'connection failed',
+      });
+    }).not.toThrow();
+    expect(warn).toHaveBeenCalledWith('session event delivery failed', {
+      eventType: 'mcp.server.status',
+      error: observerError,
+    });
+
+    await session.close();
+  });
+
+  it('consumes an asynchronously rejected initial MCP error event', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const observerError = new Error('MCP error observer rejected asynchronously');
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>((event) =>
+      event.type === 'error' ? Promise.reject(observerError) : Promise.resolve(),
+    );
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-mcp-async-observer',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const warn = vi.spyOn(session.log, 'warn').mockImplementation(() => {});
+    const emitters = session as unknown as {
+      emitInitialMcpLoadError(error: unknown): void;
+    };
+
+    emitters.emitInitialMcpLoadError(new Error('initial MCP load failed'));
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith('session event delivery failed', {
+        eventType: 'error',
+        error: observerError,
+      });
+    });
+
+    await session.close();
+  });
+
   it('stops background tasks on close by default', async () => {
     const { sessionDir, workDir } = await hookFixture();
     const session = new Session({
@@ -199,6 +341,7 @@ describe('Session lifecycle hooks', () => {
       .mockImplementation(() => turnSettled.promise as never);
     const cancelSpy = vi.spyOn(child.turn, 'cancel').mockImplementation(() => {
       turnSettled.resolve();
+      return Promise.resolve();
     });
     vi.spyOn(child.turn, 'hasActiveTurn', 'get').mockReturnValue(true);
     const abortController = new AbortController();
@@ -581,7 +724,7 @@ describe('Session lifecycle hooks', () => {
     await session.close();
   });
 
-  it('cancels an active foreground turn before closing', async () => {
+  it('awaits foreground agent shutdown before closing', async () => {
     const { sessionDir, workDir } = await hookFixture();
     const session = new Session({
       kaos: testKaos.withCwd(workDir),
@@ -591,22 +734,24 @@ describe('Session lifecycle hooks', () => {
       skills: { explicitDirs: [join(workDir, 'missing-skills')] },
     });
     const agent = await session.createMain();
-    const turnSettled = createDeferred<void>();
-    const waitSpy = vi
-      .spyOn(agent.turn, 'waitForCurrentTurn')
-      .mockImplementation(() => turnSettled.promise as never);
-    const cancelSpy = vi.spyOn(agent.turn, 'cancel').mockImplementation(() => {
-      turnSettled.resolve();
+    const shutdownSettled = createDeferred<void>();
+    const shutdownSpy = vi.spyOn(agent.turn, 'shutdown').mockImplementation(async () => {
+      await shutdownSettled.promise;
     });
-    vi.spyOn(agent.turn, 'hasActiveTurn', 'get').mockReturnValue(true);
 
-    await session.close();
+    let closeSettled = false;
+    const close = session.close().then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
 
-    expect(cancelSpy).toHaveBeenCalledWith(undefined, expect.any(Error));
-    expect(waitSpy).toHaveBeenCalledOnce();
+    shutdownSettled.resolve();
+    await close;
+    expect(shutdownSpy).toHaveBeenCalledWith(expect.any(Error));
   });
 
-  it('records session-close cancellation during UserPromptSubmit hooks as cancelled', async () => {
+  it('does not emit a terminal turn event after session shutdown begins', async () => {
     const { sessionDir, workDir } = await hookFixture();
     const hookStartedPath = join(workDir, 'hook-started');
     const hookScriptPath = join(workDir, 'blocking-user-prompt-hook.cjs');
@@ -642,18 +787,7 @@ describe('Session lifecycle hooks', () => {
     await session.close();
 
     const events = emitEvent.mock.calls.map(([event]) => event);
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        type: 'turn.ended',
-        reason: 'cancelled',
-      }),
-    );
-    expect(events).not.toContainEqual(
-      expect.objectContaining({
-        type: 'turn.ended',
-        reason: 'failed',
-      }),
-    );
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'turn.ended' }));
   });
 
   it('keeps background tasks alive and skips SessionEnd hooks when closing for reload', async () => {
@@ -690,6 +824,279 @@ describe('Session lifecycle hooks', () => {
         source: 'startup',
       },
     ]);
+  });
+
+  it('awaits foreground agent shutdown when closing for reload', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-reload-shutdown',
+      homedir: sessionDir,
+      rpc: createSessionRpc(),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const agent = await session.createMain();
+    const shutdownSettled = createDeferred<void>();
+    const shutdownSpy = vi.spyOn(agent.turn, 'shutdown').mockImplementation(async () => {
+      await shutdownSettled.promise;
+    });
+
+    let reloadCloseSettled = false;
+    const reloadClose = session.closeForReload().then(() => {
+      reloadCloseSettled = true;
+    });
+    await Promise.resolve();
+    expect(reloadCloseSettled).toBe(false);
+
+    shutdownSettled.resolve();
+    await reloadClose;
+    expect(shutdownSpy).toHaveBeenCalledWith(expect.any(Error));
+  });
+
+  it('suppresses a delayed agent event after close returns', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>(async () => {});
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-close-late-event',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const agent = await session.createMain();
+    const releaseLateSetter = createDeferred<void>();
+    const lateSetter = releaseLateSetter.promise.then(() => {
+      agent.emitEvent({ type: 'warning', message: 'late setter event' });
+    });
+
+    await session.close();
+    emitEvent.mockClear();
+    releaseLateSetter.resolve();
+    await lateSetter;
+
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a delayed agent event after closeForReload returns', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>(async () => {});
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-reload-late-event',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const agent = await session.createMain();
+    const releaseLateSetter = createDeferred<void>();
+    const lateSetter = releaseLateSetter.promise.then(() => {
+      agent.emitEvent({ type: 'warning', message: 'late reload setter event' });
+    });
+
+    await session.closeForReload();
+    emitEvent.mockClear();
+    releaseLateSetter.resolve();
+    await lateSetter;
+
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('waits for a pending agent creation and prevents it from committing after close', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>(async () => {});
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-close-pending-create',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const bootstrapStarted = createDeferred<void>();
+    const releaseBootstrap = createDeferred<void>();
+    vi.spyOn(
+      session as unknown as {
+        bootstrapAgentProfile(agent: Agent, profile: unknown): Promise<void>;
+      },
+      'bootstrapAgentProfile',
+    ).mockImplementation(async (agent) => {
+      bootstrapStarted.resolve();
+      await releaseBootstrap.promise;
+      agent.emitEvent({ type: 'warning', message: 'late create event' });
+    });
+
+    const creating = session.createMain();
+    await bootstrapStarted.promise;
+    let closeSettled = false;
+    const close = session.close().then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+
+    emitEvent.mockClear();
+    releaseBootstrap.resolve();
+    await expect(creating).rejects.toMatchObject({ code: 'session.closed' });
+    await close;
+
+    expect(session.getReadyAgent('main')).toBeUndefined();
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+  it('waits for a pending agent resume and prevents it from committing after reload close', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    await writeFile(
+      join(sessionDir, 'state.json'),
+      JSON.stringify({
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        title: 'Pending Resume',
+        isCustomTitle: false,
+        agents: { main: { type: 'main' } },
+        custom: {},
+      }),
+      'utf-8',
+    );
+    const emitEvent = vi.fn<SDKSessionRPC['emitEvent']>(async () => {});
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-reload-pending-resume',
+      homedir: sessionDir,
+      rpc: createSessionRpc({ emitEvent }),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const resumeStarted = createDeferred<void>();
+    const releaseResume = createDeferred<void>();
+    const resumeSpy = vi.spyOn(Agent.prototype, 'resume').mockImplementation(async function (
+      this: Agent,
+    ) {
+      resumeStarted.resolve();
+      await releaseResume.promise;
+      this.emitEvent({ type: 'warning', message: 'late resume event' });
+      return {};
+    });
+
+    try {
+      const resuming = session.resume();
+      await resumeStarted.promise;
+      let closeSettled = false;
+      const close = session.closeForReload().then(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+
+      emitEvent.mockClear();
+      releaseResume.resolve();
+      await expect(resuming).rejects.toMatchObject({ code: 'session.closed' });
+      await close;
+
+      expect(session.getReadyAgent('main')).toBeUndefined();
+      expect(emitEvent).not.toHaveBeenCalled();
+    } finally {
+      resumeSpy.mockRestore();
+    }
+  });
+
+  it('aborts and joins an in-flight startup SessionStart before firing SessionEnd', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-close-during-startup-hook',
+      homedir: sessionDir,
+      rpc: createSessionRpc(),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const startEntered = createDeferred<void>();
+    const releaseStart = createDeferred<void>();
+    const order: string[] = [];
+    let startSignal: AbortSignal | undefined;
+    vi.spyOn(session.hookEngine, 'trigger').mockImplementation((event, args = {}) => {
+      if (event === 'SessionStart') {
+        startSignal = args.signal;
+        order.push('SessionStart.begin');
+        startEntered.resolve();
+        return releaseStart.promise.then(() => {
+          order.push('SessionStart.end');
+          return [];
+        });
+      }
+      if (event === 'SessionEnd') order.push('SessionEnd');
+      return Promise.resolve([]);
+    });
+    vi.spyOn(
+      session as unknown as { flushMetadata(): Promise<void> },
+      'flushMetadata',
+    ).mockResolvedValue();
+
+    const creating = session.createMain();
+    await startEntered.promise;
+    const closing = session.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(startSignal?.aborted).toBe(true);
+    expect(order).toEqual(['SessionStart.begin']);
+
+    releaseStart.resolve();
+    await expect(creating).rejects.toMatchObject({ code: 'session.closed' });
+    await closing;
+    expect(order).toEqual(['SessionStart.begin', 'SessionStart.end', 'SessionEnd']);
+  });
+
+  it('aborts and joins an in-flight resume SessionStart before firing SessionEnd', async () => {
+    const { sessionDir, workDir } = await hookFixture();
+    await writeFile(
+      join(sessionDir, 'state.json'),
+      JSON.stringify({
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+        title: 'Resume Hook Race',
+        isCustomTitle: false,
+        agents: {},
+        custom: {},
+      }),
+      'utf-8',
+    );
+    const session = new Session({
+      kaos: testKaos.withCwd(workDir),
+      id: 'session-close-during-resume-hook',
+      homedir: sessionDir,
+      rpc: createSessionRpc(),
+      skills: { explicitDirs: [join(workDir, 'missing-skills')] },
+    });
+    const startEntered = createDeferred<void>();
+    const releaseStart = createDeferred<void>();
+    const order: string[] = [];
+    let startSignal: AbortSignal | undefined;
+    vi.spyOn(session.hookEngine, 'trigger').mockImplementation((event, args = {}) => {
+      if (event === 'SessionStart') {
+        startSignal = args.signal;
+        order.push('SessionStart.begin');
+        startEntered.resolve();
+        return releaseStart.promise.then(() => {
+          order.push('SessionStart.end');
+          return [];
+        });
+      }
+      if (event === 'SessionEnd') order.push('SessionEnd');
+      return Promise.resolve([]);
+    });
+    vi.spyOn(
+      session as unknown as { flushMetadata(): Promise<void> },
+      'flushMetadata',
+    ).mockResolvedValue();
+
+    const resuming = session.resume();
+    await startEntered.promise;
+    const closing = session.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(startSignal?.aborted).toBe(true);
+    expect(order).toEqual(['SessionStart.begin']);
+
+    releaseStart.resolve();
+    await expect(resuming).rejects.toMatchObject({ code: 'session.closed' });
+    await closing;
+    expect(order).toEqual(['SessionStart.begin', 'SessionStart.end', 'SessionEnd']);
   });
 });
 

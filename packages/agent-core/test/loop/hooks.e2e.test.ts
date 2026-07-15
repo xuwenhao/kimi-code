@@ -9,7 +9,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { LoopHooks, ExecutableToolResult, ToolExecution } from '../../src/loop/index';
 import { PathSecurityError } from '../../src/tools/policies/path-access';
-import { makeEndTurnResponse, makeToolCall, makeToolUseResponse } from './fixtures/fake-llm';
+import {
+  FakeLLM,
+  makeEndTurnResponse,
+  makeToolCall,
+  makeToolUseResponse,
+} from './fixtures/fake-llm';
 import { runTurn, runTurnExpectingThrow } from './fixtures/helpers';
 import { EchoTool, FailingTool, type EchoInput } from './fixtures/tools';
 
@@ -494,6 +499,28 @@ describe('runTurn — shouldContinueAfterStop hook', () => {
     });
     expect(result.stopReason).toBe('end_turn');
     expect(shouldContinueAfterStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('receives the LLM instance that executed the stopped step', async () => {
+    const rebuiltLlm = new FakeLLM({
+      modelName: 'rebuilt-model',
+      responses: [makeEndTurnResponse('ok')],
+    });
+    const observedLlms: unknown[] = [];
+    const { llm: initialLlm } = await runTurn({
+      responses: [makeEndTurnResponse('unused')],
+      buildLlm: () => rebuiltLlm,
+      hooks: {
+        shouldContinueAfterStop: async (ctx) => {
+          observedLlms.push(ctx.llm);
+          return { continue: false };
+        },
+      },
+    });
+
+    expect(initialLlm.callCount).toBe(0);
+    expect(rebuiltLlm.callCount).toBe(1);
+    expect(observedLlms).toEqual([rebuiltLlm]);
   });
 
   it('continue:true allows another step after a non-tool stopReason', async () => {
