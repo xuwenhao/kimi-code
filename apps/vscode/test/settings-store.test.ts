@@ -287,3 +287,85 @@ describe("Webview chat error recovery", () => {
     });
   });
 });
+
+describe("Webview thinking mode parity with the TUI", () => {
+  it("derives thinking modes from metadata only, mirroring the TUI rules", () => {
+    const base = { id: "m", name: "M", provider: "p", capabilities: [] as string[] };
+    expect(getModelThinkingMode({ ...base, capabilities: ["thinking"], support_efforts: ["low", "high"] })).toBe("effort");
+    expect(getModelThinkingMode({ ...base, capabilities: ["always_thinking"] })).toBe("always");
+    expect(getModelThinkingMode({ ...base, capabilities: ["thinking"] })).toBe("switch");
+    expect(getModelThinkingMode({ ...base, adaptive_thinking: true })).toBe("switch");
+    expect(getModelThinkingMode({ ...base, name: "Kimi Thinking Pro" })).toBe("none");
+    expect(getModelThinkingMode(base)).toBe("none");
+  });
+});
+
+describe("Webview thinking effort parity with the TUI", () => {
+  it("resolves a boolean \"on\" to the model default for effort-capable models", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels(MODELS, "reasoning", false);
+
+    useSettingsStore.getState().selectThinkingEffort("on");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe("high");
+    expect(boundary.saveConfig).toHaveBeenCalledWith({ model: "reasoning", thinking: true, effort: "high" });
+  });
+
+  it("prefers the persisted configured effort when resolving \"on\"", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels(MODELS, "reasoning", false);
+    useSettingsStore.setState({ defaultThinkingEffort: "low" });
+
+    useSettingsStore.getState().selectThinkingEffort("on");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe("low");
+  });
+
+  it("keeps \"on\" for genuine boolean models", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels([
+      { id: "bool", name: "Bool", provider: "openai", capabilities: ["thinking"] },
+    ], "bool", false);
+
+    useSettingsStore.getState().selectThinkingEffort("on");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe("on");
+    expect(boundary.saveConfig).toHaveBeenCalledWith({ model: "bool", thinking: true, effort: "on" });
+  });
+
+  it("persists disabling thinking with thinking false", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels(MODELS, "reasoning", true);
+
+    useSettingsStore.getState().selectThinkingEffort("off");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe("off");
+    expect(boundary.saveConfig).toHaveBeenCalledWith({ model: "reasoning", thinking: false, effort: "off" });
+  });
+
+  it("rejects \"off\" for always-on effort models", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels([
+      { id: "always-effort", name: "AE", provider: "openai", capabilities: ["always_thinking"], support_efforts: ["low", "high"] },
+    ], "always-effort", true);
+    const previous = useSettingsStore.getState().thinkingEffort;
+    boundary.saveConfig.mockClear();
+
+    useSettingsStore.getState().selectThinkingEffort("off");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe(previous);
+    expect(boundary.saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("rejects efforts outside support_efforts", () => {
+    boundary.saveConfig.mockResolvedValue({ ok: true });
+    useSettingsStore.getState().initModels(MODELS, "reasoning", false);
+    const previous = useSettingsStore.getState().thinkingEffort;
+    boundary.saveConfig.mockClear();
+
+    useSettingsStore.getState().selectThinkingEffort("ultra");
+
+    expect(useSettingsStore.getState().thinkingEffort).toBe(previous);
+    expect(boundary.saveConfig).not.toHaveBeenCalled();
+  });
+});

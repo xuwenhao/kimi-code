@@ -32,6 +32,7 @@ export const DEFAULT_EXTENSION_CONFIG: ExtensionConfig = {
   version: "",
 };
 
+/** Metadata-driven only; mirrors the TUI's thinkingAvailability rules. */
 export function getModelThinkingMode(model: ModelConfig): ThinkingMode {
   if ((model.support_efforts?.length ?? 0) > 0) {
     return "effort";
@@ -41,9 +42,6 @@ export function getModelThinkingMode(model: ModelConfig): ThinkingMode {
   }
   if (model.capabilities.includes("thinking") || model.adaptive_thinking === true) {
     return "switch";
-  }
-  if (model.name.toLowerCase().includes("think")) {
-    return "always";
   }
   return "none";
 }
@@ -234,12 +232,19 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     );
   },
 
-  selectThinkingEffort: (thinkingEffort) => {
+  selectThinkingEffort: (effort) => {
     const { models, currentModel, thinkingEffort: previousEffort, defaultThinking, defaultThinkingEffort } = get();
     const model = getModelById(models, currentModel);
     if (!model) return;
+    // Match the TUI's commitEffort rule: a boolean "on" never reaches the
+    // engine for effort-capable models; resolve it to the model's default
+    // effort first. "on" remains valid only for genuine boolean models.
+    let thinkingEffort = effort;
+    if (thinkingEffort === "on" && getModelThinkingMode(model) === "effort") {
+      thinkingEffort = defaultEffortForModel(model, true, defaultThinkingEffort);
+    }
     const allowed = model.support_efforts ?? [];
-    const alwaysOn = getModelThinkingMode(model) === "always";
+    const alwaysOn = model.capabilities.includes("always_thinking");
     if (thinkingEffort !== "off" && thinkingEffort !== "on" && !allowed.includes(thinkingEffort)) return;
     if (alwaysOn && thinkingEffort === "off") return;
     set({
