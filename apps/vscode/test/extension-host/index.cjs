@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { writeFile } = require("node:fs/promises");
-const { homedir } = require("node:os");
-const { parse, sep } = require("node:path");
+const os = require("node:os");
+const path = require("node:path");
 const vscode = require("vscode");
 
 const EXTENSION_ID = "moonshot-ai.kimi-code";
@@ -23,10 +23,10 @@ exports.run = async function run() {
   assert.ok(isolatedHome, "isolated OS home must be provided");
   process.env.HOME = isolatedHome;
   process.env.USERPROFILE = isolatedHome;
-  const root = parse(isolatedHome).root;
+  const root = path.parse(isolatedHome).root;
   process.env.HOMEDRIVE = process.platform === "win32" ? root.replace(/[\\/]+$/, "") : root;
   process.env.HOMEPATH = process.platform === "win32"
-    ? `${sep}${isolatedHome.slice(root.length)}`
+    ? `${path.sep}${isolatedHome.slice(root.length)}`
     : isolatedHome;
 
   const extension = vscode.extensions.getExtension(EXTENSION_ID);
@@ -36,7 +36,7 @@ exports.run = async function run() {
   assert.ok(process.env.KIMI_CODE_HOME, "KIMI_CODE_HOME must point at the isolated test home");
   assert.equal(process.env.HOME, isolatedHome);
   assert.equal(process.env.USERPROFILE, isolatedHome);
-  assert.equal(homedir(), isolatedHome);
+  assert.equal(os.homedir(), isolatedHome);
 
   await extension.activate();
   assert.equal(extension.isActive, true, "extension activation did not complete");
