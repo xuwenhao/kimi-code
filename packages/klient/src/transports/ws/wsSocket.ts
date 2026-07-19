@@ -89,6 +89,7 @@ interface ServerFrame {
   readonly data?: unknown;
   readonly code?: number;
   readonly msg?: string;
+  readonly details?: unknown;
   readonly eventId?: string;
 }
 
@@ -299,12 +300,12 @@ export class WsSocket {
       case 'error': {
         const p = this.take(frame.id);
         if (p !== undefined) {
-          p.reject(new RPCError(frame.code ?? 50001, frame.msg ?? 'error'));
+          p.reject(new RPCError(frame.code ?? 50001, frame.msg ?? 'error', frame.details));
         } else {
           const sub = this.listens.get(frame.id ?? '');
           if (sub !== undefined) {
             this.listens.delete(frame.id ?? '');
-            const error = new RPCError(frame.code ?? 50001, frame.msg ?? 'error');
+            const error = new RPCError(frame.code ?? 50001, frame.msg ?? 'error', frame.details);
             sub.onError?.(error);
             queueMicrotask(() => {
               for (const listener of this.listenErrorListeners) {

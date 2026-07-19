@@ -61,7 +61,9 @@ import { IAgentMediaToolsRegistrar } from '#/agent/media/mediaTools';
 import { IImageConfigBridge } from '#/agent/media/imageConfigBridge';
 import { IAgentMcpService } from '#/agent/mcp/mcp';
 import { IAgentExternalHooksService } from '#/agent/externalHooks/externalHooks';
+import { IAgentFileFencingService } from '#/agent/fileFencing/fileFencing';
 import { IAgentPluginService } from '#/agent/plugin/agentPlugin';
+import { IAgentSkillListingReminderService } from '#/agent/profile/agentSkillListingReminder';
 import { ISessionInteractionService } from '#/session/interaction/interaction';
 import { IWireService } from '#/wire/wire';
 import {
@@ -211,10 +213,17 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
     handle.accessor.get(IImageConfigBridge);
     handle.accessor.get(IAgentToolDedupeService);
     handle.accessor.get(IAgentExternalHooksService);
+    // File fencing hooks Read/Write/Edit on the shared Session file ledger:
+    // resolve after externalHooks so permission/external hook participants
+    // register first on the executor's hook slots.
+    handle.accessor.get(IAgentFileFencingService);
     handle.accessor.get(IAgentMcpService);
     // Agent plugin service: registers main-agent-only plugin session-start
     // guidance before the first turn (self-gates to a no-op for other agents).
     handle.accessor.get(IAgentPluginService);
+    // Skill listing reminder: arms the turn-boundary notification for skill
+    // catalog hot reload before the first turn.
+    handle.accessor.get(IAgentSkillListingReminderService);
     // Tool-select services: precompute tool selection and the announcements
     // derived from it before the first turn.
     handle.accessor.get(IAgentToolSelectService);

@@ -126,3 +126,21 @@ export type {
 } from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
 export type { ContentPart } from '@moonshot-ai/agent-core-v2/app/llmProtocol/message';
 export type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';
+
+// Multi-instance session ownership (shared home): the http transport follows
+// 40921 `session.held_by_peer` redirects onto the holder instance.
+export {
+  KlientConnection,
+  normalizeInstanceOrigin,
+  readSessionOwnershipDetails,
+  SESSION_HELD_BY_PEER,
+  SessionRedirectChannel,
+  splitOrigin,
+  type HeldByPeerDetails,
+  type SessionOwnershipDetails,
+  type SessionOwnershipPhase,
+  type SessionRedirectChannelOptions,
+  type SessionRedirectInfo,
+  type SessionRedirectOptions,
+  type UnregisteredWriterDetails,
+} from './sessionRedirect.js';

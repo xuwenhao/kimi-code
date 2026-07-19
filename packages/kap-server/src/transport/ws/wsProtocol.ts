@@ -85,6 +85,8 @@ export interface ErrorMessage {
   readonly id: string;
   readonly code: number;
   readonly msg: string;
+  /** Structured error payload (e.g. `SessionOwnershipDetails` under 40921); absent when the mapped error carries none. */
+  readonly details?: unknown;
 }
 
 export interface ListenResultMessage {

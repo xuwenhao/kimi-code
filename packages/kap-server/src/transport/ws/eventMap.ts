@@ -35,6 +35,18 @@ export const eventMap: Record<ScopeKind, Record<string, EventSource>> = {
       subscribe: (scope, listener) =>
         scope.accessor.get(IEventService).subscribe(listener as (event: GlobalEvent) => void),
     },
+    // Filtered view of the same bus for the multi-instance session-list hint
+    // (design §3.8): volatile and payload-free, published by
+    // `SessionListWatchService` — clients subscribe by name instead of
+    // draining the whole `events` stream.
+    'session.list_changed': {
+      subscribe: (scope, listener) =>
+        scope.accessor
+          .get(IEventService)
+          .subscribe((event) => {
+            if (event.type === 'session.list_changed') listener(event);
+          }),
+    },
   },
   session: {
     // Pushes the full pending interaction set whenever it changes. Payload is

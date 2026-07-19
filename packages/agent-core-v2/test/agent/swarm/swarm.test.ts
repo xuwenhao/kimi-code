@@ -20,6 +20,8 @@ import { AgentToolRegistryService } from '#/agent/toolRegistry/toolRegistryServi
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { IConfigService } from '#/app/config/config';
 import { AppendLogStore } from '#/persistence/backends/node-fs/appendLogStore';
+import { WriteAuthorityRegistryService } from '#/persistence/backends/node-fs/writeAuthorityRegistryService';
+import { IWriteAuthorityRegistry } from '#/persistence/interface/writeAuthority';
 import { InMemoryStorageService } from '#/persistence/backends/memory/inMemoryStorageService';
 import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
 import { IFileSystemStorageService } from '#/persistence/interface/storage';
@@ -77,6 +79,7 @@ describe('AgentSwarmService', () => {
     ix.stub(IAgentContextMemoryService, stubContextMemory());
     ix.stub(IFileSystemStorageService, new InMemoryStorageService());
     ix.set(IAppendLogStore, new SyncDescriptor(AppendLogStore));
+    ix.stub(IWriteAuthorityRegistry, new WriteAuthorityRegistryService());
     ix.set(IEventBus, new SyncDescriptor(EventBusService));
     ix.stub(IAgentLoopService, stubLoopWithHooks());
     ix.set(IAgentToolRegistryService, new SyncDescriptor(AgentToolRegistryService));
@@ -132,6 +135,7 @@ describe('AgentSwarmService', () => {
     const ix2 = disposables.add(new TestInstantiationService());
     ix2.stub(IFileSystemStorageService, new InMemoryStorageService());
     ix2.set(IAppendLogStore, new SyncDescriptor(AppendLogStore));
+    ix2.stub(IWriteAuthorityRegistry, new WriteAuthorityRegistryService());
     const fresh = registerTestAgentWire(ix2, testWireScope('wire', 'swarm-replay'), {
       log: ix2.get(IAppendLogStore),
     });

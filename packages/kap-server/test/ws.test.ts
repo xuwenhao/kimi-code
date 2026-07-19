@@ -2,11 +2,22 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ISessionIndex, ISessionMetadata } from '@moonshot-ai/agent-core-v2';
+import {
+  createDecorator,
+  Error2,
+  ErrorCodes,
+  ISessionIndex,
+  ISessionMetadata,
+  type Scope,
+  type ServiceIdentifier,
+} from '@moonshot-ai/agent-core-v2';
+import { ErrorCode } from '../src/protocol/error-codes';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
+import { registerChannel } from '../src/transport/channelRegistry';
 import { RpcWsError, WsClient } from '../src/transport/ws/wsClient';
+import { WsConnection } from '../src/transport/ws/wsConnection';
 import { authHeaders } from './helpers/auth';
 
 interface Envelope<T> {
@@ -195,3 +206,119 @@ describe('server-v2 /api/v2/ws auth', () => {
     client.close();
   });
 });
+
+/**
+ * `/api/v2/ws` error-frame construction, no server boot: drive a raw
+ * `WsConnection` against a stub socket + scope so the mapped `details`
+ * forwarding is asserted verbatim on the wire frame.
+ */
+describe('server-v2 /api/v2/ws error frames', () => {
+  it('error frame forwards mapped details verbatim', async () => {
+    const details = { kind: 'held-by-peer', phase: 'routable', address: 'http://127.0.0.1:58628' };
+    const { connMessage, frames } = serveThrowingService(
+      ErrorCodes.SESSION_HELD_BY_PEER,
+      'session 01JOWNERSHIP is held by another instance (routable)',
+      details,
+    );
+    connMessage({ type: 'hello' });
+    connMessage({
+      type: 'call',
+      id: 'c1',
+      scope: 'core',
+      service: 'ownershipTestThrowing',
+      method: 'fail',
+    });
+    await expect
+      .poll(() => frames.find((f) => f['type'] === 'error'), { timeout: 2000 })
+      .toEqual({
+        type: 'error',
+        id: 'c1',
+        code: ErrorCode.SESSION_HELD_BY_PEER,
+        msg: 'session 01JOWNERSHIP is held by another instance (routable)',
+        details,
+      });
+  });
+
+  it('error frame omits details when the mapped error carries none', async () => {
+    const { connMessage, frames } = serveThrowingService(
+      ErrorCodes.SESSION_NOT_FOUND,
+      'session s_missing not found',
+      undefined,
+    );
+    connMessage({ type: 'hello' });
+    connMessage({
+      type: 'call',
+      id: 'c2',
+      scope: 'core',
+      service: 'ownershipTestThrowing',
+      method: 'fail',
+    });
+    await expect.poll(() => frames.find((f) => f['type'] === 'error'), { timeout: 2000 }).toEqual({
+      type: 'error',
+      id: 'c2',
+      code: ErrorCode.SESSION_NOT_FOUND,
+      msg: 'session s_missing not found',
+    });
+  });
+});
+
+interface ThrowingTestService {
+  fail(): never;
+}
+
+/**
+ * Wire a one-off channel whose `fail` throws an `Error2` with `details`, and
+ * return a frame driver + frame sink for a `WsConnection` wrapped around a
+ * minimal stub socket.
+ */
+function serveThrowingService(
+  code: ConstructorParameters<typeof Error2>[0],
+  message: string,
+  details: Record<string, unknown> | undefined,
+): {
+  conn: WsConnection;
+  connMessage: (msg: unknown) => void;
+  frames: Record<string, unknown>[];
+} {
+  const Throwing = createDecorator<ThrowingTestService>('ownershipTestThrowing');
+  registerChannel(Throwing as ServiceIdentifier<unknown>);
+  const service: ThrowingTestService = {
+    fail: () => {
+      throw new Error2(code, message, details === undefined ? undefined : { details });
+    },
+  };
+  const frames: Record<string, unknown>[] = [];
+  const handlers = new Map<string, (data: unknown) => void>();
+  const socket = {
+    readyState: 1,
+    OPEN: 1,
+    on(event: string, cb: (data: unknown) => void) {
+      handlers.set(event, cb);
+    },
+    send(raw: string) {
+      frames.push(JSON.parse(raw) as Record<string, unknown>);
+    },
+    close() {
+      // no-op
+    },
+  };
+  const core = {
+    accessor: {
+      get: (id: unknown) => {
+        if (id === Throwing) return service;
+        throw new Error('unseeded service');
+      },
+    },
+  } as unknown as Scope;
+  const conn = new WsConnection({
+    socket: socket as never,
+    core,
+    remoteAddress: null,
+    userAgent: null,
+  });
+  return {
+    conn,
+    connMessage: (msg) => handlers.get('message')?.(JSON.stringify(msg)),
+    frames,
+  };
+}

@@ -103,6 +103,10 @@ const DOMAIN_LAYER = new Map([
   ['config', 2],
   ['workspaceLocalConfig', 2],
   ['sessionFs', 2],
+  // `sessionFileLedger` is the Session-scope optimistic-concurrency ledger for
+  // the write path: it consumes the `sessionFs` dirty-tick state and the L1
+  // hostFs stat, so it sits beside `sessionFs` at L2.
+  ['sessionFileLedger', 2],
   ['process', 2],
   ['workspaceRegistry', 2],
   ['hostFolderBrowser', 2],
@@ -146,6 +150,10 @@ const DOMAIN_LAYER = new Map([
   ['usage', 4],
   ['runtime', 4],
   ['toolDedupe', 4],
+  // `fileFencing` is the Agent-scope optimistic-concurrency gate: a
+  // tool-executor hook participant (L3) over the `sessionFileLedger` (L2)
+  // and flag state (L3), so it sits at L4 beside `toolDedupe`.
+  ['fileFencing', 4],
   ['toolSelect', 4],
   ['contextMemory', 4],
   ['contextInjector', 4],
@@ -209,6 +217,13 @@ const DOMAIN_LAYER = new Map([
   // through `profile` (L4). Its highest real dependency is `agentLifecycle`,
   // so it sits in L6 beside `workspaceCommand`.
   ['sessionInit', 6],
+  // `sessionLease` owns the per-session write lease (`SessionLease`, the
+  // Session-scope seeded `ISessionLeaseService` fencing capability, and the
+  // App-scope contact provider seed). It builds on the L1 cross-process lock
+  // and the L1 write-authority contract, and is consumed by `sessionLifecycle`
+  // and `sessionMetadata` (both L6); nothing it imports rises past L1, and it
+  // sits in L6 beside its consumers.
+  ['sessionLease', 6],
   // L7 — boundary
   ['approval', 7],
   ['question', 7],

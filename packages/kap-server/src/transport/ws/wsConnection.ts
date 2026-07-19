@@ -227,7 +227,7 @@ export class WsConnection {
       } else {
         this.logger.warn(ctx, 'ws rpc call failed');
       }
-      this.send({ type: 'error', id: msg.id, code: env.code, msg: env.msg });
+      this.send({ type: 'error', id: msg.id, code: env.code, msg: env.msg, details: env.details });
     }
   }
 
@@ -283,7 +283,7 @@ export class WsConnection {
       } else {
         this.logger.warn(ctx, 'ws listen failed');
       }
-      this.send({ type: 'error', id: msg.id, code: env.code, msg: env.msg });
+      this.send({ type: 'error', id: msg.id, code: env.code, msg: env.msg, details: env.details });
       return;
     }
 

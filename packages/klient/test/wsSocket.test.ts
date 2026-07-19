@@ -72,8 +72,8 @@ class FakeServer {
     this.send({ type: 'event', id, eventId, data });
   }
 
-  pushError(id: string, msg: string): void {
-    this.send({ type: 'error', id, code: 40001, msg });
+  pushError(id: string, msg: string, details?: unknown): void {
+    this.send({ type: 'error', id, code: 40001, msg, details });
   }
 
   cancelEvent(id: string, eventId: string): void {
@@ -241,13 +241,21 @@ describe('WsSocket', () => {
     const server = new FakeServer();
     const socket = await openSocket(server);
     const errors: string[] = [];
-    socket.onDidListenError((event) => errors.push(event.error.message));
+    const detailsList: unknown[] = [];
+    socket.onDidListenError((event) => {
+      errors.push(event.error.message);
+      detailsList.push((event.error as { details?: unknown }).details);
+    });
     socket.listen('session', 'onDidChangeMetadata', { sessionId: 's1' }, () => undefined, 'sessionMetadata');
     await tick(5);
     const id = [...server.listens][0]!;
-    server.pushError(id, 'payload is not serializable');
+    // Server-side validation failures must carry the structured details
+    // payload through — 40921 session-ownership refusals branch on it.
+    const details = { kind: 'held-by-peer', phase: 'holder-unresponsive', retry_after_ms: 2000 };
+    server.pushError(id, 'payload is not serializable', details);
     await tick(5);
     expect(errors).toEqual(['payload is not serializable']);
+    expect(detailsList).toEqual([details]);
     socket.close();
   });
 
@@ -328,5 +336,26 @@ describe('WsSocket', () => {
     const socket = await openSocket(server);
     socket.close();
     await expect(socket.call('core', 'sessionIndex', 'list', [{}])).rejects.toThrow('ws closed');
+  });
+});
+
+describe('session.list_changed (multi-instance discovery)', () => {
+  it('passes the session.list_changed core event stream through to listeners verbatim', async () => {
+    const server = new FakeServer();
+    const socket = await openSocket(server);
+    const seen: unknown[] = [];
+    const sub = socket.listen('core', 'session.list_changed', {}, (data) => seen.push(data));
+    await tick(5);
+
+    const listenFrame = server.frames.find((frame) => frame['type'] === 'listen')!;
+    expect(listenFrame).toMatchObject({ scope: 'core', event: 'session.list_changed' });
+    const listenId = listenFrame['id'] as string;
+    server.pushEvent(listenId, { type: 'session.list_changed' });
+    await tick(5);
+    expect(seen).toEqual([{ type: 'session.list_changed' }]);
+
+    sub.dispose();
+    expect(server.listens.size).toBe(0);
+    socket.close();
   });
 });

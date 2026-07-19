@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { ISessionInteractionService, type IDisposable } from '@moonshot-ai/agent-core-v2';
+import {
+  IEventService,
+  ISessionInteractionService,
+  type GlobalEvent,
+  type IDisposable,
+} from '@moonshot-ai/agent-core-v2';
 
 import { resolveEventSource } from '../src/transport/ws/eventMap';
 
@@ -88,5 +93,32 @@ describe('session `interactions:resolved` event source', () => {
     disposable.dispose();
     fire({ id: 'e3', response: null });
     expect(seen).toHaveLength(2);
+  });
+});
+
+describe('core `session.list_changed` event source', () => {
+  it('forwards only session.list_changed domain events', () => {
+    const { event, fire } = manualEvent<GlobalEvent>();
+    const eventService = { subscribe: event };
+    const scope = {
+      accessor: {
+        get: (id: unknown) => (id === IEventService ? eventService : undefined),
+      },
+    };
+
+    const source = resolveEventSource('core', 'session.list_changed');
+    expect(source).toBeDefined();
+
+    const seen: unknown[] = [];
+    const disposable = source!.subscribe(scope as never, (data) => seen.push(data));
+
+    fire({ type: 'event.session.created', payload: { id: 's1' } });
+    fire({ type: 'session.list_changed', payload: {} });
+
+    expect(seen).toEqual([{ type: 'session.list_changed', payload: {} }]);
+
+    disposable.dispose();
+    fire({ type: 'session.list_changed', payload: {} });
+    expect(seen).toHaveLength(1);
   });
 });
