@@ -77,7 +77,7 @@ export class SandboxService implements ISandboxService {
       return { kind: 'unsandboxed', reason: probe.status };
     }
 
-    const policy = resolveSandboxPolicy(config, this.workspaceRoots(cwd), {
+    const policy = resolveSandboxPolicy(config, this.workspaceRoots(), {
       tmpdir: tmpdir(),
       homeDir: this.env.homeDir,
     });
@@ -125,11 +125,11 @@ export class SandboxService implements ISandboxService {
     );
   }
 
-  private workspaceRoots(cwd: string): SandboxWorkspaceRoots {
-    const workDir = this.workspace.workDir;
-    const additionalDirs =
-      cwd === workDir ? this.workspace.additionalDirs : [cwd, ...this.workspace.additionalDirs];
-    return { workDir, additionalDirs };
+  private workspaceRoots(): SandboxWorkspaceRoots {
+    // Writable roots come only from the session workspace — the command's cwd
+    // is never promoted: a cwd inside the workspace is covered by workDir,
+    // and a cwd outside it stays read-only (cd in, read, but writes EROFS).
+    return { workDir: this.workspace.workDir, additionalDirs: this.workspace.additionalDirs };
   }
 }
 

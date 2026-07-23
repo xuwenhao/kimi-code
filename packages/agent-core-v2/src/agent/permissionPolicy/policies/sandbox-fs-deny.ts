@@ -36,7 +36,7 @@ export class SandboxFsDenyPermissionPolicyService implements PermissionPolicy {
     if (accesses.length === 0) return undefined;
     const policy = this.resolvedPolicy(config);
     for (const access of accesses) {
-      const denied = this.denyAccess(access, config, policy);
+      const denied = this.denyAccess(access, policy);
       if (denied !== undefined) return denied;
     }
     return undefined;
@@ -44,7 +44,6 @@ export class SandboxFsDenyPermissionPolicyService implements PermissionPolicy {
 
   private denyAccess(
     access: ToolFileAccess,
-    config: SandboxConfig,
     policy: ResolvedSandboxPolicy,
   ): PermissionPolicyResult | undefined {
     if (isSensitiveFile(access.path)) {
@@ -61,26 +60,22 @@ export class SandboxFsDenyPermissionPolicyService implements PermissionPolicy {
       access.operation === 'search' ||
       access.operation === 'readwrite';
     if (reads) {
-      const rule = (config.filesystem?.denyRead ?? []).find((entry) =>
-        matchesPathRule(access.path, entry, homeDir),
-      );
+      const rule = policy.denyRead.find((entry) => matchesPathRule(access.path, entry, homeDir));
       if (rule !== undefined) {
         return {
           kind: 'deny',
-          message: `Read access to "${access.path}" is denied by sandbox rule filesystem.deny_read ("${rule}").`,
+          message: `Read access to "${access.path}" is denied by the sandbox deny-read policy ("${rule}").`,
           reason: { matched_rule: rule },
         };
       }
     }
     const writes = access.operation === 'write' || access.operation === 'readwrite';
     if (writes) {
-      const rule = (config.filesystem?.denyWrite ?? []).find((entry) =>
-        matchesPathRule(access.path, entry, homeDir),
-      );
+      const rule = policy.denyWrite.find((entry) => matchesPathRule(access.path, entry, homeDir));
       if (rule !== undefined) {
         return {
           kind: 'deny',
-          message: `Write access to "${access.path}" is denied by sandbox rule filesystem.deny_write ("${rule}").`,
+          message: `Write access to "${access.path}" is denied by the sandbox deny-write policy ("${rule}").`,
           reason: { matched_rule: rule },
         };
       }

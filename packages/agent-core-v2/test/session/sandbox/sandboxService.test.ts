@@ -157,17 +157,23 @@ describe('SandboxService.decide', () => {
     expect(spawn.mock.calls[0]?.[0]).toBe('bwrap');
   });
 
-  it('includes the command cwd in the writable roots when it differs from the workDir', async () => {
+  it('does not promote an outside-workspace cwd into the writable roots', async () => {
     const { sandbox } = service({ config: { enabled: true } });
 
-    const decision = await sandbox.decide('pwd', '/tmp/scratch');
+    const decision = await sandbox.decide('pwd', '/home/test/other-project');
     expect(decision.kind).toBe('sandboxed');
     if (decision.kind !== 'sandboxed') return;
-    expect(decision.argv).toEqual(expect.arrayContaining(['--bind', '/tmp/scratch', '/tmp/scratch']));
+    // The shell still cds into the requested cwd, but it stays read-only.
+    expect(decision.argv).not.toEqual(
+      expect.arrayContaining(['--bind', '/home/test/other-project', '/home/test/other-project']),
+    );
+    expect(decision.argv).toEqual(
+      expect.arrayContaining(['--bind', '/workspace/app', '/workspace/app']),
+    );
     expect(decision.argv.slice(decision.argv.indexOf('--') + 1)).toEqual([
       '/bin/bash',
       '-c',
-      "cd '/tmp/scratch' && pwd",
+      "cd '/home/test/other-project' && pwd",
     ]);
   });
 

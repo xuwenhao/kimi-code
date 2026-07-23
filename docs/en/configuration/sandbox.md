@@ -37,7 +37,7 @@ auto_allow_sandboxed_bash = true       # Sandboxed Bash calls skip the approval 
 excluded_commands = []                 # Command prefixes that bypass the sandbox.
 
 [sandbox.filesystem]
-deny_read = []                         # Paths masked so the sandboxed process cannot read them.
+deny_read = []                         # Extra paths to mask (appended to the built-in sensitive list).
 allow_write = []                       # Extra writable roots on top of the mode defaults.
 deny_write = []                        # Paths inside writable roots re-protected as read-only.
 
@@ -62,7 +62,18 @@ allow_unix_sockets = []                # Reserved (e.g. an ssh-agent socket); in
 - `deny_read` beats the writable roots, `deny_write` beats `allow_write` / the mode defaults — deny always wins.
 - On Linux, `deny_read` / `deny_write` entries that do not exist are skipped (bubblewrap cannot mount over a non-existent path).
 
-Sensitive files (`~/.ssh/id_rsa`, `.env`, cloud credentials, …) are always denied by the permission layer while the sandbox is enabled, even without listing them in `deny_read` — see below.
+### Built-in `deny_read` list
+
+The sandbox always masks a built-in set of credential locations — it cannot be turned off, and `filesystem.deny_read` appends to it:
+
+```
+~/.ssh  ~/.aws  ~/.gnupg  ~/.azure  ~/.config/gcloud
+~/.kube  ~/.docker  ~/.netrc  ~/.git-credentials  ~/.config/gh
+```
+
+In addition, a literal `.env` directly under each writable root (the workspace, its additional directories, the temp directory, and each `allow_write` entry) is masked. A `.env` in a **nested subdirectory** is not covered by this built-in rule — add the concrete directory to `filesystem.deny_read` if you need it masked.
+
+Sensitive files beyond these paths (`credentials` files, SSH key variants, …) are also hard-denied for the file tools by the permission layer while the sandbox is enabled — see below.
 
 ### `network`
 
