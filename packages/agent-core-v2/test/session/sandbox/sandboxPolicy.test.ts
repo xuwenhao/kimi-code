@@ -9,7 +9,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { DEFAULT_DENY_READ, resolveSandboxPolicy } from '#/session/sandbox/sandboxPolicy';
+import {
+  DEFAULT_DENY_READ,
+  DEFAULT_DENY_READ_SOCKETS,
+  resolveSandboxPolicy,
+  resolveXdgRuntimeDir,
+} from '#/session/sandbox/sandboxPolicy';
 import type { SandboxConfig } from '#/session/sandbox/sandboxTypes';
 
 const ENV = { tmpdir: '/tmp', homeDir: '/home/test' } as const;
@@ -18,7 +23,12 @@ const WORKSPACE = { workDir: '/workspace/app', additionalDirs: ['/workspace/extr
 const EXPANDED_DEFAULTS = DEFAULT_DENY_READ.map((p) => `/home/test/${p.slice(2)}`);
 
 function expectedDenyRead(writableRoots: readonly string[], userRules: readonly string[] = []) {
-  return [...EXPANDED_DEFAULTS, ...writableRoots.map((root) => `${root}/.env`), ...userRules];
+  return [
+    ...EXPANDED_DEFAULTS,
+    ...DEFAULT_DENY_READ_SOCKETS,
+    ...writableRoots.map((root) => `${root}/.env`),
+    ...userRules,
+  ];
 }
 
 describe('resolveSandboxPolicy', () => {
@@ -107,10 +117,57 @@ describe('resolveSandboxPolicy', () => {
     expect(policy.denyRead.filter((p) => p === '/workspace/app/.env')).toHaveLength(1);
   });
 
+  it('masks host daemon sockets and (optionally) $XDG_RUNTIME_DIR sockets by default', () => {
+    const withoutXdg = resolveSandboxPolicy({}, WORKSPACE, ENV);
+    for (const socket of DEFAULT_DENY_READ_SOCKETS) {
+      expect(withoutXdg.denyRead).toContain(socket);
+    }
+    expect(withoutXdg.denyRead.some((p) => p.startsWith('/run/user/'))).toBe(false);
+
+    const withXdg = resolveSandboxPolicy({}, WORKSPACE, {
+      ...ENV,
+      xdgRuntimeDir: '/run/user/1000',
+    });
+    expect(withXdg.denyRead).toEqual(
+      expect.arrayContaining([
+        '/run/user/1000/bus',
+        '/run/user/1000/docker.sock',
+        '/run/user/1000/podman/podman.sock',
+        '/run/user/1000/gnupg',
+      ]),
+    );
+  });
+
+  it('re-protects workspace roots under tmpdir in read-only mode', () => {
+    const policy = resolveSandboxPolicy(
+      { mode: 'read-only' },
+      { workDir: '/tmp/repo', additionalDirs: ['/tmp/lib', '/workspace/outside'] },
+      ENV,
+    );
+
+    expect(policy.writableRoots).toEqual(['/tmp']);
+    expect(policy.denyWrite).toEqual(['/tmp/repo', '/tmp/lib']);
+  });
+
+  it('keeps denyWrite free of workspace roots outside tmpdir in read-only mode', () => {
+    const policy = resolveSandboxPolicy({ mode: 'read-only' }, WORKSPACE, ENV);
+
+    expect(policy.denyWrite).toEqual([]);
+  });
+
   it('reads networkEnabled from network.enabled', () => {
     expect(resolveSandboxPolicy({ network: { enabled: true } }, WORKSPACE, ENV).networkEnabled).toBe(
       true,
     );
     expect(resolveSandboxPolicy({ network: {} }, WORKSPACE, ENV).networkEnabled).toBe(false);
+  });
+});
+
+describe('resolveXdgRuntimeDir', () => {
+  it('prefers $XDG_RUNTIME_DIR, falls back to /run/user/<uid>, then undefined', () => {
+    expect(resolveXdgRuntimeDir({ XDG_RUNTIME_DIR: '/run/user/42' }, 1000)).toBe('/run/user/42');
+    expect(resolveXdgRuntimeDir({ XDG_RUNTIME_DIR: '' }, 1000)).toBe('/run/user/1000');
+    expect(resolveXdgRuntimeDir({}, 1000)).toBe('/run/user/1000');
+    expect(resolveXdgRuntimeDir({}, undefined)).toBeUndefined();
   });
 });

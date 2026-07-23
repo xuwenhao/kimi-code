@@ -315,6 +315,7 @@ export {
 export * from '#/session/sandbox/sandboxTypes';
 export * from '#/session/sandbox/sandboxPolicy';
 export * from '#/session/sandbox/pathRules';
+export * from '#/session/sandbox/envScrub';
 export * from '#/session/sandbox/backends/sandboxBackend';
 export * from '#/session/sandbox/backends/bwrapBackend';
 export * from '#/session/sandbox/backends/seatbeltBackend';

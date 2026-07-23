@@ -1,5 +1,3 @@
-import { tmpdir } from 'node:os';
-
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
 import { IConfigService, type IConfigService as ConfigService } from '#/app/config/config';
 import { IHostEnvironment, type IHostEnvironment as HostEnvironment } from '#/os/interface/hostEnvironment';
@@ -7,15 +5,16 @@ import type {
   PermissionPolicy,
   PermissionPolicyResult,
 } from '#/agent/permissionPolicy/types';
+import { defaultPathKind } from '#/session/sandbox/backends/sandboxBackend';
 import { resolveSandboxConfig } from '#/session/sandbox/configSection';
 import { isWithinAnyRoot, matchesPathRule } from '#/session/sandbox/pathRules';
-import { resolveSandboxPolicy } from '#/session/sandbox/sandboxPolicy';
+import { hostSandboxPathEnv, resolveSandboxPolicy } from '#/session/sandbox/sandboxPolicy';
 import type { ResolvedSandboxPolicy, SandboxConfig } from '#/session/sandbox/sandboxTypes';
 import {
   ISessionWorkspaceContext,
   type ISessionWorkspaceContext as WorkspaceContext,
 } from '#/session/workspaceContext/workspaceContext';
-import { isSensitiveFile } from '#/tool/path-access';
+import { isSensitiveFile, isWithinDirectory } from '#/tool/path-access';
 import type { ToolFileAccess } from '#/tool/toolContract';
 
 import { fileAccesses } from './path-utils';
@@ -68,6 +67,23 @@ export class SandboxFsDenyPermissionPolicyService implements PermissionPolicy {
           reason: { matched_rule: rule },
         };
       }
+      if (access.recursive === true) {
+        const contained = policy.denyRead.find(
+          (entry) =>
+            defaultPathKind(entry) === 'dir' &&
+            isWithinDirectory(entry, access.path) &&
+            !isWithinDirectory(access.path, entry),
+        );
+        if (contained !== undefined) {
+          return {
+            kind: 'deny',
+            message:
+              `Recursive access to "${access.path}" is denied: its subtree contains the ` +
+              `sandbox deny-read path "${contained}". Narrow the search or read root.`,
+            reason: { matched_rule: contained },
+          };
+        }
+      }
     }
     const writes = access.operation === 'write' || access.operation === 'readwrite';
     if (writes) {
@@ -96,7 +112,7 @@ export class SandboxFsDenyPermissionPolicyService implements PermissionPolicy {
     return resolveSandboxPolicy(
       config,
       { workDir: this.workspace.workDir, additionalDirs: this.workspace.additionalDirs },
-      { tmpdir: tmpdir(), homeDir: this.env.homeDir },
+      hostSandboxPathEnv(this.env.homeDir),
     );
   }
 }

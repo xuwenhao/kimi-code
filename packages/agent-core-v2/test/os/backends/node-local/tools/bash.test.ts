@@ -937,6 +937,38 @@ describe('BashTool', () => {
     expect(result.output).not.toContain('sandbox.excluded_commands');
   });
 
+  it('scrubs sensitive env vars only when the command runs sandboxed', async () => {
+    const key = 'KIMI_TEST_FAKE_API_KEY';
+    const previous = process.env[key];
+    process.env[key] = 'supersecret';
+    try {
+      const { runner: sandboxedRunner, exec: sandboxedExec } = createTestRunner(
+        processWithOutput({ stdout: 'ok\n' }),
+      );
+      const sandboxedTool = bashTool(
+        sandboxedRunner,
+        posixEnv,
+        createTestCtx(),
+        undefined,
+        undefined,
+        undefined,
+        stubSandbox({ kind: 'sandboxed', argv: ['bwrap', '--', 'true'], backendId: 'bwrap' }),
+      );
+      await executeTool(sandboxedTool, context({ command: 'env', timeout: 60 }));
+      const sandboxedEnv = sandboxedExec.mock.calls[0]?.[1]?.env as Record<string, string>;
+      expect(sandboxedEnv[key]).toBe('');
+
+      const { runner, exec } = createTestRunner(processWithOutput({ stdout: 'ok\n' }));
+      const tool = bashTool(runner);
+      await executeTool(tool, context({ command: 'env', timeout: 60 }));
+      const plainEnv = exec.mock.calls[0]?.[1]?.env as Record<string, string>;
+      expect(plainEnv[key]).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
+  });
+
   it('uses Git Bash semantics on Windows', async () => {
     const proc = processWithOutput({ stdout: 'ok\n' });
     const { runner, exec } = createTestRunner(proc);

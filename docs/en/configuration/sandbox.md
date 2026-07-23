@@ -73,7 +73,13 @@ The sandbox always masks a built-in set of credential locations — it cannot be
 
 In addition, a literal `.env` directly under each writable root (the workspace, its additional directories, the temp directory, and each `allow_write` entry) is masked. A `.env` in a **nested subdirectory** is not covered by this built-in rule — add the concrete directory to `filesystem.deny_read` if you need it masked.
 
+Host daemon sockets are masked as well, since unix-domain sockets bypass network isolation: `/var/run/docker.sock`, `/run/docker.sock`, `/var/run/containerd.sock`, `/run/containerd/containerd.sock`, `/run/crio/crio.sock`, `/run/podman/podman.sock`, plus `$XDG_RUNTIME_DIR/bus`, `$XDG_RUNTIME_DIR/docker.sock`, `$XDG_RUNTIME_DIR/podman/podman.sock`, and `$XDG_RUNTIME_DIR/gnupg` (when `XDG_RUNTIME_DIR` is set or resolvable as `/run/user/<uid>`).
+
 Sensitive files beyond these paths (`credentials` files, SSH key variants, …) are also hard-denied for the file tools by the permission layer while the sandbox is enabled — see below.
+
+### Environment variable scrubbing
+
+Sandboxed commands do not inherit secret-bearing environment variables: names ending in `_API_KEY`, `_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD`, or `_CREDENTIALS` (case-insensitive), plus `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, and `XAUTHORITY`, are blanked out in the command's environment. This is not configurable; put non-secret values in ordinary variables if a sandboxed command needs them.
 
 ### `network`
 
@@ -105,6 +111,7 @@ While `sandbox.enabled = true`, three permission policies take effect (in additi
 1. **Sandboxed Bash skip-approval** — a `Bash` call that will run inside the sandbox is approved without prompting (disable with `auto_allow_sandboxed_bash = false`). User `deny` rules and the checks below still take precedence.
 2. **Hard deny** — evaluated before mode-based auto-approval (`--auto` / `--yolo`):
    - reads/searches matching `filesystem.deny_read`;
+   - **recursive** reads/searches (e.g. `Grep` over a directory tree) whose root contains a `deny_read` *directory* — the whole access is denied with a hint to narrow the search root (file entries such as the built-in `.env` masks never trigger this);
    - writes matching `filesystem.deny_write`;
    - in `read-only` mode, writes outside the writable roots;
    - any access to a **sensitive file** (env files, SSH keys, cloud credentials — the same patterns the file tools already guard), which is upgraded from "ask" to a hard "deny" while the sandbox is enabled.
@@ -114,6 +121,7 @@ While `sandbox.enabled = true`, three permission policies take effect (in additi
 
 - Only `Bash` is wrapped by the OS sandbox. External hooks run unsandboxed (same as claude-code), and the `Grep` tool's `rg` subprocess is not sandboxed separately — its search roots are already guarded by the workspace path checks plus the policies above.
 - On Linux, `deny_read` masks only paths that exist when the command starts (bubblewrap cannot mount over a non-existent path).
+- The sandbox masks the known host socket paths listed above but cannot block creating new `AF_UNIX` sockets (no seccomp filter); it also cannot stop a sandboxed process from talking to daemons over unnamed or relocated sockets.
 - `network.allowed_domains` and `network.allow_unix_sockets` are reserved schema fields with no behavior yet (Phase 3).
 - Windows is not supported; commands run unsandboxed there.
 

@@ -1,7 +1,9 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { ToolCall } from '#/kosong/contract/message';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import type { IConfigService } from '#/app/config/config';
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
@@ -35,12 +37,28 @@ function stubEnv(): IHostEnvironment {
   };
 }
 
-function policy(section: SandboxConfig | undefined): SandboxFsDenyPermissionPolicyService {
+function policy(
+  section: SandboxConfig | undefined,
+  workDir = '/workspace/app',
+  additionalDirs: readonly string[] = ['/workspace/extra'],
+): SandboxFsDenyPermissionPolicyService {
   return new SandboxFsDenyPermissionPolicyService(
     stubConfig(section),
-    stubWorkspaceContext('/workspace/app', ['/workspace/extra']),
+    stubWorkspaceContext(workDir, additionalDirs),
     stubEnv(),
   );
+}
+
+let tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function makeTempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'kimi-sandbox-fs-deny-'));
+  tempDirs.push(dir);
+  return dir;
 }
 
 function policyContext(accesses: ToolAccessList): ResolvedToolExecutionHookContext {
@@ -169,5 +187,43 @@ describe('SandboxFsDenyPermissionPolicyService', () => {
       policy(undefined).evaluate(policyContext(ToolAccesses.readFile('/home/test/.ssh/id_rsa'))),
     ).toBeUndefined();
     expect(policy({ enabled: true }).evaluate(policyContext(ToolAccesses.none()))).toBeUndefined();
+  });
+
+  it('denies a recursive search whose root contains a deny_read directory', () => {
+    const ws = makeTempDir();
+    const secret = join(ws, 'secret');
+    mkdirSync(secret);
+    const p = policy({ enabled: true, filesystem: { denyRead: [secret] } }, ws);
+
+    const denied = p.evaluate(policyContext(ToolAccesses.searchTree(ws)));
+    expect(denied).toMatchObject({ kind: 'deny', reason: { matched_rule: secret } });
+    expect(denied?.kind === 'deny' && denied.message).toContain('Narrow');
+
+    expect(p.evaluate(policyContext(ToolAccesses.readTree(ws)))).toMatchObject({
+      kind: 'deny',
+      reason: { matched_rule: secret },
+    });
+  });
+
+  it('does not deny recursive searches that only contain deny_read files or nothing denied', () => {
+    const ws = makeTempDir();
+    writeFileSync(join(ws, '.env'), 'SECRET=1');
+    const p = policy({ enabled: true }, ws);
+
+    expect(p.evaluate(policyContext(ToolAccesses.searchTree(ws)))).toBeUndefined();
+  });
+
+  it('does not apply reverse containment to non-recursive accesses', () => {
+    const ws = makeTempDir();
+    const secret = join(ws, 'secret');
+    mkdirSync(secret);
+    const p = policy({ enabled: true, filesystem: { denyRead: [secret] } }, ws);
+
+    expect(
+      p.evaluate(policyContext(ToolAccesses.readFile(join(ws, 'other.txt')))),
+    ).toBeUndefined();
+    expect(
+      p.evaluate(policyContext([{ kind: 'file', operation: 'search', path: ws }])),
+    ).toBeUndefined();
   });
 });

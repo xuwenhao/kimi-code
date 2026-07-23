@@ -1,5 +1,3 @@
-import { tmpdir } from 'node:os';
-
 import type { ResolvedToolExecutionHookContext } from '#/agent/toolExecutor/toolHooks';
 import { IConfigService, type IConfigService as ConfigService } from '#/app/config/config';
 import { IHostEnvironment, type IHostEnvironment as HostEnvironment } from '#/os/interface/hostEnvironment';
@@ -9,7 +7,7 @@ import type {
 } from '#/agent/permissionPolicy/types';
 import { resolveSandboxConfig } from '#/session/sandbox/configSection';
 import { isWithinAnyRoot } from '#/session/sandbox/pathRules';
-import { resolveSandboxPolicy } from '#/session/sandbox/sandboxPolicy';
+import { hostSandboxPathEnv, resolveSandboxPolicy } from '#/session/sandbox/sandboxPolicy';
 import {
   ISessionWorkspaceContext,
   type ISessionWorkspaceContext as WorkspaceContext,
@@ -32,7 +30,7 @@ export class SandboxOutsideWorkspaceAskPermissionPolicyService implements Permis
     const policy = resolveSandboxPolicy(
       config,
       { workDir: this.workspace.workDir, additionalDirs: this.workspace.additionalDirs },
-      { tmpdir: tmpdir(), homeDir: this.env.homeDir },
+      hostSandboxPathEnv(this.env.homeDir),
     );
     const access = fileAccesses(context).find(
       (fileAccess) => !isWithinAnyRoot(fileAccess.path, policy.writableRoots),

@@ -12,7 +12,9 @@
  *   - `tasks`    — `IAgentTaskService`, owns foreground/detached task
  *                  lifecycle (timeouts, detach, user interrupt)
  *   - `sandbox`  — `ISandboxService`, decides per command whether the shell
- *                  argv is wrapped in the OS sandbox (bwrap/seatbelt)
+ *                  argv is wrapped in the OS sandbox (bwrap/seatbelt);
+ *                  sandboxed runs also scrub sensitive env vars (API keys,
+ *                  tokens, agent sockets) to empty in the exec overlay
  *
  * Execution goes through `ISessionProcessRunner`, never directly via
  * `node:child_process`.
@@ -41,6 +43,7 @@ import { resolveAgentTaskConfig } from '#/agent/task/configSection';
 import { IConfigService } from '#/app/config/config';
 import { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import { ISandboxService } from '#/session/sandbox/sandbox';
+import { sensitiveEnvNames } from '#/session/sandbox/envScrub';
 import type { SandboxDecision } from '#/session/sandbox/sandboxTypes';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionProcessRunner, type IProcess } from '#/session/process/processRunner';
@@ -270,6 +273,11 @@ export class BashTool implements BuiltinTool<BashInput> {
       GIT_TERMINAL_PROMPT: process.env['GIT_TERMINAL_PROMPT'] ?? '0',
       SHELL: this.env.shellPath,
     };
+    if (decision.kind === 'sandboxed') {
+      for (const name of sensitiveEnvNames(Object.keys(process.env))) {
+        noninteractiveEnv[name] = '';
+      }
+    }
 
     return this.runner.exec(shellArgs, { env: noninteractiveEnv });
   }

@@ -14,11 +14,14 @@
  * (`PathKindProbe`) for tests; the default uses `node:fs`.
  */
 
-import { statSync } from 'node:fs';
-
 import type { ResolvedSandboxPolicy } from '../sandboxTypes';
 
-import type { ISandboxBackend, PathKind, PathKindProbe, SpawnProbe } from './sandboxBackend';
+import {
+  defaultPathKind,
+  type ISandboxBackend,
+  type PathKindProbe,
+  type SpawnProbe,
+} from './sandboxBackend';
 
 export const BWRAP_DETECT_ARGV: readonly string[] = ['bwrap', '--ro-bind', '/', '/', '--', 'true'];
 
@@ -72,12 +75,4 @@ export class BwrapSandboxBackend implements ISandboxBackend {
 function isWithinPath(p: string, root: string): boolean {
   if (root === '/') return true;
   return p === root || p.startsWith(`${root}/`);
-}
-
-function defaultPathKind(p: string): PathKind {
-  try {
-    return statSync(p).isDirectory() ? 'dir' : 'file';
-  } catch {
-    return 'missing';
-  }
 }

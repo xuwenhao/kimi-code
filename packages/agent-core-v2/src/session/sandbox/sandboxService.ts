@@ -6,7 +6,11 @@
  * lazily on first `decide` through `os/interface` host-process spawns and
  * cached afterwards), and folds the workspace roots from `workspaceContext`
  * with host path facts (`os/interface` host environment) into a
- * `ResolvedSandboxPolicy`. A sandboxed decision wraps the full shell argv
+ * `ResolvedSandboxPolicy`. The writable roots come only from the session
+ * workspace — the command's cwd is never promoted: a cwd inside the
+ * workspace is already covered by workDir, and a cwd outside it stays
+ * read-only (the shell cds in and can read, but writes hit EROFS). A
+ * sandboxed decision wraps the full shell argv
  * (`<shell> -c 'cd <cwd> && <command>'`, POSIX only — Windows reports
  * `unsupported-platform`) so the caller can exec it directly. Backend
  * unavailable with `require = true` fails closed (`blocked`); otherwise it
@@ -16,8 +20,6 @@
  * followed by a space or end) bypass the sandbox and run through the normal
  * permission chain. Bound at Session scope.
  */
-
-import { tmpdir } from 'node:os';
 
 import { InstantiationType } from '#/_base/di/extensions';
 import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
@@ -32,7 +34,11 @@ import type { ISandboxBackend } from './backends/sandboxBackend';
 import { SeatbeltSandboxBackend } from './backends/seatbeltBackend';
 import { resolveSandboxConfig } from './configSection';
 import { ISandboxService } from './sandbox';
-import { resolveSandboxPolicy, type SandboxWorkspaceRoots } from './sandboxPolicy';
+import {
+  hostSandboxPathEnv,
+  resolveSandboxPolicy,
+  type SandboxWorkspaceRoots,
+} from './sandboxPolicy';
 import type { SandboxBackendId, SandboxDecision } from './sandboxTypes';
 
 type BackendProbeResult =
@@ -77,10 +83,7 @@ export class SandboxService implements ISandboxService {
       return { kind: 'unsandboxed', reason: probe.status };
     }
 
-    const policy = resolveSandboxPolicy(config, this.workspaceRoots(), {
-      tmpdir: tmpdir(),
-      homeDir: this.env.homeDir,
-    });
+    const policy = resolveSandboxPolicy(config, this.workspaceRoots(), hostSandboxPathEnv(this.env.homeDir));
     const shellArgv = [this.env.shellPath, '-c', `cd ${shellQuote(cwd)} && ${command}`];
     return {
       kind: 'sandboxed',
@@ -126,9 +129,6 @@ export class SandboxService implements ISandboxService {
   }
 
   private workspaceRoots(): SandboxWorkspaceRoots {
-    // Writable roots come only from the session workspace — the command's cwd
-    // is never promoted: a cwd inside the workspace is covered by workDir,
-    // and a cwd outside it stays read-only (cd in, read, but writes EROFS).
     return { workDir: this.workspace.workDir, additionalDirs: this.workspace.additionalDirs };
   }
 }

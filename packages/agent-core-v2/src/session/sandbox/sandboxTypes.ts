@@ -5,7 +5,11 @@
  * seatbelt on macOS): the `[sandbox]` config-section shape (`SandboxConfig`),
  * the per-command verdict (`SandboxDecision`) produced by `ISandboxService`,
  * and the backend-ready `ResolvedSandboxPolicy` (absolute, `~`-expanded paths)
- * consumed by the sandbox backends. No IO, no DI.
+ * consumed by the sandbox backends. `blocked` is the fail-closed verdict:
+ * `require = true` but no usable backend, so the command must not run. In a
+ * resolved policy the writable roots are cwd + additionalDirs + tmpdir +
+ * `filesystem.allowWrite` for `workspace-write`, or tmpdir +
+ * `filesystem.allowWrite` for `read-only`. No IO, no DI.
  */
 
 export type SandboxMode = 'workspace-write' | 'read-only';
@@ -41,13 +45,10 @@ export type SandboxDecision =
       readonly kind: 'unsandboxed';
       readonly reason: 'disabled' | 'backend-unavailable' | 'unsupported-platform';
     }
-  // `require = true` but no usable backend: fail-closed, the command must not run.
   | { readonly kind: 'blocked'; readonly reason: string };
 
 export interface ResolvedSandboxPolicy {
   readonly mode: SandboxMode;
-  // Absolute paths with `~` expanded. `workspace-write`: cwd + additionalDirs +
-  // tmpdir + filesystem.allowWrite; `read-only`: tmpdir + filesystem.allowWrite.
   readonly writableRoots: readonly string[];
   readonly denyRead: readonly string[];
   readonly denyWrite: readonly string[];
